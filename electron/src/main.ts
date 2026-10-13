@@ -34,13 +34,19 @@ function createAppInfo(): AppInfo {
 }
 
 function createContentSecurityPolicy(): string {
+  // Vite's React Fast Refresh preamble is an inline module in development.
+  // Production bundles do not need this exception.
+  const scriptSource =
+    developmentServerUrl !== undefined
+      ? "script-src 'self' 'unsafe-inline'"
+      : "script-src 'self'";
   const styleSource =
     developmentServerUrl !== undefined
       ? "style-src 'self' 'unsafe-inline'"
       : "style-src 'self'";
   const directives = [
     "default-src 'self'",
-    "script-src 'self'",
+    scriptSource,
     styleSource,
     "img-src 'self' data:",
     "font-src 'self'",
