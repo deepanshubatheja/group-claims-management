@@ -1,0 +1,22 @@
+{
+  "name": "group-claims-management",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-user local-first group claims management desktop application.",
+  "workspaces": [
+    "frontend",
+    "electron"
+  ],
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names frontend,electron-build,electron \"npm run dev --workspace frontend\" \"npm run dev:build --workspace electron\" \"npm run dev:start --workspace electron\"",
+    "build": "npm run build --workspace frontend && npm run build --workspace electron",
+    "typecheck": "npm run typecheck --workspace frontend && npm run typecheck --workspace electron"
+  },
+  "devDependencies": {
+    "concurrently": "9.1.2"
+  }
+}
