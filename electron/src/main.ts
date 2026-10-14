@@ -188,7 +188,7 @@ function startDevelopmentBackend(storageRoot: string): void {
 // failed backend once per request, and retries configuration if the venv was missing.
 async function ensureDevelopmentBackend(): Promise<BackendProcessManager | undefined> {
   if (backendProcess === undefined) {
-    startDevelopmentBackend();
+    startDevelopmentBackend(app.getPath("userData"));
   }
 
   if (backendProcess?.state === "failed") {
