@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test test-dist/tests/document-viewer-navigation.test.js"
+    "test": "npm run build:test && node --test test-dist/tests/*.test.js"
   },
   "dependencies": {
     "react": "19.1.0",

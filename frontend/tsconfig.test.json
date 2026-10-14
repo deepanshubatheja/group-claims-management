@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/vite-env.d.ts", "src/components/document-viewer-navigation.ts", "src/components/document-viewer-client.ts", "tests/**/*.ts"]
+  "include": ["src/vite-env.d.ts", "src/components/document-viewer-navigation.ts", "src/components/document-viewer-client.ts", "src/components/workspace-ui.ts", "tests/**/*.ts"]
 }

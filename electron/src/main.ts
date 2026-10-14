@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, session } from "electron";
 import { access, lstat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -12,11 +13,13 @@ import {
   GET_APP_INFO_CHANNEL,
   GET_BACKEND_HEALTH_CHANNEL,
   GET_STORAGE_STATUS_CHANNEL,
-  SELECT_AND_IMPORT_DOCUMENTS_CHANNEL, IMPORT_DROPPED_DOCUMENTS_CHANNEL, LIST_DOCUMENTS_CHANNEL, GET_DOCUMENT_CONTENT_CHANNEL, RETRY_DOCUMENT_PARSE_CHANNEL,
+  SELECT_AND_IMPORT_DOCUMENTS_CHANNEL, SELECT_FOLDER_FOR_IMPORT_CHANNEL, CONFIRM_FOLDER_IMPORT_CHANNEL, CANCEL_FOLDER_IMPORT_CHANNEL, FOLDER_IMPORT_PROGRESS_CHANNEL, IMPORT_DROPPED_DOCUMENTS_CHANNEL, LIST_DOCUMENTS_CHANNEL, GET_DOCUMENT_CONTENT_CHANNEL, RETRY_DOCUMENT_PARSE_CHANNEL,
   type AppInfo,
   type BackendHealthResponse,
   type StorageStatusResponse,
+  type DocumentImportResponse,
 } from "./ipc-contract";
+import { discoverImportableFiles, type AuthorizedFolderFile } from "./folder-import";
 
 const MAX_IMPORT_FILE_BYTES = 50 * 1024 * 1024;
 const supportedExtensions = new Set([".xlsx", ".xls", ".csv", ".pdf"]);
@@ -26,6 +29,7 @@ const rendererHtmlPath = path.join(__dirname, "../../frontend/dist/index.html");
 const rendererHtmlUrl = pathToFileURL(rendererHtmlPath).toString();
 const projectRoot = path.join(__dirname, "../..");
 let backendProcess: BackendProcessManager | undefined;
+const folderAuthorizations = new Map<string, { files: AuthorizedFolderFile[]; skipped: number; expiresAt: number }>();
 
 function isAllowedRendererUrl(url: string): boolean {
   try {
@@ -271,11 +275,11 @@ app.whenReady().then(() => {
     if (event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid document request.");
     if (arguments_.length > 1) throw new Error("Invalid document request.");
   };
-  const importPaths = async (paths: unknown) => {
+  const importPaths = async (paths: unknown): Promise<DocumentImportResponse> => {
     try {
       const backend = await ensureDevelopmentBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
-      return { ok: true as const, ...(await backend.requestDocumentOperation("documents.import", { paths: await validateAuthorizedImportPaths(paths) })) };
+      return { ok: true as const, ...(await backend.requestDocumentOperation("documents.import", { paths: await validateAuthorizedImportPaths(paths) })) } as DocumentImportResponse;
     } catch (error) { return documentFailure(error); }
   };
   ipcMain.handle(SELECT_AND_IMPORT_DOCUMENTS_CHANNEL, async (event, ...arguments_: unknown[]) => {
@@ -285,6 +289,41 @@ app.whenReady().then(() => {
     const owner = BrowserWindow.fromWebContents(event.sender);
     const selected = owner === null ? await dialog.showOpenDialog(dialogOptions) : await dialog.showOpenDialog(owner, dialogOptions);
     return selected.canceled ? { ok: true, cancelled: true, documents: [] } : importPaths(selected.filePaths);
+  });
+  ipcMain.handle(SELECT_FOLDER_FOR_IMPORT_CHANNEL, async (event, ...arguments_: unknown[]) => {
+    validateSender(event, arguments_);
+    if (arguments_.length !== 0) throw new Error("Invalid folder selection request.");
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    const selected = owner === null ? await dialog.showOpenDialog({ properties: ["openDirectory"] }) : await dialog.showOpenDialog(owner, { properties: ["openDirectory"] });
+    if (selected.canceled) return { ok: true, cancelled: true };
+    try {
+      const discovery = await discoverImportableFiles(selected.filePaths[0] ?? "");
+      const authorizationId = randomUUID();
+      folderAuthorizations.set(authorizationId, { files: discovery.files, skipped: discovery.skippedFiles + discovery.skippedLinks, expiresAt: Date.now() + 5 * 60_000 });
+      return { ok: true, preview: { authorizationId, supportedFiles: discovery.files.length, totalBytes: discovery.totalBytes, skippedFiles: discovery.skippedFiles, skippedLinks: discovery.skippedLinks, limitReached: discovery.limitReached } };
+    } catch { return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The selected folder could not be read safely.")); }
+  });
+  const folderAuthorizationId = (payload: unknown): string | undefined => typeof payload === "object" && payload !== null && typeof (payload as { authorizationId?: unknown }).authorizationId === "string" ? (payload as { authorizationId: string }).authorizationId : undefined;
+  ipcMain.handle(CANCEL_FOLDER_IMPORT_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]) => { validateSender(event, arguments_); const id = folderAuthorizationId(payload); if (id) folderAuthorizations.delete(id); return { ok: true }; });
+  ipcMain.handle(CONFIRM_FOLDER_IMPORT_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]) => {
+    validateSender(event, arguments_);
+    const authorizationId = folderAuthorizationId(payload);
+    const authorized = authorizationId ? folderAuthorizations.get(authorizationId) : undefined;
+    if (!authorizationId || !authorized || authorized.expiresAt < Date.now()) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The folder selection expired. Select the folder again."));
+    folderAuthorizations.delete(authorizationId);
+    const progress = { authorizationId, discovered: authorized.files.length, processed: 0, imported: 0, duplicates: 0, failed: 0, skipped: authorized.skipped };
+    const failures: Array<{ filename: string; message: string }> = [];
+    const emit = () => event.sender.send(FOLDER_IMPORT_PROGRESS_CHANNEL, progress);
+    emit();
+    for (const file of authorized.files) {
+      const response = await importPaths([file.path]);
+      progress.processed += 1;
+      const item = response.ok && "documents" in response ? response.documents[0] : undefined;
+      if (item?.ok) { if (item.duplicate) progress.duplicates += 1; else progress.imported += 1; }
+      else { progress.failed += 1; if (failures.length < 20) failures.push({ filename: file.relativePath, message: item?.error?.message ?? (!response.ok ? response.error.message : "Import failed.") }); }
+      emit();
+    }
+    return { ok: true, result: { ...progress, failures } };
   });
   ipcMain.handle(IMPORT_DROPPED_DOCUMENTS_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]) => {
     validateSender(event, arguments_);

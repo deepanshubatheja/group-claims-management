@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, DocumentContentResponse, DocumentImportResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions } from "./ipc-contract";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, DocumentContentResponse, DocumentImportResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
@@ -7,6 +7,10 @@ const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 const SELECT_AND_IMPORT_DOCUMENTS_CHANNEL = "documents:select-and-import" as const;
+const SELECT_FOLDER_FOR_IMPORT_CHANNEL = "documents:select-folder-for-import" as const;
+const CONFIRM_FOLDER_IMPORT_CHANNEL = "documents:confirm-folder-import" as const;
+const CANCEL_FOLDER_IMPORT_CHANNEL = "documents:cancel-folder-import" as const;
+const FOLDER_IMPORT_PROGRESS_CHANNEL = "documents:folder-import-progress" as const;
 const IMPORT_DROPPED_DOCUMENTS_CHANNEL = "documents:import-dropped" as const;
 const LIST_DOCUMENTS_CHANNEL = "documents:list" as const;
 const GET_DOCUMENT_CONTENT_CHANNEL = "documents:get-content" as const;
@@ -153,6 +157,28 @@ const desktopApi = Object.freeze({
     const response: unknown = await ipcRenderer.invoke(SELECT_AND_IMPORT_DOCUMENTS_CHANNEL);
     if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid document response.");
     return Object.freeze(response) as DocumentImportResponse;
+  },
+  async selectFolderForImport(): Promise<FolderImportPreviewResponse> {
+    const response: unknown = await ipcRenderer.invoke(SELECT_FOLDER_FOR_IMPORT_CHANNEL);
+    if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid folder response.");
+    return Object.freeze(response) as FolderImportPreviewResponse;
+  },
+  async confirmFolderImport(authorizationId: string): Promise<FolderImportResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(authorizationId)) throw new Error("Invalid folder import authorization.");
+    const response: unknown = await ipcRenderer.invoke(CONFIRM_FOLDER_IMPORT_CHANNEL, { authorizationId });
+    if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid folder import response.");
+    return Object.freeze(response) as FolderImportResponse;
+  },
+  async cancelFolderImport(authorizationId: string): Promise<void> {
+    if (!/^[a-f0-9-]{36}$/i.test(authorizationId)) return;
+    await ipcRenderer.invoke(CANCEL_FOLDER_IMPORT_CHANNEL, { authorizationId });
+  },
+  onFolderImportProgress(listener: (progress: FolderImportProgress) => void): () => void {
+    const receive = (_event: Electron.IpcRendererEvent, value: unknown) => {
+      if (typeof value === "object" && value !== null && typeof (value as Record<string, unknown>).authorizationId === "string") listener(value as FolderImportProgress);
+    };
+    ipcRenderer.on(FOLDER_IMPORT_PROGRESS_CHANNEL, receive);
+    return () => ipcRenderer.removeListener(FOLDER_IMPORT_PROGRESS_CHANNEL, receive);
   },
   async importDroppedDocuments(files: File[]): Promise<DocumentImportResponse> {
     // A DOM File from an Electron drop has an OS path only inside this privileged preload.
