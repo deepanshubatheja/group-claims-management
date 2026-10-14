@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test test-dist/tests/document-viewer-navigation.test.js"
   },
   "dependencies": {
     "react": "19.1.0",

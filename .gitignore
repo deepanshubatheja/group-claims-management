@@ -19,6 +19,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
 
 # Build artifacts and tooling caches
 dist/
@@ -50,7 +51,10 @@ coverage/
 # User-imported legal documents and application-generated outputs
 imported-documents/
 local-data/
+database/
+documents/
 exports/
+backups/
 generated-invoices/
 generated-reports/
 *.invoice.pdf

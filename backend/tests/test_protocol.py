@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from group_claims_backend.protocol import ProtocolServer
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -128,7 +131,7 @@ class ProtocolServerTests(unittest.TestCase):
             result = responses[0]["result"]
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["databaseStatus"], "connected")
-            self.assertEqual(result["schemaVersion"], 2)
+            self.assertEqual(result["schemaVersion"], 5)
             self.assertTrue(result["directoriesAvailable"])
             self.assertTrue((root / "database" / "claims.sqlite").is_file())
 
@@ -142,6 +145,16 @@ class ProtocolServerTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["databaseStatus"], "unavailable")
         self.assertFalse(result["directoriesAvailable"])
+
+    def test_oversized_response_is_replaced_by_a_controlled_error(self) -> None:
+        server = ProtocolServer({"test.large": lambda _params: {"value": "x" * 70_000}})
+        stdout = io.BytesIO()
+        server.serve(io.BytesIO((json.dumps(request("large-1", "test.large")) + "\n").encode()), stdout)
+
+        response = json.loads(stdout.getvalue().decode())
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["id"], "large-1")
+        self.assertEqual(response["error"]["code"], "response_too_large")
 
 
 if __name__ == "__main__":

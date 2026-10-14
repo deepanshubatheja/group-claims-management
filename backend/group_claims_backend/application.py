@@ -8,6 +8,7 @@ from typing import BinaryIO
 
 from .protocol import ProtocolServer
 from .services.health import get_health_status
+from .services.document_import import DocumentImportError, DocumentImportService
 from .storage.service import StorageService
 
 
@@ -31,8 +32,29 @@ def main(
     configure_logging()
     storage = StorageService(storage_root)
     storage.initialize()
+    def no_params(handler):
+        def wrapped(params):
+            if params != {}:
+                raise DocumentImportError("invalid_params", "This command does not accept parameters.")
+            return handler()
+        return wrapped
+    try:
+        documents = DocumentImportService(storage)
+        commands = {
+            "health.check": no_params(get_health_status), "storage.status": no_params(storage.status),
+            "documents.import": lambda params: documents.import_authorized_paths(params.get("paths")),
+            "documents.list": no_params(documents.list_documents),
+            "documents.content": lambda params: documents.content(
+                params.get("documentId"), params.get("offset"), params.get("limit"), params.get("sheetName"),
+                params.get("rowStart"), params.get("rowLimit"), params.get("columnStart"),
+                params.get("columnLimit"), params.get("pageNumber"),
+            ),
+            "documents.retry_parse": lambda params: documents.retry_parse(params.get("documentId")),
+        }
+    except DocumentImportError:
+        commands = {"health.check": no_params(get_health_status), "storage.status": no_params(storage.status)}
     server = ProtocolServer(
-        {"health.check": get_health_status, "storage.status": storage.status}
+        commands
     )
     server.serve(
         stdin if stdin is not None else sys.stdin.buffer,

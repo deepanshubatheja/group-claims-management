@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import BackendStatus from "./components/BackendStatus";
 import StorageStatus from "./components/StorageStatus";
+import DocumentsScreen from "./components/DocumentsScreen";
 
 const navigationItems = [
   "Dashboard",
@@ -18,6 +19,7 @@ function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("connecting");
+  const [activePage, setActivePage] = useState<(typeof navigationItems)[number]>("Dashboard");
 
   useEffect(() => {
     let isCurrent = true;
@@ -55,18 +57,20 @@ function App() {
 
         <nav className="navigation">
           {navigationItems.map((item) => {
-            const isDashboard = item === "Dashboard";
+            const isActive = item === activePage;
+            const enabled = item === "Dashboard" || item === "Documents";
 
             return (
               <button
                 key={item}
-                className={`navigation-item${isDashboard ? " active" : ""}`}
+                className={`navigation-item${isActive ? " active" : ""}`}
                 type="button"
-                aria-current={isDashboard ? "page" : undefined}
-                disabled={!isDashboard}
+                aria-current={isActive ? "page" : undefined}
+                disabled={!enabled}
+                onClick={() => setActivePage(item)}
               >
                 <span>{item}</span>
-                {!isDashboard && <span className="coming-soon">Coming soon</span>}
+                {!enabled && <span className="coming-soon">Coming soon</span>}
               </button>
             );
           })}
@@ -76,6 +80,7 @@ function App() {
       </aside>
 
       <main className="main-content">
+        {activePage === "Documents" ? <DocumentsScreen /> : <>
         <header className="page-header">
           <div>
             <p className="eyebrow">Dashboard</p>
@@ -123,6 +128,7 @@ function App() {
 
         <BackendStatus />
         <StorageStatus />
+        </>}
       </main>
     </div>
   );
