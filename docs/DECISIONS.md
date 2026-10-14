@@ -10,6 +10,25 @@ Document copies remain local, immutable managed files named by generated IDs;
 SQLite stores their relative paths and SHA-256 hashes. No public local server,
 cloud storage, or automatic encryption is introduced.
 
+## 2026-10-14 — Local PDF OCR fallback
+
+Phase 5.2 uses PyMuPDF for deterministic coordinate-aware native PDF text blocks. Tesseract is a
+strictly local, per-page fallback only when a page has no usable native text layer. Raw text,
+cleaned presentation text, page coordinates, engine/language metadata, confidence where available,
+and quality warnings are stored with a versioned extraction attempt. No OCR content leaves the
+device; incomplete OCR is never represented as reliable extraction. Future packaged builds must
+bundle the reviewed OCR runtime and language data rather than requiring an end-user installation.
+
+## 2026-10-14 — Deterministic extraction inspection
+
+Spreadsheet extraction attempts retain worksheet position, row, and column for new parses. The
+document viewer retrieves a bounded worksheet grid in that order rather than UUID insertion order;
+it represents omitted blank positions visually and preserves stored values and formulas unchanged.
+Older extraction attempts without a worksheet position use a stable sheet-name fallback and can be
+reprocessed from their immutable vault copy to capture original sheet order. PDF presentation keeps
+raw blocks and cleaned text separate, with warnings whenever layout or hyphenation cleanup may
+affect reading order.
+
 Provisional MVP Billing and Legal Rules
 
 We will proceed using the available pseudonymised client documents and illustrative examples rather than waiting for finalized client-specific legal and billing agreements.

@@ -45,6 +45,29 @@ Local storage is not encrypted automatically.
 Run Python protocol tests with `cd backend && ./.venv/bin/python -m unittest discover -s tests -v`
 on macOS/Linux, or the corresponding `.venv\\Scripts\\python.exe` command on Windows.
 
+## Phase 5 document parsing dependencies
+
+Install the declared backend parser dependencies into the project virtual environment with
+`cd backend && ./.venv/bin/python -m pip install -e .`. They provide deterministic XLSX
+(`openpyxl`), legacy XLS (`xlrd`), coordinate-aware PDF native text (`PyMuPDF`, with `pypdf`
+retained for compatibility), and local OCR handoff (`Pillow`, `pytesseract`); CSV uses Python's
+standard library. Native file selection is the supported import path. Drag-and-drop remains deliberately
+disabled until its Electron file-handle handoff can be verified without exposing paths to the renderer.
+
+## Phase 5.2 local OCR
+
+Tesseract is a separate local runtime; the Python package does not install it. In development,
+install Tesseract and its required language data with the platform's normal package manager, then
+verify it with `tesseract --list-langs`. English (`eng`) is required for OCR; German (`deu`) is used
+when installed. On Windows, a future packaged app must bundle a reviewed Tesseract runtime and the
+selected `tessdata`; end users must not need to install Python or Tesseract.
+
+The parser always tries native PDF text first. It renders and OCRs only pages without a usable text
+layer, sequentially with page, pixel, and per-page-time limits. OCR stays local, stores page-level
+provenance and a quality warning, and must be reviewed against the immutable source PDF. If the
+runtime or language data is unavailable, the document reports a controlled OCR-unavailable result
+instead of a false successful parse.
+
 ## Naming and organization
 
 - Use TypeScript for Electron and frontend code, with explicit types at process boundaries.

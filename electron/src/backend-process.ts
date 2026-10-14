@@ -46,7 +46,7 @@ export interface BackendLaunchConfiguration {
   options: SpawnOptionsWithoutStdio;
 }
 
-type BackendCommand = "health.check" | "storage.status";
+type BackendCommand = "health.check" | "storage.status" | "documents.import" | "documents.list" | "documents.content" | "documents.retry_parse";
 
 export type BackendSpawn = (
   command: string,
@@ -316,6 +316,12 @@ export class BackendProcessManager {
     return parseStorageStatus(result);
   }
 
+  public async requestDocumentOperation(command: Exclude<BackendCommand, "health.check" | "storage.status">, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.currentState === "starting" && this.startupPromise !== undefined) await this.startupPromise;
+    if (this.currentState !== "ready") throw new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is not connected.");
+    return this.sendRequest(command, params, 60_000);
+  }
+
   public stop(): void {
     const child = this.child;
     this.child = undefined;
@@ -460,7 +466,7 @@ export class BackendProcessManager {
 
   private sendRequest(
     command: BackendCommand,
-    params: Record<string, never>,
+    params: Record<string, unknown>,
     timeoutMs: number,
   ): Promise<Record<string, unknown>> {
     const child = this.child;

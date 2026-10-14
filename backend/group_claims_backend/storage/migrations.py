@@ -255,9 +255,112 @@ def _migration_002_add_investment_vehicle_type(connection: sqlite3.Connection) -
     )
 
 
+def _migration_003_add_document_extractions(connection: sqlite3.Connection) -> None:
+    """Store versioned deterministic extraction output with source locations."""
+
+    connection.executescript(
+        """
+        ALTER TABLE source_documents ADD COLUMN file_format TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE source_documents ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'imported'
+            CHECK (processing_status IN ('imported', 'parsed', 'unsupported', 'failed'));
+        ALTER TABLE source_documents ADD COLUMN parser_version TEXT;
+        ALTER TABLE source_documents ADD COLUMN parsed_at TEXT;
+        ALTER TABLE source_documents ADD COLUMN processing_error TEXT;
+
+        CREATE TABLE document_extractions (
+            id TEXT PRIMARY KEY,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            parser_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('processing', 'parsed', 'unsupported', 'failed')),
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            error_code TEXT,
+            error_message TEXT
+        );
+        CREATE TABLE extracted_content (
+            id TEXT PRIMARY KEY,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            content_kind TEXT NOT NULL CHECK (content_kind IN ('spreadsheet_cell', 'csv_cell', 'pdf_page')),
+            sheet_name TEXT,
+            row_number INTEGER,
+            column_number INTEGER,
+            page_number INTEGER,
+            value_text TEXT,
+            value_type TEXT,
+            formula_text TEXT,
+            is_empty INTEGER NOT NULL CHECK (is_empty IN (0, 1)),
+            source_reference TEXT NOT NULL
+        );
+        CREATE INDEX idx_document_extractions_source ON document_extractions(source_document_id, started_at DESC);
+        CREATE INDEX idx_extracted_content_extraction ON extracted_content(extraction_id, id);
+        """
+    )
+
+
+def _migration_004_add_pdf_page_extractions(connection: sqlite3.Connection) -> None:
+    """Keep coordinate-aware PDF output alongside the original generic extraction rows.
+
+    Existing extraction attempts remain immutable.  This table is intentionally
+    additive so a reprocess creates a new, independently reviewable attempt.
+    """
+
+    connection.executescript(
+        """
+        CREATE TABLE pdf_page_extractions (
+            id TEXT PRIMARY KEY,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            page_number INTEGER NOT NULL CHECK (page_number > 0),
+            extraction_method TEXT NOT NULL CHECK (extraction_method IN ('native_text', 'ocr', 'unavailable')),
+            raw_text TEXT,
+            cleaned_text TEXT,
+            quality_warning TEXT,
+            ocr_language TEXT,
+            ocr_engine_version TEXT,
+            mean_confidence REAL,
+            block_count INTEGER NOT NULL DEFAULT 0 CHECK (block_count >= 0),
+            UNIQUE (extraction_id, page_number)
+        );
+        CREATE TABLE pdf_text_blocks (
+            id TEXT PRIMARY KEY,
+            pdf_page_extraction_id TEXT NOT NULL REFERENCES pdf_page_extractions(id) ON DELETE RESTRICT,
+            block_index INTEGER NOT NULL CHECK (block_index >= 0),
+            x0 REAL,
+            y0 REAL,
+            x1 REAL,
+            y1 REAL,
+            text TEXT NOT NULL,
+            confidence REAL,
+            is_table_candidate INTEGER NOT NULL DEFAULT 0 CHECK (is_table_candidate IN (0, 1)),
+            UNIQUE (pdf_page_extraction_id, block_index)
+        );
+        CREATE INDEX idx_pdf_page_extractions_attempt ON pdf_page_extractions(extraction_id, page_number);
+        CREATE INDEX idx_pdf_text_blocks_page ON pdf_text_blocks(pdf_page_extraction_id, block_index);
+        """
+    )
+
+
+def _migration_005_add_extraction_order_indexes(connection: sqlite3.Connection) -> None:
+    """Add stable grid ordering for new spreadsheet extraction attempts.
+
+    Earlier attempts did not retain workbook sheet positions; their sheet order
+    remains a deterministic name fallback until the user chooses reprocessing.
+    """
+
+    connection.executescript(
+        """
+        ALTER TABLE extracted_content ADD COLUMN worksheet_index INTEGER;
+        CREATE INDEX idx_extracted_content_grid
+            ON extracted_content (extraction_id, content_kind, worksheet_index, sheet_name, row_number, column_number);
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _migration_001_initial_schema),
     Migration(2, _migration_002_add_investment_vehicle_type),
+    Migration(3, _migration_003_add_document_extractions),
+    Migration(4, _migration_004_add_pdf_page_extractions),
+    Migration(5, _migration_005_add_extraction_order_indexes),
 )
 
 

@@ -34,6 +34,7 @@ class StorageService:
         self._configured_root = configured_root
         self.paths: StoragePaths | None = None
         self.database: Database | None = None
+        self.vault: FileVaultService | None = None
         self._status = StorageStatus("initializing", "unavailable", None, False)
 
     def initialize(self) -> StorageStatus:
@@ -46,13 +47,16 @@ class StorageService:
             paths.initialize_directories()
             database = Database(paths.database_file)
             schema_version = MigrationRunner(database).initialize()
-            FileVaultService(paths, database).recover_incomplete_imports()
+            vault = FileVaultService(paths, database)
+            vault.recover_incomplete_imports()
             self.paths = paths
             self.database = database
+            self.vault = vault
             self._status = StorageStatus("ready", "connected", schema_version, True)
         except (StorageConfigurationError, DatabaseConnectionError, MigrationError, VaultStorageError):
             self.paths = None
             self.database = None
+            self.vault = None
             self._status = StorageStatus("error", "unavailable", None, False)
 
         return self._status

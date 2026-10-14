@@ -101,6 +101,17 @@ class FileVaultService:
                 except Exception:
                     self._remove_file_if_present(final_path)
 
+    def managed_path_for(self, document: DocumentRecord) -> Path:
+        """Return a checked path for a document already owned by this vault."""
+
+        expected = f"documents/{document.id}"
+        if document.managed_relative_path != expected:
+            raise VaultStorageError("The managed document reference is invalid.")
+        managed_path = self._paths.document_path_for(document.id)
+        if managed_path.is_symlink() or not managed_path.is_file():
+            raise VaultStorageError("The managed document copy is unavailable.")
+        return managed_path
+
     def recover_incomplete_imports(self) -> None:
         """Remove only generated unreferenced vault files left by an interrupted import."""
 

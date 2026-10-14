@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, Final
 
 PROTOCOL_VERSION: Final = "1.0"
 MAX_REQUEST_BYTES: Final = 65_536
+MAX_RESPONSE_BYTES: Final = 60_000
 MAX_REQUEST_ID_LENGTH: Final = 128
 _REQUEST_ID_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 LOGGER = logging.getLogger(__name__)
@@ -62,10 +63,13 @@ def _encode_response(response: Mapping[str, object]) -> bytes:
     )
 
 
+CommandHandler = Callable[[Mapping[str, object]], Mapping[str, object]]
+
+
 class ProtocolServer:
     """Handles the allowlisted request/response protocol over byte streams."""
 
-    def __init__(self, commands: Mapping[str, Callable[[], Mapping[str, object]]]) -> None:
+    def __init__(self, commands: Mapping[str, CommandHandler]) -> None:
         self._commands = dict(commands)
 
     def serve(self, stdin: BinaryIO, stdout: BinaryIO) -> None:
@@ -98,7 +102,19 @@ class ProtocolServer:
 
     @staticmethod
     def _write(stdout: BinaryIO, response: Mapping[str, object]) -> None:
-        stdout.write(_encode_response(response))
+        encoded = _encode_response(response)
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            request_id = response.get("id")
+            encoded = _encode_response(
+                _error_response(
+                    ProtocolError(
+                        "response_too_large",
+                        "The backend response exceeds the safe protocol limit.",
+                        request_id if isinstance(request_id, str) else None,
+                    )
+                )
+            )
+        stdout.write(encoded)
         stdout.flush()
 
     def _handle_line(self, raw_line: bytes) -> dict[str, object]:
@@ -131,15 +147,16 @@ class ProtocolServer:
                 raise ProtocolError("unknown_command", "Command is not allowed.", request_id)
 
             params = payload.get("params")
-            if params != {}:
-                raise ProtocolError(
-                    "invalid_params", "Commands in this protocol do not accept parameters.", request_id
-                )
+            if not _is_record(params):
+                raise ProtocolError("invalid_params", "Command parameters must be an object.", request_id)
 
-            return _success_response(request_id, self._commands[command]())
+            return _success_response(request_id, self._commands[command](params))
         except ProtocolError as error:
             return _error_response(error)
-        except Exception:  # pragma: no cover - defensive boundary for future services
+        except Exception as error:  # pragma: no cover - defensive boundary for future services
+            code = getattr(error, "code", None)
+            if isinstance(code, str) and code.replace("_", "").isalnum():
+                return _error_response(ProtocolError(code.lower(), str(error), request_id))
             LOGGER.exception("A backend command failed.")
             return _error_response(
                 ProtocolError("internal_error", "Backend could not process the request.", request_id)

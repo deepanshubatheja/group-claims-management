@@ -22,6 +22,101 @@ button {
   font: inherit;
 }
 
+.preview-reference {
+  margin: 0 0 16px;
+  border: 1px solid #d9e3ec;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fbfdff;
+}
+
+.preview-reference-heading,
+.preview-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.preview-method {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #e8f1fa;
+  color: #285b8c;
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+
+.preview-warning {
+  margin: 10px 0;
+  color: #805a17;
+  font-size: 0.84rem;
+}
+
+.extract-preview pre {
+  max-height: 440px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #223a52;
+  font: 0.82rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.preview-pagination {
+  margin-top: 16px;
+}
+
+.preview-pagination button {
+  border: 1px solid #b8cadb;
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #fff;
+  color: #285b8c;
+}
+
+.preview-pagination button:disabled {
+  color: #8394a3;
+  cursor: not-allowed;
+}
+
+.extraction-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.extraction-summary div,
+.cell-inspector {
+  border: 1px solid #d9e3ec;
+  border-radius: 7px;
+  padding: 10px;
+  background: #fbfdff;
+}
+
+.extraction-summary dt { color: #60758a; font-size: 0.72rem; }
+.extraction-summary dd { margin: 4px 0 0; color: #173b5c; font-weight: 650; }
+.worksheet-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 18px 0 10px; color: #536b81; font-size: 0.86rem; }
+.worksheet-toolbar select { margin-left: 8px; border: 1px solid #b8cadb; border-radius: 5px; padding: 6px; background: #fff; color: #173b5c; }
+.spreadsheet-scroll { max-height: 540px; overflow: auto; border: 1px solid #d9e3ec; border-radius: 8px; }
+.spreadsheet-grid { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.spreadsheet-grid th { position: sticky; top: 0; z-index: 1; min-width: 48px; border: 1px solid #d9e3ec; padding: 6px 8px; background: #edf3f8; color: #46637d; text-align: center; }
+.spreadsheet-grid tbody th { position: sticky; left: 0; z-index: 1; background: #f7fafc; }
+.spreadsheet-grid td { min-width: 118px; height: 30px; border: 1px solid #e4ebf1; padding: 0; }
+.grid-cell { display: block; width: 100%; min-height: 30px; overflow: hidden; border: 0; padding: 5px 7px; background: #fff; color: #65798c; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.grid-cell.populated { color: #193a58; }
+.grid-cell:hover, .grid-cell:focus-visible { background: #e8f1fa; outline: 2px solid #4e8cce; outline-offset: -2px; }
+.grid-pagination { display: flex; gap: 8px; margin-top: 12px; }
+.grid-pagination button, .worksheet-toolbar button { border: 1px solid #b8cadb; border-radius: 6px; padding: 7px 10px; background: #fff; color: #285b8c; }
+.cell-inspector { display: grid; gap: 5px; margin-top: 14px; font-size: 0.84rem; }
+.cell-inspector code, .cell-inspector pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.pdf-blocks { margin-top: 14px; color: #405a72; font-size: 0.82rem; }
+.pdf-blocks p { margin: 8px 0; border-bottom: 1px solid #edf1f4; padding-bottom: 8px; white-space: pre-wrap; }
+.viewer-state, .viewer-error, .viewer-warning { margin: 16px 0; border-radius: 7px; padding: 11px 12px; font-size: 0.9rem; }
+.viewer-state { background: #edf3f8; color: #405a72; }
+.viewer-error { border: 1px solid #e7c5c5; background: #fcebed; color: #8f2930; }
+.viewer-warning { border: 1px solid #ead9ad; background: #fff8e7; color: #785a18; }
+
 .app-shell {
   display: flex;
   min-height: 100vh;
@@ -247,6 +342,14 @@ h2 {
   background: #ffffff;
   box-shadow: 0 8px 24px rgb(31 57 79 / 4%);
 }
+
+.documents-card { max-width: 900px; margin-top: 18px; padding: 26px 28px; border: 1px solid #d9e3ec; border-radius: 12px; background: #fff; box-shadow: 0 8px 24px rgb(31 57 79 / 4%); }
+.primary-button { border: 0; border-radius: 7px; padding: 10px 14px; background: #1d5f99; color: #fff; font-weight: 650; cursor: pointer; }
+.support-note { margin: 14px 0 0; color: #5c7591; font-size: .8rem; }
+.document-row { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 16px; margin-top: 10px; border: 1px solid #d9e3ec; border-radius: 8px; padding: 13px; background: #fff; color: #173b5c; text-align: left; cursor: pointer; }
+.document-row small { display: block; margin-top: 4px; color: #6f8294; }
+.document-status { border-radius: 999px; padding: 5px 8px; background: #edf3f8; font-size: .72rem; text-transform: capitalize; }.document-status.parsed { color: #17643d; background: #e7f6ec; }.document-status.failed,.document-status.unsupported { color: #8f2930; background: #fcebed; }
+.extract-preview { max-height: 420px; overflow: auto; border-top: 1px solid #e2e9ef; }.extract-preview p { padding: 10px 0; margin: 0; border-bottom: 1px solid #edf1f4; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .storage-card-header {
   display: flex;

@@ -15,7 +15,8 @@
     "dev": "concurrently --kill-others --names frontend,electron-build,electron \"npm run dev --workspace frontend\" \"npm run dev:build --workspace electron\" \"npm run dev:start --workspace electron\"",
     "build": "npm run build --workspace frontend && npm run build --workspace electron",
     "typecheck": "npm run typecheck --workspace frontend && npm run typecheck --workspace electron",
-    "test:electron": "npm run test --workspace electron"
+    "test:electron": "npm run test --workspace electron",
+    "test:frontend": "npm run test --workspace frontend"
   },
   "devDependencies": {
     "concurrently": "9.1.2"
