@@ -7,6 +7,7 @@ import { type BackendHealth, type StorageStatus } from "./ipc-contract";
 
 const PROTOCOL_VERSION = "1.0";
 const MAX_PROTOCOL_LINE_BYTES = 65_536;
+const MAX_DIAGNOSTIC_LINE_CHARS = 1_000;
 
 export type BackendState = "idle" | "starting" | "ready" | "failed" | "stopped";
 
@@ -228,7 +229,9 @@ export class BackendProcessManager {
 
   public constructor(private readonly options: BackendProcessManagerOptions) {
     this.spawn = options.spawn ?? spawnBackend;
-    this.startupTimeoutMs = options.startupTimeoutMs ?? 8_000;
+    // Covers interpreter launch plus the first health check; cold starts on
+    // office laptops (antivirus scanning, first-run bytecode compilation) can be slow.
+    this.startupTimeoutMs = options.startupTimeoutMs ?? 20_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
     this.onDiagnostic = options.onDiagnostic ?? (() => undefined);
   }
@@ -246,16 +249,16 @@ export class BackendProcessManager {
       return this.startupPromise;
     }
 
-    if (this.currentState === "failed" || this.currentState === "stopped") {
+    if (this.currentState === "stopped") {
       return Promise.reject(
-        new BackendProcessError(
-          "BACKEND_UNAVAILABLE",
-          "The backend is unavailable and will not be restarted automatically.",
-        ),
+        new BackendProcessError("BACKEND_UNAVAILABLE", "The backend was stopped."),
       );
     }
 
+    // A failed backend is never restarted automatically; it is only restarted
+    // when a caller explicitly invokes start() again (for example, a user retry).
     this.currentState = "starting";
+    this.stdoutBuffer = Buffer.alloc(0);
     try {
       const child = this.spawn(
         this.options.launch.command,
@@ -332,8 +335,38 @@ export class BackendProcessManager {
     child.stdout.on("data", (chunk: Buffer | string) => {
       this.handleStdout(child, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"));
     });
-    child.stderr.on("data", () => {
-      // Python diagnostics are intentionally not forwarded to the renderer or logs with payload data.
+    // Python writes operational logs (never raw request content) to stderr. Forward
+    // them line by line to diagnostics only; they are never sent to the renderer.
+    let stderrText = "";
+    const forwardStderrLine = (line: string): void => {
+      const trimmed = line.trimEnd();
+      if (trimmed.length === 0) {
+        return;
+      }
+      this.onDiagnostic(
+        `python: ${
+          trimmed.length > MAX_DIAGNOSTIC_LINE_CHARS
+            ? `${trimmed.slice(0, MAX_DIAGNOSTIC_LINE_CHARS)}…`
+            : trimmed
+        }`,
+      );
+    };
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderrText += chunk;
+      const lines = stderrText.split("\n");
+      stderrText = lines.pop() ?? "";
+      for (const line of lines) {
+        forwardStderrLine(line);
+      }
+      if (stderrText.length > MAX_DIAGNOSTIC_LINE_CHARS) {
+        forwardStderrLine(stderrText);
+        stderrText = "";
+      }
+    });
+    child.stderr.on("end", () => {
+      forwardStderrLine(stderrText);
+      stderrText = "";
     });
     child.once("error", () => {
       this.failForChild(

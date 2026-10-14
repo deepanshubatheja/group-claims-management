@@ -184,6 +184,20 @@ function startDevelopmentBackend(storageRoot: string): void {
   }
 }
 
+// Called on explicit renderer health requests (initial load or user retry): restarts a
+// failed backend once per request, and retries configuration if the venv was missing.
+async function ensureDevelopmentBackend(): Promise<BackendProcessManager | undefined> {
+  if (backendProcess === undefined) {
+    startDevelopmentBackend();
+  }
+
+  if (backendProcess?.state === "failed") {
+    await backendProcess.start();
+  }
+
+  return backendProcess;
+}
+
 app.setName("Group Claims Management");
 
 app.whenReady().then(() => {
@@ -216,14 +230,15 @@ app.whenReady().then(() => {
         throw new Error("Invalid backend health request.");
       }
 
-      if (backendProcess === undefined) {
-        return createBackendHealthFailure(
-          new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."),
-        );
-      }
-
       try {
-        return { ok: true, health: await backendProcess.getHealth() };
+        const backend = await ensureDevelopmentBackend();
+        if (backend === undefined) {
+          return createBackendHealthFailure(
+            new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."),
+          );
+        }
+
+        return { ok: true, health: await backend.getHealth() };
       } catch (error: unknown) {
         return createBackendHealthFailure(error);
       }

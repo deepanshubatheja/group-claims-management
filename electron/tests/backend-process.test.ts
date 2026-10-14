@@ -187,6 +187,70 @@ test("stops the child process and rejects pending work during clean shutdown", a
   assert.equal(fake.killed, true);
 });
 
+test("restarts a failed backend only when start is called again", async () => {
+  const first = new FakeBackendProcess();
+  const second = new FakeBackendProcess();
+  let spawnCount = 0;
+  const manager = createManager(first, {
+    spawn: () => (++spawnCount === 1 ? first : second),
+  });
+  await startConnected(manager, first);
+
+  first.terminateUnexpectedly();
+  assert.equal(manager.state, "failed");
+  assert.equal(spawnCount, 1);
+  await assert.rejects(manager.getHealth(), (error: unknown) => {
+    assert.ok(error instanceof BackendProcessError);
+    assert.equal(error.code, "BACKEND_UNAVAILABLE");
+    return true;
+  });
+
+  await startConnected(manager, second);
+  assert.equal(spawnCount, 2);
+  assert.equal(manager.state, "ready");
+  manager.stop();
+});
+
+test("does not restart a backend after a clean stop", async () => {
+  const fake = new FakeBackendProcess();
+  let spawnCount = 0;
+  const manager = createManager(fake, {
+    spawn: () => {
+      spawnCount += 1;
+      return fake;
+    },
+  });
+  await startConnected(manager, fake);
+  manager.stop();
+
+  await assert.rejects(manager.start(), (error: unknown) => {
+    assert.ok(error instanceof BackendProcessError);
+    assert.equal(error.code, "BACKEND_UNAVAILABLE");
+    return true;
+  });
+  assert.equal(spawnCount, 1);
+  assert.equal(manager.state, "stopped");
+});
+
+test("forwards backend stderr lines to diagnostics", async () => {
+  const fake = new FakeBackendProcess();
+  const diagnostics: string[] = [];
+  const manager = createManager(fake, {
+    onDiagnostic: (message) => diagnostics.push(message),
+  });
+  await startConnected(manager, fake);
+
+  fake.stderr.write("first line\nsecond ");
+  fake.stderr.write("line\n\n");
+  fake.stderr.write(`${"x".repeat(1_500)}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(diagnostics.slice(0, 2), ["python: first line", "python: second line"]);
+  assert.equal(diagnostics.length, 3);
+  assert.equal(diagnostics[2], `python: ${"x".repeat(1_000)}…`);
+  manager.stop();
+});
+
 test("communicates with the real local Python health-check process", async () => {
   const projectRoot = path.resolve(process.cwd(), "..");
   const storageRoot = mkdtempSync(path.join(os.tmpdir(), "group-claims-electron-test-"));
