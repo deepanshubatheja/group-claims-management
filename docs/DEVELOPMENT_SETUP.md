@@ -19,9 +19,23 @@ The application will use Electron, React, TypeScript, Vite, Python, and SQLite. 
 - Git for source control.
 - macOS or Windows for supported desktop behavior.
 
+For the Phase 3 backend, create a project-local virtual environment with
+`python3 -m venv backend/.venv` (on Windows, use the installed Python launcher
+or interpreter). Phase 3 has no third-party Python runtime dependencies.
+
 ## Dependency management
 
 Frontend and Electron dependencies will be declared in the repository's Node package manifest and installed through a lockfile-backed package-manager workflow. Backend dependencies will be declared in a Python dependency manifest and installed into a project-local virtual environment. No dependencies are installed during Phase 1.
+
+The Phase 3 Electron-to-Python boundary is private newline-delimited UTF-8 JSON
+over the Python child process's stdin/stdout; it does not open a network port.
+Electron starts the development backend from `backend/.venv` and exposes only
+allowlisted, typed IPC methods to the renderer. Production packaging will bundle
+a standalone backend executable in a later milestone, so end users will not need
+to install Python.
+
+Run Python protocol tests with `cd backend && ./.venv/bin/python -m unittest discover -s tests -v`
+on macOS/Linux, or the corresponding `.venv\\Scripts\\python.exe` command on Windows.
 
 ## Naming and organization
 

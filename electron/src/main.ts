@@ -1,18 +1,34 @@
 import { app, BrowserWindow, ipcMain, session } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { GET_APP_INFO_CHANNEL, type AppInfo } from "./ipc-contract";
+import {
+  BackendProcessError,
+  BackendProcessManager,
+  resolveDevelopmentBackendLaunch,
+} from "./backend-process";
+import {
+  GET_APP_INFO_CHANNEL,
+  GET_BACKEND_HEALTH_CHANNEL,
+  type AppInfo,
+  type BackendHealthResponse,
+} from "./ipc-contract";
 
 const developmentServerUrl = process.env.ELECTRON_RENDERER_URL;
 const rendererHtmlPath = path.join(__dirname, "../../frontend/dist/index.html");
 const rendererHtmlUrl = pathToFileURL(rendererHtmlPath).toString();
+const projectRoot = path.join(__dirname, "../..");
+let backendProcess: BackendProcessManager | undefined;
 
 function isAllowedRendererUrl(url: string): boolean {
-  if (developmentServerUrl !== undefined) {
-    return new URL(url).origin === new URL(developmentServerUrl).origin;
-  }
+  try {
+    if (developmentServerUrl !== undefined) {
+      return new URL(url).origin === new URL(developmentServerUrl).origin;
+    }
 
-  return url === rendererHtmlUrl;
+    return url === rendererHtmlUrl;
+  } catch {
+    return false;
+  }
 }
 
 function createAppInfo(): AppInfo {
@@ -127,10 +143,50 @@ function createMainWindow(): BrowserWindow {
   return window;
 }
 
+function createBackendHealthFailure(
+  error: unknown,
+): BackendHealthResponse {
+  if (error instanceof BackendProcessError) {
+    return {
+      ok: false,
+      error: {
+        code: error.code,
+        message: error.message,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    error: {
+      code: "BACKEND_UNAVAILABLE",
+      message: "The backend is unavailable.",
+    },
+  };
+}
+
+function startDevelopmentBackend(): void {
+  if (app.isPackaged) {
+    // Packaging a standalone backend executable is a later release milestone.
+    return;
+  }
+
+  try {
+    backendProcess = new BackendProcessManager({
+      launch: resolveDevelopmentBackendLaunch(projectRoot),
+      onDiagnostic: (message) => console.error(`Backend process: ${message}`),
+    });
+    void backendProcess.start().catch(() => undefined);
+  } catch (error: unknown) {
+    console.error("Backend process could not be configured.");
+  }
+}
+
 app.setName("Group Claims Management");
 
 app.whenReady().then(() => {
   configureSessionSecurity();
+  startDevelopmentBackend();
 
   ipcMain.handle(GET_APP_INFO_CHANNEL, (event, ...arguments_: unknown[]) => {
     const senderFrame = event.senderFrame;
@@ -146,6 +202,32 @@ app.whenReady().then(() => {
     return createAppInfo();
   });
 
+  ipcMain.handle(
+    GET_BACKEND_HEALTH_CHANNEL,
+    async (event, ...arguments_: unknown[]): Promise<BackendHealthResponse> => {
+      const senderFrame = event.senderFrame;
+      if (
+        arguments_.length !== 0 ||
+        senderFrame === null ||
+        !isAllowedRendererUrl(senderFrame.url)
+      ) {
+        throw new Error("Invalid backend health request.");
+      }
+
+      if (backendProcess === undefined) {
+        return createBackendHealthFailure(
+          new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."),
+        );
+      }
+
+      try {
+        return { ok: true, health: await backendProcess.getHealth() };
+      } catch (error: unknown) {
+        return createBackendHealthFailure(error);
+      }
+    },
+  );
+
   createMainWindow();
 
   app.on("activate", () => {
@@ -159,4 +241,8 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  backendProcess?.stop();
 });

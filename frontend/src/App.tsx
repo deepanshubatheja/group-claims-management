@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import BackendStatus from "./components/BackendStatus";
 
 const navigationItems = [
   "Dashboard",
@@ -118,6 +119,8 @@ function App() {
             </div>
           </dl>
         </section>
+
+        <BackendStatus />
       </main>
     </div>
   );

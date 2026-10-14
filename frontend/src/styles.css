@@ -224,6 +224,126 @@ h2 {
   margin-bottom: 0;
 }
 
+.backend-card {
+  display: grid;
+  max-width: 760px;
+  gap: 18px;
+  margin-top: 18px;
+  padding: 26px 28px;
+  border: 1px solid #d9e3ec;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 8px 24px rgb(31 57 79 / 4%);
+}
+
+.backend-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.backend-card-header h2 {
+  margin-bottom: 0;
+}
+
+.backend-status {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.backend-status.starting {
+  color: #745b16;
+  background: #fff6d9;
+}
+
+.backend-status.connected {
+  color: #17643d;
+  background: #e7f6ec;
+}
+
+.backend-status.disconnected,
+.backend-status.error {
+  color: #8f2930;
+  background: #fcebed;
+}
+
+.backend-status.starting .status-dot {
+  background: #b58b14;
+}
+
+.backend-status.connected .status-dot {
+  background: #248451;
+}
+
+.backend-status.disconnected .status-dot,
+.backend-status.error .status-dot {
+  background: #bd3e48;
+}
+
+.backend-message {
+  margin: 0;
+  color: #536b83;
+  font-size: 0.94rem;
+}
+
+.backend-details {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.backend-details div {
+  min-width: 0;
+}
+
+.backend-details dt {
+  margin-bottom: 5px;
+  color: #6f8294;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.backend-details dd {
+  margin: 0;
+  color: #183a58;
+  font-size: 0.85rem;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.retry-button {
+  width: fit-content;
+  padding: 9px 13px;
+  border: 1px solid #9bb4d0;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #1e5c98;
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.retry-button:hover:not(:disabled) {
+  border-color: #2d6eaa;
+  background: #f2f7fc;
+}
+
+.retry-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 dl {
   display: grid;
   min-width: 235px;
@@ -279,7 +399,8 @@ dd {
   }
 
   .page-header,
-  .environment-card {
+  .environment-card,
+  .backend-card-header {
     flex-direction: column;
   }
 
@@ -299,5 +420,9 @@ dd {
 
   dl {
     width: 100%;
+  }
+
+  .backend-details {
+    grid-template-columns: 1fr;
   }
 }

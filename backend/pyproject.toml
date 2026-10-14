@@ -1,0 +1,10 @@
+[project]
+name = "group-claims-backend"
+version = "0.1.0"
+description = "Local application core for Group Claims Management."
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
