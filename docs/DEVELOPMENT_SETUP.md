@@ -34,6 +34,14 @@ allowlisted, typed IPC methods to the renderer. Production packaging will bundle
 a standalone backend executable in a later milestone, so end users will not need
 to install Python.
 
+Phase 4 storage is initialized by the Python backend from Electron's
+`app.getPath('userData')` value. On macOS this is normally under
+`~/Library/Application Support/Group Claims Management`; on Windows it is under
+the current user's `%APPDATA%\\Group Claims Management`. The repository and app
+install directory never contain user documents or runtime databases. The managed
+layout is `database/`, `documents/`, `exports/`, `backups/`, and `logs/`.
+Local storage is not encrypted automatically.
+
 Run Python protocol tests with `cd backend && ./.venv/bin/python -m unittest discover -s tests -v`
 on macOS/Linux, or the corresponding `.venv\\Scripts\\python.exe` command on Windows.
 

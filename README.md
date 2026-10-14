@@ -13,7 +13,7 @@ The application will support macOS and Windows. Imported source documents will b
 
 ## Development status
 
-**Phase 3 — Local Backend Foundation:** Electron now supervises a development-only Python child process using a private newline-delimited JSON protocol. The secure typed preload bridge exposes a health check, and the dashboard displays actual backend runtime information. SQLite, document handling, business logic, billing, AI integration, and production backend packaging remain intentionally unimplemented.
+**Phase 4 — Local Persistence Foundation:** Electron supplies its OS-managed user-data directory to the local Python backend. SQLite uses versioned migrations, and a backend-only vault can retain immutable document copies with SHA-256 metadata. The dashboard reports real storage status. Document parsing, business logic, billing, AI integration, backup workflows, and production backend packaging remain intentionally unimplemented.
 
 ## Local development
 

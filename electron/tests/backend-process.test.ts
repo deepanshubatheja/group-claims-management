@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { PassThrough } from "node:stream";
@@ -187,8 +189,9 @@ test("stops the child process and rejects pending work during clean shutdown", a
 
 test("communicates with the real local Python health-check process", async () => {
   const projectRoot = path.resolve(process.cwd(), "..");
+  const storageRoot = mkdtempSync(path.join(os.tmpdir(), "group-claims-electron-test-"));
   const manager = new BackendProcessManager({
-    launch: resolveDevelopmentBackendLaunch(projectRoot),
+    launch: resolveDevelopmentBackendLaunch(projectRoot, storageRoot),
     startupTimeoutMs: 3_000,
     requestTimeoutMs: 3_000,
   });
@@ -200,5 +203,30 @@ test("communicates with the real local Python health-check process", async () =>
     assert.match(health.pythonVersion, /^3\./);
   } finally {
     manager.stop();
+    rmSync(storageRoot, { recursive: true, force: true });
   }
+});
+
+test("retrieves a validated storage status through the allowlisted protocol", async () => {
+  const fake = new FakeBackendProcess();
+  const manager = createManager(fake);
+  await startConnected(manager, fake);
+
+  const storage = manager.getStorageStatus();
+  const request = await nextRequest(fake);
+  assert.equal(request.command, "storage.status");
+  fake.emitResponse({
+    protocolVersion: "1.0",
+    id: request.id,
+    ok: true,
+    result: {
+      status: "ready",
+      databaseStatus: "connected",
+      schemaVersion: 1,
+      directoriesAvailable: true,
+    },
+  });
+
+  assert.equal((await storage).schemaVersion, 1);
+  manager.stop();
 });

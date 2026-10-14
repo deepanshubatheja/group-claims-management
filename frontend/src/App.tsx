@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import BackendStatus from "./components/BackendStatus";
+import StorageStatus from "./components/StorageStatus";
 
 const navigationItems = [
   "Dashboard",
@@ -121,6 +122,7 @@ function App() {
         </section>
 
         <BackendStatus />
+        <StorageStatus />
       </main>
     </div>
   );

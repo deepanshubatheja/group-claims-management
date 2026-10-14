@@ -21,9 +21,21 @@ type BackendHealthResponse =
   | { ok: true; health: BackendHealth }
   | { ok: false; error: { code: string; message: string } };
 
+interface StorageStatus {
+  status: "ready" | "error";
+  databaseStatus: "connected" | "unavailable";
+  schemaVersion: number | null;
+  directoriesAvailable: boolean;
+}
+
+type StorageStatusResponse =
+  | { ok: true; storage: StorageStatus }
+  | { ok: false; error: { code: string; message: string } };
+
 interface DesktopAPI {
   getAppInfo(): Promise<AppInfo>;
   getBackendHealth(): Promise<BackendHealthResponse>;
+  getStorageStatus(): Promise<StorageStatusResponse>;
 }
 
 interface Window {

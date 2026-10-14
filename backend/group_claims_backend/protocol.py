@@ -65,8 +65,8 @@ def _encode_response(response: Mapping[str, object]) -> bytes:
 class ProtocolServer:
     """Handles the allowlisted request/response protocol over byte streams."""
 
-    def __init__(self, health_check: Callable[[], Mapping[str, object]]) -> None:
-        self._health_check = health_check
+    def __init__(self, commands: Mapping[str, Callable[[], Mapping[str, object]]]) -> None:
+        self._commands = dict(commands)
 
     def serve(self, stdin: BinaryIO, stdout: BinaryIO) -> None:
         """Read one request line at a time and emit one JSON response per line."""
@@ -127,16 +127,16 @@ class ProtocolServer:
                 )
 
             command = payload.get("command")
-            if command != "health.check":
+            if not isinstance(command, str) or command not in self._commands:
                 raise ProtocolError("unknown_command", "Command is not allowed.", request_id)
 
             params = payload.get("params")
             if params != {}:
                 raise ProtocolError(
-                    "invalid_params", "health.check does not accept parameters.", request_id
+                    "invalid_params", "Commands in this protocol do not accept parameters.", request_id
                 )
 
-            return _success_response(request_id, self._health_check())
+            return _success_response(request_id, self._commands[command]())
         except ProtocolError as error:
             return _error_response(error)
         except Exception:  # pragma: no cover - defensive boundary for future services

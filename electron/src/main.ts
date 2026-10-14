@@ -9,8 +9,10 @@ import {
 import {
   GET_APP_INFO_CHANNEL,
   GET_BACKEND_HEALTH_CHANNEL,
+  GET_STORAGE_STATUS_CHANNEL,
   type AppInfo,
   type BackendHealthResponse,
+  type StorageStatusResponse,
 } from "./ipc-contract";
 
 const developmentServerUrl = process.env.ELECTRON_RENDERER_URL;
@@ -145,7 +147,7 @@ function createMainWindow(): BrowserWindow {
 
 function createBackendHealthFailure(
   error: unknown,
-): BackendHealthResponse {
+): { ok: false; error: { code: string; message: string } } {
   if (error instanceof BackendProcessError) {
     return {
       ok: false,
@@ -165,7 +167,7 @@ function createBackendHealthFailure(
   };
 }
 
-function startDevelopmentBackend(): void {
+function startDevelopmentBackend(storageRoot: string): void {
   if (app.isPackaged) {
     // Packaging a standalone backend executable is a later release milestone.
     return;
@@ -173,7 +175,7 @@ function startDevelopmentBackend(): void {
 
   try {
     backendProcess = new BackendProcessManager({
-      launch: resolveDevelopmentBackendLaunch(projectRoot),
+      launch: resolveDevelopmentBackendLaunch(projectRoot, storageRoot),
       onDiagnostic: (message) => console.error(`Backend process: ${message}`),
     });
     void backendProcess.start().catch(() => undefined);
@@ -186,7 +188,7 @@ app.setName("Group Claims Management");
 
 app.whenReady().then(() => {
   configureSessionSecurity();
-  startDevelopmentBackend();
+  startDevelopmentBackend(app.getPath("userData"));
 
   ipcMain.handle(GET_APP_INFO_CHANNEL, (event, ...arguments_: unknown[]) => {
     const senderFrame = event.senderFrame;
@@ -222,6 +224,32 @@ app.whenReady().then(() => {
 
       try {
         return { ok: true, health: await backendProcess.getHealth() };
+      } catch (error: unknown) {
+        return createBackendHealthFailure(error);
+      }
+    },
+  );
+
+  ipcMain.handle(
+    GET_STORAGE_STATUS_CHANNEL,
+    async (event, ...arguments_: unknown[]): Promise<StorageStatusResponse> => {
+      const senderFrame = event.senderFrame;
+      if (
+        arguments_.length !== 0 ||
+        senderFrame === null ||
+        !isAllowedRendererUrl(senderFrame.url)
+      ) {
+        throw new Error("Invalid storage status request.");
+      }
+
+      if (backendProcess === undefined) {
+        return createBackendHealthFailure(
+          new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."),
+        );
+      }
+
+      try {
+        return { ok: true, storage: await backendProcess.getStorageStatus() };
       } catch (error: unknown) {
         return createBackendHealthFailure(error);
       }

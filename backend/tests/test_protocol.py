@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,9 +23,14 @@ def request(request_id: str, command: str = "health.check", **overrides: object)
     return payload
 
 
-def run_backend(raw_input: bytes) -> tuple[list[dict[str, object]], str]:
+def run_backend(
+    raw_input: bytes, storage_root: Path | None = None
+) -> tuple[list[dict[str, object]], str]:
+    command = [sys.executable, "-m", "group_claims_backend"]
+    if storage_root is not None:
+        command.extend(["--storage-root", str(storage_root)])
     completed = subprocess.run(
-        [sys.executable, "-m", "group_claims_backend"],
+        command,
         cwd=BACKEND_ROOT,
         input=raw_input,
         stdout=subprocess.PIPE,
@@ -109,6 +115,33 @@ class ProtocolServerTests(unittest.TestCase):
 
         self.assertEqual(len(responses), 1)
         self.assertNotIn("health.check", stderr)
+
+    def test_storage_status_initializes_supplied_temporary_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "app-data"
+            responses, _ = run_backend(
+                (json.dumps(request("storage-1", "storage.status")) + "\n").encode(),
+                root,
+            )
+
+            self.assertTrue(responses[0]["ok"])
+            result = responses[0]["result"]
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["databaseStatus"], "connected")
+            self.assertEqual(result["schemaVersion"], 2)
+            self.assertTrue(result["directoriesAvailable"])
+            self.assertTrue((root / "database" / "claims.sqlite").is_file())
+
+    def test_storage_failure_is_reported_without_falsely_reporting_ready(self) -> None:
+        responses, _ = run_backend(
+            (json.dumps(request("storage-error", "storage.status")) + "\n").encode(),
+        )
+
+        self.assertTrue(responses[0]["ok"])
+        result = responses[0]["result"]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["databaseStatus"], "unavailable")
+        self.assertFalse(result["directoriesAvailable"])
 
 
 if __name__ == "__main__":

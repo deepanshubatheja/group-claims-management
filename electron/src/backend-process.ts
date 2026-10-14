@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { type BackendHealth } from "./ipc-contract";
+import { type BackendHealth, type StorageStatus } from "./ipc-contract";
 
 const PROTOCOL_VERSION = "1.0";
 const MAX_PROTOCOL_LINE_BYTES = 65_536;
@@ -44,6 +44,8 @@ export interface BackendLaunchConfiguration {
   args: string[];
   options: SpawnOptionsWithoutStdio;
 }
+
+type BackendCommand = "health.check" | "storage.status";
 
 export type BackendSpawn = (
   command: string,
@@ -150,8 +152,32 @@ function parseBackendHealth(value: Record<string, unknown>): BackendHealth {
   });
 }
 
+function parseStorageStatus(value: Record<string, unknown>): StorageStatus {
+  if (
+    (value.status !== "ready" && value.status !== "error") ||
+    (value.databaseStatus !== "connected" && value.databaseStatus !== "unavailable") ||
+    (typeof value.schemaVersion !== "number" && value.schemaVersion !== null) ||
+    (typeof value.schemaVersion === "number" &&
+      (!Number.isInteger(value.schemaVersion) || value.schemaVersion < 0)) ||
+    typeof value.directoriesAvailable !== "boolean"
+  ) {
+    throw new BackendProcessError(
+      "BACKEND_PROTOCOL_ERROR",
+      "The backend returned an invalid storage response.",
+    );
+  }
+
+  return Object.freeze({
+    status: value.status,
+    databaseStatus: value.databaseStatus,
+    schemaVersion: value.schemaVersion,
+    directoriesAvailable: value.directoriesAvailable,
+  });
+}
+
 export function resolveDevelopmentBackendLaunch(
   projectRoot: string,
+  storageRoot: string,
   platform: NodeJS.Platform = process.platform,
 ): BackendLaunchConfiguration {
   const backendDirectory = path.join(projectRoot, "backend");
@@ -167,9 +193,19 @@ export function resolveDevelopmentBackendLaunch(
     );
   }
 
+  if (
+    !path.isAbsolute(storageRoot) ||
+    path.parse(storageRoot).root === path.resolve(storageRoot)
+  ) {
+    throw new BackendProcessError(
+      "BACKEND_UNAVAILABLE",
+      "The application storage directory is unavailable.",
+    );
+  }
+
   return {
     command: interpreter,
-    args: ["-m", "group_claims_backend"],
+    args: ["-m", "group_claims_backend", "--storage-root", storageRoot],
     options: {
       cwd: backendDirectory,
       env: { ...process.env, PYTHONUTF8: "1" },
@@ -262,6 +298,19 @@ export class BackendProcessManager {
 
     const result = await this.sendRequest("health.check", {}, this.requestTimeoutMs);
     return parseBackendHealth(result);
+  }
+
+  public async getStorageStatus(): Promise<StorageStatus> {
+    if (this.currentState === "starting" && this.startupPromise !== undefined) {
+      await this.startupPromise;
+    }
+
+    if (this.currentState !== "ready") {
+      throw new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is not connected.");
+    }
+
+    const result = await this.sendRequest("storage.status", {}, this.requestTimeoutMs);
+    return parseStorageStatus(result);
   }
 
   public stop(): void {
@@ -377,7 +426,7 @@ export class BackendProcessManager {
   }
 
   private sendRequest(
-    command: "health.check",
+    command: BackendCommand,
     params: Record<string, never>,
     timeoutMs: number,
   ): Promise<Record<string, unknown>> {

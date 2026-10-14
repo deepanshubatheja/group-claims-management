@@ -8,6 +8,7 @@ from typing import BinaryIO
 
 from .protocol import ProtocolServer
 from .services.health import get_health_status
+from .storage.service import StorageService
 
 
 def configure_logging() -> None:
@@ -23,11 +24,16 @@ def configure_logging() -> None:
 def main(
     stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
+    storage_root: str | None = None,
 ) -> int:
     """Serve the restricted local protocol until stdin is closed."""
 
     configure_logging()
-    server = ProtocolServer(health_check=get_health_status)
+    storage = StorageService(storage_root)
+    storage.initialize()
+    server = ProtocolServer(
+        {"health.check": get_health_status, "storage.status": storage.status}
+    )
     server.serve(
         stdin if stdin is not None else sys.stdin.buffer,
         stdout if stdout is not None else sys.stdout.buffer,
