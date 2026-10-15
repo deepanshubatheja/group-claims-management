@@ -3,13 +3,14 @@ import test from "node:test";
 import {
   nextPdfPage,
   previousPdfPage,
+  evidenceTarget,
   spreadsheetRequest,
 } from "../src/components/document-viewer-navigation.js";
 import { loadDocumentPreview } from "../src/components/document-viewer-client.js";
 
 const parsedWorkbook: DocumentContentResponse = {
   ok: true,
-  document: { id: "document-1", original_filename: "holdings.xlsx", file_size_bytes: 64, imported_at: "2026-01-01T00:00:00Z", file_format: "xlsx", processing_status: "parsed", processing_error: null },
+  document: { id: "document-1", original_filename: "holdings.xlsx", file_size_bytes: 64, imported_at: "2026-01-01T00:00:00Z", file_format: "xlsx", processing_status: "parsed", processing_error: null, ai_review_status: "new" },
   contentType: "spreadsheet",
   worksheets: [{ name: "Holdings", maxRow: 30, maxColumn: 10 }],
   grid: { sheetName: "Holdings", rowStart: 1, rowLimit: 10, columnStart: 1, columnLimit: 10, cells: [{ source_reference: "Holdings!A1", value_text: "000123" }] },
@@ -62,4 +63,12 @@ test("creates bounded coordinate requests for worksheet switching and navigation
   assert.deepEqual(spreadsheetRequest("Notes", 21, 11), {
     sheetName: "Notes", rowStart: 21, rowLimit: 10, columnStart: 11, columnLimit: 10,
   });
+});
+
+test("parses only canonical AI evidence references for local navigation", () => {
+  assert.deepEqual(evidenceTarget("page 1 block 3"), { kind: "pdf", pageNumber: 1, blockIndex: 3 });
+  assert.deepEqual(evidenceTarget("page 5"), { kind: "pdf", pageNumber: 5, blockIndex: null });
+  assert.deepEqual(evidenceTarget("Holdings!AA21"), { kind: "spreadsheet", sheetName: "Holdings", rowNumber: 21, columnNumber: 27 });
+  assert.equal(evidenceTarget("page 0 block 1"), null);
+  assert.equal(evidenceTarget("file:///private-document"), null);
 });

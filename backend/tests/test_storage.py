@@ -56,7 +56,7 @@ class StorageTestCase(unittest.TestCase):
         return source
 
     def test_first_run_creates_expected_directories_and_schema(self) -> None:
-        self.assertEqual(self.status.schema_version, 5)
+        self.assertEqual(self.status.schema_version, 9)
         self.assertTrue(all(directory.is_dir() for directory in (
             self.paths.database,
             self.paths.documents,
@@ -111,7 +111,7 @@ class StorageTestCase(unittest.TestCase):
         assert self.service.database is not None
         with self.service.database.connection() as connection:
             version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 9)
 
         failed_database = StorageService(str(Path(self.temporary_directory.name) / "failed-migration"))
         self.assertEqual(failed_database.initialize().status, "ready")
@@ -122,14 +122,14 @@ class StorageTestCase(unittest.TestCase):
             connection.execute("THIS IS NOT VALID SQL")
 
         with self.assertRaises(Exception):
-            MigrationRunner(failed_database.database, (Migration(6, invalid_migration),)).initialize()
+            MigrationRunner(failed_database.database, (Migration(10, invalid_migration),)).initialize()
         with failed_database.database.connection() as connection:
             partial = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'partial_migration'"
             ).fetchone()
             version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
         self.assertIsNone(partial)
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 9)
 
     def test_existing_version_one_database_upgrades_without_resetting_data(self) -> None:
         legacy_root = Path(self.temporary_directory.name) / "legacy-app-data"
@@ -143,7 +143,7 @@ class StorageTestCase(unittest.TestCase):
                 ("legacy-entity", "Legacy Entity", "organization", "2026-10-14T00:00:00+00:00"),
             )
 
-        self.assertEqual(MigrationRunner(legacy_database).initialize(), 5)
+        self.assertEqual(MigrationRunner(legacy_database).initialize(), 9)
         with legacy_database.connection() as connection:
             entity = connection.execute(
                 "SELECT display_name FROM legal_entities WHERE id = ?", ("legacy-entity",)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import uuid
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -72,6 +73,55 @@ class XlsxExtractionTests(unittest.TestCase):
             result = DocumentImportService(storage).import_authorized_paths([str(source)])
 
         self.assertEqual(result["documents"][0]["document"]["original_filename"], "Bestätigung März.xlsx")
+
+
+class DocumentSummaryStatusTests(unittest.TestCase):
+    def test_summary_marks_only_the_current_extraction_as_ai_reviewed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "holdings.csv"
+            source.write_text("Fund,Quantity\nFund A,10\n", encoding="utf-8")
+            storage = StorageService(str(Path(directory) / "app-data"))
+            storage.initialize()
+            service = DocumentImportService(storage)
+            imported = service.import_authorized_paths([str(source)])["documents"][0]["document"]
+            self.assertEqual(imported["ai_review_status"], "new")
+            assert storage.database
+            with storage.database.transaction() as connection:
+                extraction = connection.execute(
+                    "SELECT id FROM document_extractions WHERE source_document_id = ? AND status = 'parsed'",
+                    (imported["id"],),
+                ).fetchone()
+                assert extraction is not None
+                connection.execute(
+                    "INSERT INTO ai_processing_jobs (id, source_document_id, extraction_id, provider, model, prompt_version, schema_version, status, created_at, completed_at) "
+                    "VALUES (?, ?, ?, 'mock', 'test', 'v1', 'v1', 'completed', ?, ?)",
+                    (str(uuid.uuid4()), imported["id"], extraction["id"], "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+                )
+            self.assertEqual(service.list_documents()["documents"][0]["ai_review_status"], "reviewed")
+
+    def test_remove_document_deletes_only_managed_copy_and_derived_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "remove-me.csv"
+            original_bytes = b"Fund,Quantity\nFund A,10\n"
+            source.write_bytes(original_bytes)
+            storage = StorageService(str(Path(directory) / "app-data"))
+            storage.initialize()
+            service = DocumentImportService(storage)
+            imported = service.import_authorized_paths([str(source)])["documents"][0]["document"]
+            assert storage.paths is not None
+            managed = storage.paths.documents / imported["id"]
+            self.assertTrue(managed.exists())
+
+            removed = service.remove_document(imported["id"])
+
+            self.assertEqual(removed["documentId"], imported["id"])
+            self.assertEqual(source.read_bytes(), original_bytes)
+            self.assertFalse(managed.exists())
+            self.assertEqual(service.list_documents()["documents"], [])
+            assert storage.database is not None
+            with storage.database.connection() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM document_extractions").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM extracted_content").fetchone()[0], 0)
 
 
 class SpreadsheetContentTests(unittest.TestCase):

@@ -354,6 +354,56 @@ def _migration_005_add_extraction_order_indexes(connection: sqlite3.Connection) 
         """
     )
 
+def _migration_006_add_ai_foundation(connection: sqlite3.Connection) -> None:
+    connection.executescript("""
+        CREATE TABLE ai_authorizations (id TEXT PRIMARY KEY, authorized INTEGER NOT NULL CHECK (authorized IN (0,1)), provider TEXT, model TEXT, authorization_text_version TEXT NOT NULL, occurred_at TEXT NOT NULL);
+        CREATE TABLE ai_processing_jobs (id TEXT PRIMARY KEY, source_document_id TEXT REFERENCES source_documents(id) ON DELETE RESTRICT, extraction_id TEXT REFERENCES document_extractions(id) ON DELETE RESTRICT, provider TEXT NOT NULL, model TEXT, prompt_version TEXT NOT NULL, schema_version TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','blocked')), error_code TEXT, created_at TEXT NOT NULL, completed_at TEXT);
+        CREATE TABLE ai_proposals (id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES ai_processing_jobs(id) ON DELETE RESTRICT, proposal_type TEXT NOT NULL, field_name TEXT NOT NULL, value_json TEXT, is_unknown INTEGER NOT NULL CHECK (is_unknown IN (0,1)), confidence REAL, validation_status TEXT NOT NULL CHECK (validation_status IN ('unvalidated','invalid','validated')), source_reference TEXT NOT NULL, evidence_snippet TEXT, model_version TEXT, created_at TEXT NOT NULL);
+        CREATE INDEX idx_ai_jobs_source ON ai_processing_jobs(source_document_id, created_at DESC);
+        CREATE INDEX idx_ai_proposals_job ON ai_proposals(job_id);
+    """)
+
+
+def _migration_007_add_ai_job_coverage(connection: sqlite3.Connection) -> None:
+    """Keep document-level authorization and bounded-analysis coverage with each job."""
+
+    connection.executescript(
+        """
+        ALTER TABLE ai_processing_jobs ADD COLUMN authorization_event_id TEXT;
+        ALTER TABLE ai_processing_jobs ADD COLUMN coverage_json TEXT;
+        CREATE UNIQUE INDEX idx_ai_jobs_active_source_extraction
+            ON ai_processing_jobs(source_document_id, extraction_id)
+            WHERE status IN ('queued', 'running');
+        """
+    )
+
+
+def _migration_008_add_ai_usage_cost_metadata(connection: sqlite3.Connection) -> None:
+    """Persist non-sensitive token/cost estimates without retaining AI payloads."""
+
+    connection.executescript(
+        """
+        ALTER TABLE ai_processing_jobs ADD COLUMN estimated_cost_usd TEXT;
+        ALTER TABLE ai_processing_jobs ADD COLUMN input_tokens INTEGER;
+        ALTER TABLE ai_processing_jobs ADD COLUMN output_tokens INTEGER;
+        ALTER TABLE ai_processing_jobs ADD COLUMN total_tokens INTEGER;
+        ALTER TABLE ai_processing_jobs ADD COLUMN actual_cost_estimate_usd TEXT;
+        """
+    )
+
+
+def _migration_009_add_ai_analysis_summaries(connection: sqlite3.Connection) -> None:
+    """Persist a concise, cited summary separately from proposal records."""
+
+    connection.executescript(
+        """
+        ALTER TABLE ai_processing_jobs ADD COLUMN summary_text TEXT;
+        ALTER TABLE ai_processing_jobs ADD COLUMN summary_unknown INTEGER NOT NULL DEFAULT 1
+            CHECK (summary_unknown IN (0,1));
+        ALTER TABLE ai_processing_jobs ADD COLUMN summary_citations_json TEXT;
+        """
+    )
+
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _migration_001_initial_schema),
@@ -361,6 +411,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(3, _migration_003_add_document_extractions),
     Migration(4, _migration_004_add_pdf_page_extractions),
     Migration(5, _migration_005_add_extraction_order_indexes),
+    Migration(6, _migration_006_add_ai_foundation),
+    Migration(7, _migration_007_add_ai_job_coverage),
+    Migration(8, _migration_008_add_ai_usage_cost_metadata),
+    Migration(9, _migration_009_add_ai_analysis_summaries),
 )
 
 

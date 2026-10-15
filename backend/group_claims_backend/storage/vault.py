@@ -112,6 +112,20 @@ class FileVaultService:
             raise VaultStorageError("The managed document copy is unavailable.")
         return managed_path
 
+    def remove_managed_copy(self, document: DocumentRecord) -> None:
+        """Remove only a checked, generated vault copy after its metadata is deleted.
+
+        This never touches the user-selected source path.  If an operating-system
+        failure leaves an orphaned generated copy, normal startup recovery removes
+        that unreferenced vault entry safely.
+        """
+
+        managed_path = self.managed_path_for(document)
+        try:
+            managed_path.unlink()
+        except OSError as error:
+            raise VaultStorageError("The managed document copy could not be removed.") from error
+
     def recover_incomplete_imports(self) -> None:
         """Remove only generated unreferenced vault files left by an interrupted import."""
 

@@ -1,17 +1,36 @@
-import { contextBridge, ipcRenderer } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, DocumentContentResponse, DocumentImportResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress } from "./ipc-contract";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIConnectionCheckResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
 const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
+const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
+const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
+const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
+const GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL = "documents:get-analysis-preview" as const;
+const START_DOCUMENT_ANALYSIS_CHANNEL = "documents:start-analysis" as const;
+const GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL = "documents:get-analysis-status" as const;
+const GET_DOCUMENT_ANALYSIS_FINDINGS_CHANNEL = "documents:get-analysis-findings" as const;
+const PREVIEW_DOCUMENT_QUESTION_CHANNEL = "documents:preview-question" as const;
+const ASK_DOCUMENT_QUESTION_CHANNEL = "documents:ask-question" as const;
+const GET_DOCUMENT_QUESTION_STATUS_CHANNEL = "documents:get-question-status" as const;
+const GET_MATTER_REVIEW_CHANNEL = "matter:get-review" as const;
+const GET_BILLING_PREVIEW_CHANNEL = "matter:get-billing-preview" as const;
+const PREVIEW_MATTER_ANALYSIS_BATCH_CHANNEL = "matter:preview-analysis-batch" as const;
+const START_MATTER_ANALYSIS_BATCH_CHANNEL = "matter:start-analysis-batch" as const;
+const GET_MATTER_ANALYSIS_BATCH_STATUS_CHANNEL = "matter:get-analysis-batch-status" as const;
+const PREVIEW_MATTER_QUESTION_CHANNEL = "matter:preview-question" as const;
+const ASK_MATTER_QUESTION_CHANNEL = "matter:ask-question" as const;
+const GET_MATTER_QUESTION_STATUS_CHANNEL = "matter:get-question-status" as const;
 const SELECT_AND_IMPORT_DOCUMENTS_CHANNEL = "documents:select-and-import" as const;
 const SELECT_FOLDER_FOR_IMPORT_CHANNEL = "documents:select-folder-for-import" as const;
 const CONFIRM_FOLDER_IMPORT_CHANNEL = "documents:confirm-folder-import" as const;
 const CANCEL_FOLDER_IMPORT_CHANNEL = "documents:cancel-folder-import" as const;
 const FOLDER_IMPORT_PROGRESS_CHANNEL = "documents:folder-import-progress" as const;
 const IMPORT_DROPPED_DOCUMENTS_CHANNEL = "documents:import-dropped" as const;
+const REMOVE_DOCUMENT_CHANNEL = "documents:remove" as const;
 const LIST_DOCUMENTS_CHANNEL = "documents:list" as const;
 const GET_DOCUMENT_CONTENT_CHANNEL = "documents:get-content" as const;
 const RETRY_DOCUMENT_PARSE_CHANNEL = "documents:retry-parse" as const;
@@ -153,6 +172,71 @@ const desktopApi = Object.freeze({
 
     return Object.freeze(response);
   },
+  async getAIStatus(): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(GET_AI_STATUS_CHANNEL) as AIStatusResponse); },
+  async checkAIConnection(): Promise<AIConnectionCheckResponse> { return Object.freeze(await ipcRenderer.invoke(CHECK_AI_CONNECTION_CHANNEL) as AIConnectionCheckResponse); },
+  async setAIAuthorization(authorized: boolean): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(SET_AI_AUTHORIZATION_CHANNEL, { authorized }) as AIStatusResponse); },
+  async getDocumentAnalysisPreview(documentId: string): Promise<DocumentAnalysisPreviewResponse> {
+    if (!documentId || documentId.length > 128) throw new Error("Invalid document analysis request.");
+    return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL, { documentId }) as DocumentAnalysisPreviewResponse);
+  },
+  async startDocumentAnalysis(documentId: string): Promise<DocumentAnalysisStartResponse> {
+    if (!documentId || documentId.length > 128) throw new Error("Invalid document analysis request.");
+    return Object.freeze(await ipcRenderer.invoke(START_DOCUMENT_ANALYSIS_CHANNEL, { documentId, acknowledged: true }) as DocumentAnalysisStartResponse);
+  },
+  async getDocumentAnalysisStatus(jobId: string): Promise<DocumentAnalysisStatusResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(jobId)) throw new Error("Invalid analysis job reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL, { jobId }) as DocumentAnalysisStatusResponse);
+  },
+  async getDocumentAnalysisFindings(jobId: string): Promise<DocumentAnalysisFindingsResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(jobId)) throw new Error("Invalid analysis job reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_ANALYSIS_FINDINGS_CHANNEL, { jobId, limit: 25 }) as DocumentAnalysisFindingsResponse);
+  },
+  async previewDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionPreviewResponse> {
+    if (!documentId || documentId.length > 128 || !question.trim() || question.length > 600) throw new Error("Invalid document question.");
+    return Object.freeze(await ipcRenderer.invoke(PREVIEW_DOCUMENT_QUESTION_CHANNEL, { documentId, question: question.trim() }) as DocumentQuestionPreviewResponse);
+  },
+  async askDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionStartResponse> {
+    if (!documentId || documentId.length > 128 || !question.trim() || question.length > 600) throw new Error("Invalid document question.");
+    return Object.freeze(await ipcRenderer.invoke(ASK_DOCUMENT_QUESTION_CHANNEL, { documentId, question: question.trim(), acknowledged: true }) as DocumentQuestionStartResponse);
+  },
+  async getDocumentQuestionStatus(questionId: string): Promise<DocumentQuestionStatusResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(questionId)) throw new Error("Invalid document question reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_QUESTION_STATUS_CHANNEL, { questionId }) as DocumentQuestionStatusResponse);
+  },
+  async getMatterReview(documentIds: string[]): Promise<MatterReviewResponse> {
+    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Select up to 20 valid documents.");
+    return Object.freeze(await ipcRenderer.invoke(GET_MATTER_REVIEW_CHANNEL, { documentIds: [...documentIds] }) as MatterReviewResponse);
+  },
+  async previewMatterAnalysisBatch(documentIds: string[]): Promise<MatterAnalysisBatchPreviewResponse> {
+    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Select up to 20 valid documents.");
+    return Object.freeze(await ipcRenderer.invoke(PREVIEW_MATTER_ANALYSIS_BATCH_CHANNEL, { documentIds: [...documentIds] }) as MatterAnalysisBatchPreviewResponse);
+  },
+  async startMatterAnalysisBatch(documentIds: string[]): Promise<MatterAnalysisBatchResponse> {
+    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Select up to 20 valid documents.");
+    return Object.freeze(await ipcRenderer.invoke(START_MATTER_ANALYSIS_BATCH_CHANNEL, { documentIds: [...documentIds], acknowledged: true }) as MatterAnalysisBatchResponse);
+  },
+  async getMatterAnalysisBatchStatus(batchId: string): Promise<MatterAnalysisBatchResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(batchId)) throw new Error("Invalid batch analysis reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_MATTER_ANALYSIS_BATCH_STATUS_CHANNEL, { batchId }) as MatterAnalysisBatchResponse);
+  },
+  async previewMatterQuestion(documentIds: string[], question: string, followUp?: MatterQuestionFollowUp): Promise<MatterQuestionPreviewResponse> {
+    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)) || !question.trim() || question.length > 600) throw new Error("Select up to 20 valid documents for a consolidated question.");
+    if (followUp && (!followUp.question.trim() || followUp.question.length > 600 || !followUp.answer.trim() || followUp.answer.length > 1200)) throw new Error("The earlier answer is not available for a follow-up.");
+    return Object.freeze(await ipcRenderer.invoke(PREVIEW_MATTER_QUESTION_CHANNEL, { documentIds: [...documentIds], question: question.trim(), ...(followUp ? { followUp: { question: followUp.question.trim(), answer: followUp.answer.trim() } } : {}) }) as MatterQuestionPreviewResponse);
+  },
+  async askMatterQuestion(documentIds: string[], question: string, followUp?: MatterQuestionFollowUp): Promise<MatterQuestionResponse> {
+    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)) || !question.trim() || question.length > 600) throw new Error("Select up to 20 valid documents for a consolidated question.");
+    if (followUp && (!followUp.question.trim() || followUp.question.length > 600 || !followUp.answer.trim() || followUp.answer.length > 1200)) throw new Error("The earlier answer is not available for a follow-up.");
+    return Object.freeze(await ipcRenderer.invoke(ASK_MATTER_QUESTION_CHANNEL, { documentIds: [...documentIds], question: question.trim(), acknowledged: true, ...(followUp ? { followUp: { question: followUp.question.trim(), answer: followUp.answer.trim() } } : {}) }) as MatterQuestionResponse);
+  },
+  async getMatterQuestionStatus(questionId: string): Promise<MatterQuestionResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(questionId)) throw new Error("Invalid consolidated question reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_MATTER_QUESTION_STATUS_CHANNEL, { questionId }) as MatterQuestionResponse);
+  },
+  async getBillingPreview(feePool: string, currency: string, rows: BillingPreviewRow[]): Promise<BillingPreviewResponse> {
+    if (typeof feePool !== "string" || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$/.test(feePool) || !/^[A-Z]{3}$/.test(currency) || !Array.isArray(rows) || rows.length < 1 || rows.length > 50 || !rows.every((row) => typeof row.id === "string" && typeof row.label === "string" && typeof row.eligibleAmount === "string")) throw new Error("Invalid billing preview assumptions.");
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_PREVIEW_CHANNEL, { feePool, currency, rows: rows.map((row) => ({ ...row })) }) as BillingPreviewResponse);
+  },
   async selectAndImportDocuments(): Promise<DocumentImportResponse> {
     const response: unknown = await ipcRenderer.invoke(SELECT_AND_IMPORT_DOCUMENTS_CHANNEL);
     if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid document response.");
@@ -180,14 +264,22 @@ const desktopApi = Object.freeze({
     ipcRenderer.on(FOLDER_IMPORT_PROGRESS_CHANNEL, receive);
     return () => ipcRenderer.removeListener(FOLDER_IMPORT_PROGRESS_CHANNEL, receive);
   },
-  async importDroppedDocuments(files: File[]): Promise<DocumentImportResponse> {
+  async importDroppedDocuments(files: File[]): Promise<FolderImportPreviewResponse> {
     // A DOM File from an Electron drop has an OS path only inside this privileged preload.
     // The path is immediately sent to the allowlisted main-process channel and never returned.
-    const paths = files.map((file) => (file as File & { path?: string }).path).filter((path): path is string => typeof path === "string" && path.length > 0);
-    if (paths.length !== files.length || paths.length === 0 || paths.length > 20) throw new Error("Drop valid local files only.");
+    const paths = files.map((file) => {
+      try { return webUtils.getPathForFile(file); } catch { return ""; }
+    }).filter((path): path is string => typeof path === "string" && path.length > 0);
+    if (paths.length !== files.length || paths.length === 0 || paths.length > 20) throw new Error("Drop up to 20 valid local files or folders.");
     const response: unknown = await ipcRenderer.invoke(IMPORT_DROPPED_DOCUMENTS_CHANNEL, { paths });
-    if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid document response.");
-    return Object.freeze(response) as DocumentImportResponse;
+    if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid import preview response.");
+    return Object.freeze(response) as FolderImportPreviewResponse;
+  },
+  async removeDocument(documentId: string): Promise<DocumentRemoveResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(documentId)) throw new Error("Invalid document removal request.");
+    const response: unknown = await ipcRenderer.invoke(REMOVE_DOCUMENT_CHANNEL, { documentId });
+    if (!isDocumentResponse(response)) throw new Error("The desktop application returned an invalid document removal response.");
+    return Object.freeze(response) as DocumentRemoveResponse;
   },
   async listDocuments(): Promise<DocumentListResponse> {
     const response: unknown = await ipcRenderer.invoke(LIST_DOCUMENTS_CHANNEL);

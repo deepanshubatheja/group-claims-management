@@ -17,7 +17,7 @@ from ..storage.documents import DocumentMetadataRepository, DocumentRecord
 from ..storage.service import StorageService
 from ..storage.vault import VaultImportError, VaultStorageError
 
-PARSER_VERSION = "deterministic-v3"
+PARSER_VERSION = "deterministic-v4"
 SUPPORTED_FORMATS = {".xlsx": "xlsx", ".xls": "xls", ".csv": "csv", ".pdf": "pdf"}
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_IMPORT_FILES = 20
@@ -148,8 +148,9 @@ class DeterministicDocumentParser:
             for column_number, value in enumerate(row, start=1):
                 items.append(
                     ExtractedItem(
-                        "csv_cell", f"row {row_number}, column {column_number}", value,
-                        "text", row_number=row_number, column_number=column_number, worksheet_index=1, is_empty=value == "",
+                        "csv_cell", f"CSV!{self._column_letters(column_number)}{row_number}", value,
+                        "text", sheet_name="CSV", row_number=row_number, column_number=column_number,
+                        worksheet_index=1, is_empty=value == "",
                     )
                 )
         self._check_item_limit(items)
@@ -440,6 +441,58 @@ class DocumentImportService:
             rows = connection.execute("SELECT id FROM source_documents ORDER BY imported_at DESC").fetchall()
         return {"documents": [self._summary(str(row["id"])) for row in rows]}
 
+    def remove_document(self, document_id: object) -> Mapping[str, object]:
+        """Remove one user-confirmed imported document and its local derived data.
+
+        Confirmed domain records and their source evidence are never removed here.
+        The user-facing operation only applies to an unused imported document,
+        including its deterministic extractions and provisional AI results.
+        """
+
+        document = self._get_document(document_id)
+        with self._database.transaction() as connection:
+            active = connection.execute(
+                "SELECT 1 FROM ai_processing_jobs WHERE source_document_id = ? AND status IN ('queued', 'running') LIMIT 1",
+                (document.id,),
+            ).fetchone()
+            if active is not None:
+                raise DocumentImportError("DOCUMENT_BUSY", "Wait for the active AI analysis to finish before removing this document.")
+            referenced = any(
+                connection.execute(f"SELECT 1 FROM {table} WHERE source_document_id = ? LIMIT 1", (document.id,)).fetchone()
+                is not None
+                for table in ("holding_positions", "claim_right_assignments", "evidence_references", "issues")
+            )
+            if referenced:
+                raise DocumentImportError(
+                    "DOCUMENT_IN_USE",
+                    "This document is linked to confirmed records or an issue and cannot be removed here.",
+                )
+            connection.execute(
+                "DELETE FROM ai_proposals WHERE job_id IN (SELECT id FROM ai_processing_jobs WHERE source_document_id = ?)",
+                (document.id,),
+            )
+            connection.execute("DELETE FROM ai_processing_jobs WHERE source_document_id = ?", (document.id,))
+            connection.execute(
+                "DELETE FROM pdf_text_blocks WHERE pdf_page_extraction_id IN ("
+                "SELECT p.id FROM pdf_page_extractions p JOIN document_extractions e ON e.id = p.extraction_id "
+                "WHERE e.source_document_id = ?)",
+                (document.id,),
+            )
+            connection.execute(
+                "DELETE FROM pdf_page_extractions WHERE extraction_id IN ("
+                "SELECT id FROM document_extractions WHERE source_document_id = ?)",
+                (document.id,),
+            )
+            connection.execute(
+                "DELETE FROM extracted_content WHERE extraction_id IN ("
+                "SELECT id FROM document_extractions WHERE source_document_id = ?)",
+                (document.id,),
+            )
+            connection.execute("DELETE FROM document_extractions WHERE source_document_id = ?", (document.id,))
+            connection.execute("DELETE FROM source_documents WHERE id = ?", (document.id,))
+        self._vault.remove_managed_copy(document)
+        return {"documentId": document.id}
+
     def content(
         self, document_id: object, offset: object, limit: object, sheet_name: object = None,
         row_start: object = None, row_limit: object = None, column_start: object = None,
@@ -690,8 +743,19 @@ class DocumentImportService:
 
     def _summary(self, document_id: str) -> Mapping[str, object]:
         with self._database.connection() as connection:
-            row = connection.execute("""SELECT id, original_filename, file_size_bytes, imported_at, file_format,
-                processing_status, processing_error FROM source_documents WHERE id = ?""", (document_id,)).fetchone()
+            row = connection.execute("""SELECT d.id, d.original_filename, d.file_size_bytes, d.imported_at, d.file_format,
+                d.processing_status, d.processing_error,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM ai_processing_jobs j
+                    WHERE j.source_document_id = d.id
+                      AND j.status = 'completed'
+                      AND j.extraction_id = (
+                        SELECT e.id FROM document_extractions e
+                        WHERE e.source_document_id = d.id AND e.status = 'parsed'
+                        ORDER BY e.started_at DESC, e.id DESC LIMIT 1
+                      )
+                ) THEN 'reviewed' ELSE 'new' END AS ai_review_status
+                FROM source_documents d WHERE d.id = ?""", (document_id,)).fetchone()
         if row is None:
             raise DocumentImportError("DOCUMENT_NOT_FOUND", "The selected document is unavailable.")
         return dict(row)

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import DashboardScreen from "./components/DashboardScreen";
 import DocumentsScreen from "./components/DocumentsScreen";
+import MatterReviewScreen from "./components/MatterReviewScreen";
 import SettingsScreen from "./components/SettingsScreen";
 import { isAvailablePage, workspacePages, type WorkspacePage } from "./components/workspace-ui";
 
@@ -28,24 +29,28 @@ function App() {
     setRequestedDocumentId(documentId);
     setActivePage("Documents");
   };
+  const openDocuments = () => {
+    setRequestedDocumentId(null);
+    setActivePage("Documents");
+  };
 
   return <div className="app-shell">
     <aside className="sidebar" aria-label="Primary navigation">
       <div className="brand"><span className="brand-mark" aria-hidden="true">GC</span><span>Group Claims</span></div>
       <nav className="navigation">
-        {workspacePages.map((item) => {
+        {workspacePages.filter(isAvailablePage).map((item) => {
           const isActive = item === activePage;
-          const enabled = isAvailablePage(item);
-          return <button key={item} className={`navigation-item${isActive ? " active" : ""}`} type="button" aria-current={isActive ? "page" : undefined} disabled={!enabled} onClick={() => setActivePage(item)}>
-            <span>{item}</span>{!enabled && <span className="coming-soon">Coming soon</span>}
+          return <button key={item} className={`navigation-item${isActive ? " active" : ""}`} type="button" aria-current={isActive ? "page" : undefined} onClick={() => setActivePage(item)}>
+            <span>{item}</span>
           </button>;
         })}
       </nav>
       <p className="sidebar-note">Single-user local workspace</p>
     </aside>
     <main className="main-content">
-      {activePage === "Dashboard" && <DashboardScreen onOpenDocument={openDocument} />}
+      {activePage === "Dashboard" && <DashboardScreen onOpenDocument={openDocument} onViewDocuments={openDocuments} />}
       {activePage === "Documents" && <DocumentsScreen requestedDocumentId={requestedDocumentId} onRequestedDocumentHandled={() => setRequestedDocumentId(null)} />}
+      <div hidden={activePage !== "Matter Review"}><MatterReviewScreen isActive={activePage === "Matter Review"} /></div>
       {activePage === "Settings" && <SettingsScreen appInfo={appInfo} desktopState={connectionState} />}
     </main>
   </div>;

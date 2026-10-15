@@ -136,6 +136,51 @@ test("fails a ready request when it times out", async () => {
   manager.stop();
 });
 
+test("returns a controlled allowlisted operation failure without terminating the backend", async () => {
+  const fake = new FakeBackendProcess();
+  const manager = createManager(fake);
+  await startConnected(manager, fake);
+
+  const request = manager.requestDocumentOperation("ai.analysis_preview", { documentId: "document-1" });
+  const backendRequest = await nextRequest(fake);
+  fake.emitResponse({
+    protocolVersion: "1.0",
+    id: backendRequest.id,
+    ok: false,
+    error: { code: "DOCUMENT_NOT_PARSED", message: "Only successfully parsed documents can be analyzed." },
+  });
+
+  await assert.rejects(request, (error: unknown) => {
+    assert.ok(error instanceof BackendProcessError);
+    assert.equal(error.code, "BACKEND_OPERATION_FAILED");
+    assert.equal(error.message, "Only successfully parsed documents can be analyzed.");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  manager.stop();
+});
+
+test("returns a controlled AI connection outcome through the allowlisted protocol", async () => {
+  const fake = new FakeBackendProcess();
+  const manager = createManager(fake);
+  await startConnected(manager, fake);
+
+  const check = manager.checkAIConnection();
+  const backendRequest = await nextRequest(fake);
+  assert.equal(backendRequest.command, "ai.check_connection");
+  assert.deepEqual(backendRequest.params, {});
+  fake.emitResponse({
+    protocolVersion: "1.0",
+    id: backendRequest.id,
+    ok: true,
+    result: { outcome: "provider_error", checkedAt: "2026-10-15T00:00:00+00:00" },
+  });
+
+  assert.deepEqual(await check, { outcome: "provider_error", checkedAt: "2026-10-15T00:00:00+00:00" });
+  assert.equal(manager.state, "ready");
+  manager.stop();
+});
+
 test("rejects malformed backend responses and terminates the process", async () => {
   const fake = new FakeBackendProcess();
   const manager = createManager(fake);
@@ -267,6 +312,56 @@ test("communicates with the real local Python health-check process", async () =>
     assert.match(health.pythonVersion, /^3\./);
   } finally {
     manager.stop();
+    rmSync(storageRoot, { recursive: true, force: true });
+  }
+});
+
+test("passes a synthetic OpenAI environment value to the Python child without diagnostics", () => {
+  const projectRoot = path.resolve(process.cwd(), "..");
+  const storageRoot = mkdtempSync(path.join(os.tmpdir(), "group-claims-electron-env-test-"));
+  const previous = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "synthetic-test-key";
+
+  try {
+    const launch = resolveDevelopmentBackendLaunch(projectRoot, storageRoot);
+    assert.equal(launch.options.env?.OPENAI_API_KEY, "synthetic-test-key");
+  } finally {
+    if (previous === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous;
+    rmSync(storageRoot, { recursive: true, force: true });
+  }
+});
+
+test("reports only key presence from the real Python backend without contacting OpenAI", async () => {
+  const projectRoot = path.resolve(process.cwd(), "..");
+  const storageRoot = mkdtempSync(path.join(os.tmpdir(), "group-claims-electron-ai-status-test-"));
+  const previousKey = process.env.OPENAI_API_KEY;
+  const previousProvider = process.env.GROUP_CLAIMS_AI_PROVIDER;
+  const previousModel = process.env.GROUP_CLAIMS_AI_MODEL;
+  process.env.OPENAI_API_KEY = "synthetic-test-key";
+  process.env.GROUP_CLAIMS_AI_PROVIDER = "openai";
+  process.env.GROUP_CLAIMS_AI_MODEL = "gpt-4.1-mini";
+  const manager = new BackendProcessManager({
+    launch: resolveDevelopmentBackendLaunch(projectRoot, storageRoot),
+    startupTimeoutMs: 3_000,
+    requestTimeoutMs: 3_000,
+  });
+
+  try {
+    await manager.start();
+    const status = await manager.getAIStatus();
+    assert.equal(status.credentialPresent, true);
+    assert.equal(status.provider, "openai");
+    assert.equal(status.model, "gpt-4.1-mini");
+    assert.equal(JSON.stringify(status).includes("synthetic-test-key"), false);
+  } finally {
+    manager.stop();
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+    if (previousProvider === undefined) delete process.env.GROUP_CLAIMS_AI_PROVIDER;
+    else process.env.GROUP_CLAIMS_AI_PROVIDER = previousProvider;
+    if (previousModel === undefined) delete process.env.GROUP_CLAIMS_AI_MODEL;
+    else process.env.GROUP_CLAIMS_AI_MODEL = previousModel;
     rmSync(storageRoot, { recursive: true, force: true });
   }
 });

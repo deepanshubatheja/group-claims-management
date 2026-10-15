@@ -16,7 +16,8 @@ export type BackendErrorCode =
   | "BACKEND_STARTUP_TIMEOUT"
   | "BACKEND_REQUEST_TIMEOUT"
   | "BACKEND_PROTOCOL_ERROR"
-  | "BACKEND_TERMINATED";
+  | "BACKEND_TERMINATED"
+  | "BACKEND_OPERATION_FAILED";
 
 export class BackendProcessError extends Error {
   public constructor(
@@ -46,7 +47,7 @@ export interface BackendLaunchConfiguration {
   options: SpawnOptionsWithoutStdio;
 }
 
-type BackendCommand = "health.check" | "storage.status" | "documents.import" | "documents.list" | "documents.content" | "documents.retry_parse";
+type BackendCommand = "health.check" | "storage.status" | "ai.status" | "ai.check_connection" | "ai.set_authorization" | "ai.analysis_preview" | "ai.analyze_document" | "ai.analysis_status" | "ai.analysis_findings" | "ai.question_preview" | "ai.ask_question" | "ai.question_status" | "matter.review" | "matter.billing_preview" | "matter.analysis_batch_preview" | "matter.start_analysis_batch" | "matter.analysis_batch_status" | "matter.question_preview" | "matter.ask_question" | "matter.question_status" | "documents.import" | "documents.list" | "documents.remove" | "documents.content" | "documents.retry_parse";
 
 export type BackendSpawn = (
   command: string,
@@ -315,6 +316,9 @@ export class BackendProcessManager {
     const result = await this.sendRequest("storage.status", {}, this.requestTimeoutMs);
     return parseStorageStatus(result);
   }
+  public async getAIStatus(): Promise<Record<string, unknown>> { return this.requestDocumentOperation("ai.status", {}); }
+  public async checkAIConnection(): Promise<Record<string, unknown>> { return this.requestDocumentOperation("ai.check_connection", {}); }
+  public async setAIAuthorization(authorized: boolean): Promise<Record<string, unknown>> { return this.requestDocumentOperation("ai.set_authorization", { authorized, acknowledged: true }); }
 
   public async requestDocumentOperation(command: Exclude<BackendCommand, "health.check" | "storage.status">, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (this.currentState === "starting" && this.startupPromise !== undefined) await this.startupPromise;
@@ -460,7 +464,7 @@ export class BackendProcessManager {
     }
 
     pending.reject(
-      new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend rejected the request."),
+      new BackendProcessError("BACKEND_OPERATION_FAILED", response.error?.message ?? "The backend rejected the request."),
     );
   }
 

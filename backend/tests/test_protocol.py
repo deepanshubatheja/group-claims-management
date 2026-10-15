@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ def request(request_id: str, command: str = "health.check", **overrides: object)
 
 
 def run_backend(
-    raw_input: bytes, storage_root: Path | None = None
+    raw_input: bytes, storage_root: Path | None = None, environment: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     command = [sys.executable, "-m", "group_claims_backend"]
     if storage_root is not None:
@@ -38,6 +39,7 @@ def run_backend(
         input=raw_input,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=environment,
         check=False,
     )
     responses = [
@@ -131,7 +133,7 @@ class ProtocolServerTests(unittest.TestCase):
             result = responses[0]["result"]
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["databaseStatus"], "connected")
-            self.assertEqual(result["schemaVersion"], 5)
+            self.assertEqual(result["schemaVersion"], 9)
             self.assertTrue(result["directoriesAvailable"])
             self.assertTrue((root / "database" / "claims.sqlite").is_file())
 
@@ -146,6 +148,20 @@ class ProtocolServerTests(unittest.TestCase):
         self.assertEqual(result["databaseStatus"], "unavailable")
         self.assertFalse(result["directoriesAvailable"])
 
+    def test_ai_connection_check_without_a_key_is_a_typed_safe_result(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("OPENAI_API_KEY", None)
+        environment["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            responses, stderr = run_backend(
+                (json.dumps(request("ai-no-key", "ai.check_connection")) + "\n").encode(),
+                Path(temporary_directory) / "app-data",
+                environment,
+            )
+        self.assertTrue(responses[0]["ok"])
+        self.assertEqual(responses[0]["result"]["outcome"], "api_key_missing")
+        self.assertNotIn("OPENAI_API_KEY", stderr)
+
     def test_oversized_response_is_replaced_by_a_controlled_error(self) -> None:
         server = ProtocolServer({"test.large": lambda _params: {"value": "x" * 70_000}})
         stdout = io.BytesIO()
@@ -155,7 +171,6 @@ class ProtocolServerTests(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["id"], "large-1")
         self.assertEqual(response["error"]["code"], "response_too_large")
-
 
 if __name__ == "__main__":
     unittest.main()
