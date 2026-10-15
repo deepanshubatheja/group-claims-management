@@ -217,6 +217,65 @@ export function resolveDevelopmentBackendLaunch(
   };
 }
 
+/**
+ * Resolve the trusted, immutable backend resources included with an installed
+ * application. Mutable databases and vault files are still kept under the
+ * Electron-provided per-user storage root.
+ */
+export function resolvePackagedBackendLaunch(
+  resourcesPath: string,
+  storageRoot: string,
+  platform: NodeJS.Platform = process.platform,
+): BackendLaunchConfiguration {
+  if (
+    !path.isAbsolute(resourcesPath) ||
+    !path.isAbsolute(storageRoot) ||
+    path.parse(storageRoot).root === path.resolve(storageRoot)
+  ) {
+    throw new BackendProcessError(
+      "BACKEND_UNAVAILABLE",
+      "The application storage directory is unavailable.",
+    );
+  }
+
+  const executable = path.join(
+    resourcesPath,
+    "backend",
+    platform === "win32" ? "claimflow-backend.exe" : "claimflow-backend",
+  );
+  if (!existsSync(executable)) {
+    throw new BackendProcessError(
+      "BACKEND_UNAVAILABLE",
+      "The packaged backend is unavailable. Reinstall ClaimFlow and try again.",
+    );
+  }
+
+  const environment: NodeJS.ProcessEnv = { ...process.env, PYTHONUTF8: "1" };
+  const tesseract = path.join(
+    resourcesPath,
+    "ocr",
+    platform === "win32" ? "tesseract.exe" : "bin/tesseract",
+  );
+  const tessdata = path.join(resourcesPath, "ocr", "tessdata");
+  // OCR remains a locally optional feature: normal PDF, spreadsheet, and CSV
+  // processing still works when a future platform build omits this resource.
+  if (existsSync(tesseract) && existsSync(tessdata)) {
+    environment.GROUP_CLAIMS_TESSERACT_CMD = tesseract;
+    environment.TESSDATA_PREFIX = tessdata;
+  }
+
+  return {
+    command: executable,
+    args: ["--storage-root", storageRoot],
+    options: {
+      cwd: path.dirname(executable),
+      env: environment,
+      shell: false,
+      windowsHide: true,
+    },
+  };
+}
+
 export class BackendProcessManager {
   private readonly spawn: BackendSpawn;
   private readonly startupTimeoutMs: number;

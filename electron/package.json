@@ -9,7 +9,7 @@
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test test-dist/tests/*.test.js",
     "dev:build": "tsc -p tsconfig.json --watch",
-    "dev:start": "wait-on tcp:127.0.0.1:5173 file:dist/main.js file:dist/preload.js && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 nodemon --watch dist --ext js --exec electron ."
+    "dev:start": "wait-on http-get://127.0.0.1:5173/ file:dist/main.js file:dist/preload.js && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 nodemon --watch dist --ext js --exec electron ."
   },
   "devDependencies": {
     "@types/node": "22.15.3",

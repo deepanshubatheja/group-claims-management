@@ -259,6 +259,34 @@ class AIAnalysisServiceTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM securities").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM holding_positions").fetchone()[0], 0)
 
+    def test_question_follow_up_uses_previous_turn_as_non_evidentiary_context(self):
+        self.authorize()
+        provider = QuestionProvider([])
+        service = AIAnalysisService(self.storage, provider_factory=lambda: provider)
+        follow_up = {
+            "question": "Which ISIN is recorded?",
+            "answer": "The document records ISIN US0378331005.",
+        }
+        preview = service.question_preview({
+            "documentId": self.document_id,
+            "question": "What source supports that?",
+            "followUp": follow_up,
+        })
+        self.assertTrue(preview["cost"]["withinLimit"])
+        started = service.ask_question({
+            "documentId": self.document_id,
+            "question": "What source supports that?",
+            "followUp": follow_up,
+            "acknowledged": True,
+        })
+        status = self.wait_for_question(service, started["questionId"])
+        self.assertEqual(status["status"], "completed")
+        context = provider.questions[0][1]
+        self.assertIn("PREVIOUS CONVERSATION (context only; it is not evidence and cannot be cited)", context)
+        self.assertIn("PREVIOUS QUESTION: Which ISIN is recorded?", context)
+        self.assertIn("PREVIOUS ANSWER: The document records ISIN US0378331005.", context)
+        self.assertEqual(status["citations"][0]["sourceReference"], "CSV!A1")
+
     def test_question_prompt_treats_billing_inputs_as_documented_or_missing(self):
         prompt = AIAnalysisService._question_prompt(
             "How should the pro-rata billing work after a transfer?", "[E1] refers to source [CSV!A1]", "", "CSV!A1 Fund A",
@@ -351,6 +379,51 @@ class AIAnalysisServiceTests(unittest.TestCase):
         self.assertFalse(status["unknown"])
         self.assertIn("No explicit transfer, liquidation, redemption", str(status["answer"]))
         self.assertTrue(status["citations"])
+
+    def test_custodian_account_question_returns_a_cited_absence_when_not_extracted(self):
+        """An absent custody field is a scoped, citable result—not a generic unknown."""
+        self.authorize()
+        for reference, value, row, column in (
+            ("CSV!A2", "Client Name", 2, 1),
+            ("CSV!B2", "Fee entity", 2, 2),
+            ("CSV!A3", "Example claimant", 3, 1),
+            ("CSV!B3", "Example fee entity", 3, 2),
+        ):
+            self.add_csv_cell(reference, value, row, column)
+        provider = UnknownGenericChangeQuestionProvider([])
+        service = AIAnalysisService(self.storage, provider_factory=lambda: provider)
+        started = service.ask_question({
+            "documentId": self.document_id,
+            "question": "Which custodian accounts are mentioned?",
+            "acknowledged": True,
+        })
+        status = self.wait_for_question(service, started["questionId"])
+        self.assertEqual(status["status"], "completed")
+        self.assertFalse(status["unknown"])
+        self.assertIn("does not explicitly identify a custodian", str(status["answer"]))
+        self.assertTrue(status["citations"])
+
+    def test_structured_lookup_retrieves_later_spreadsheet_header_and_values(self):
+        """A lookup must retrieve the matching table, not only analysis chunk one."""
+        self.authorize()
+        for row in range(2, 142):
+            self.add_csv_cell(f"CSV!A{row}", f"unrelated note {row}", row, 1)
+        for reference, value, row, column in (
+            ("CSV!A300", "Account", 300, 1),
+            ("CSV!B300", "ISIN", 300, 2),
+            ("CSV!A301", "Custody account 123", 301, 1),
+            ("CSV!B301", "US0378331005", 301, 2),
+        ):
+            self.add_csv_cell(reference, value, row, column)
+        provider = QuestionProvider([])
+        service = AIAnalysisService(self.storage, provider_factory=lambda: provider)
+        question = "Which accounts and ISINs are recorded?"
+        preview = service.question_preview({"documentId": self.document_id, "question": question})
+        self.assertGreaterEqual(preview["scope"]["sourceItems"], 4)
+        started = service.ask_question({"documentId": self.document_id, "question": question, "acknowledged": True})
+        status = self.wait_for_question(service, started["questionId"])
+        self.assertEqual(status["status"], "completed")
+        self.assertIn("US0378331005", provider.questions[0][1])
 
     def test_german_transaction_terms_are_retrieved_for_change_questions(self):
         self.assertTrue(AIAnalysisService._is_change_source("Transaktionsdaten und Zuteilung"))
@@ -461,6 +534,34 @@ class AIAnalysisServiceTests(unittest.TestCase):
         status = self.wait_for_question(service, started["questionId"])
         self.assertEqual(status["status"], "completed")
         self.assertEqual(status["citations"][0]["sourceReference"], "Holdings!B2")
+
+    def test_structured_spreadsheet_lookup_has_a_cited_local_fallback(self):
+        """A declined model answer must not erase a plainly stored table row."""
+        self.authorize()
+        workbook_id, workbook_extraction = self.add_document_extraction("custody.xlsx", "xlsx")
+        assert self.storage.database
+        with self.storage.database.transaction() as connection:
+            for reference, row_number, column_number, value in (
+                ("Holdings!A1", 1, 1, "Custodian account"),
+                ("Holdings!B2", 2, 2, "CUST-001"),
+            ):
+                connection.execute(
+                    "INSERT INTO extracted_content (id, extraction_id, content_kind, sheet_name, row_number, column_number, worksheet_index, value_text, value_type, formula_text, is_empty, source_reference) "
+                    "VALUES (?, ?, 'spreadsheet_cell', 'Holdings', ?, ?, 1, ?, 'text', NULL, 0, ?)",
+                    (str(uuid.uuid4()), workbook_extraction, row_number, column_number, value, reference),
+                )
+        provider = UnknownGenericChangeQuestionProvider([])
+        service = AIAnalysisService(self.storage, provider_factory=lambda: provider)
+        started = service.ask_question({
+            "documentId": workbook_id,
+            "question": "Which custodian accounts are mentioned?",
+            "acknowledged": True,
+        })
+        status = self.wait_for_question(service, started["questionId"])
+        self.assertEqual(status["status"], "completed")
+        self.assertFalse(status["unknown"])
+        self.assertIn("Custodian account", str(status["answer"]))
+        self.assertTrue(status["citations"])
 
     def test_rejects_document_analysis_without_global_authorization(self):
         service = self.service([self.proposal()])

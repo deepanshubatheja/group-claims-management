@@ -477,7 +477,11 @@ h2 {
 .staged-import-label { margin: 14px 0 6px; color: #365b78; font-size: .84rem; font-weight: 700; }
 .staged-import-list { display: grid; gap: 5px; max-height: 152px; margin: 0 0 14px; overflow-y: auto; padding: 9px 12px 9px 29px; border: 1px solid #d6e3ee; border-radius: 6px; background: #fff; color: #47647d; font-size: .88rem; }
 .support-note { margin: 14px 0 0; color: #5c7591; font-size: .8rem; }
-.document-row { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 16px; margin-top: 10px; border: 1px solid #e0e8ef; border-radius: 8px; padding: 14px; background: #fff; color: #173b5c; text-align: left; cursor: pointer; transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease; }
+.document-row { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 10px; margin-top: 10px; border: 1px solid #e0e8ef; border-radius: 8px; padding: 0; background: #fff; color: #173b5c; text-align: left; transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease; }
+.document-row > button { appearance: none; display: flex; flex: 1; min-width: 0; justify-content: space-between; align-items: center; gap: 16px; border: 0; border-radius: 8px; padding: 14px 14px 14px 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.document-select { display: flex; align-items: center; padding: 14px 0 14px 14px; cursor: pointer; }
+.document-select input { width: 17px; height: 17px; margin: 0; accent-color: #246aa5; }
+.document-bulk-actions { display: flex; align-items: center; gap: 12px; margin: 12px 0 4px; }
 .document-row:hover, .document-row:focus-visible { border-color: #9abbd8; background: #fbfdff; box-shadow: 0 3px 10px rgb(28 69 103 / 5%); outline: none; }
 .document-row small { display: block; margin-top: 4px; color: #6f8294; }
 .document-row-labels { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
@@ -537,6 +541,8 @@ h2 {
 .document-search input:focus { border-color: #4e8cce; outline: 2px solid rgb(78 140 206 / 20%); }
 
 .settings-section { max-width: 900px; margin-top: 28px; }
+.settings-key-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0 14px; }
+.settings-key-row input { flex: 1 1 320px; min-width: 0; }
 .settings-section-heading { margin-bottom: 16px; }
 .settings-section-heading h2 { margin-bottom: 6px; }
 .settings-details { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 18px; }

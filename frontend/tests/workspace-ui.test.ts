@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { aiConnectionMessage, isAvailablePage, platformName, recentDocuments, workspaceNotices } from "../src/components/workspace-ui.js";
-import { analysisFailureMessage, analysisOverviewFromFindings, analysisValidationCounts, canStartDocumentAnalysis, findingFieldLabel, proposalTypeLabel, validationReasonLabel } from "../src/components/analysis-ui.js";
+import { analysisFailureMessage, analysisOverviewFromFindings, analysisValidationCounts, canStartDocumentAnalysis, conversationContextAnswer, findingFieldLabel, proposalTypeLabel, validationReasonLabel } from "../src/components/analysis-ui.js";
 
 const document = (id: string, importedAt: string): DocumentSummary => ({ id, original_filename: `${id}.pdf`, file_size_bytes: 1, imported_at: importedAt, file_format: "pdf", processing_status: "parsed", processing_error: null, ai_review_status: "new" });
 
@@ -25,19 +25,22 @@ test("renders controlled connection-check outcomes without provider internals", 
   assert.match(aiConnectionMessage({ outcome: "timeout", checkedAt }) ?? "", /timed out/);
   assert.match(aiConnectionMessage({ outcome: "provider_error", checkedAt }) ?? "", /could not complete/);
 });
-test("requires both cloud and document authorization before analysis starts", () => {
-  assert.equal(canStartDocumentAnalysis(false, true, true, true, null), false);
-  assert.equal(canStartDocumentAnalysis(true, false, true, true, null), false);
-  assert.equal(canStartDocumentAnalysis(true, true, false, true, null), false);
-  assert.equal(canStartDocumentAnalysis(true, true, true, false, null), false);
-  assert.equal(canStartDocumentAnalysis(true, true, true, true, "running"), false);
-  assert.equal(canStartDocumentAnalysis(true, true, true, true, null), true);
+test("requires enabled Cloud AI, a configured provider, and a safe cost before analysis starts", () => {
+  assert.equal(canStartDocumentAnalysis(false, true, true, null), false);
+  assert.equal(canStartDocumentAnalysis(true, false, true, null), false);
+  assert.equal(canStartDocumentAnalysis(true, true, false, null), false);
+  assert.equal(canStartDocumentAnalysis(true, true, true, "running"), false);
+  assert.equal(canStartDocumentAnalysis(true, true, true, null), true);
   assert.match(analysisFailureMessage("AI_AUTHORIZATION_WITHDRAWN") ?? "", /withdrawn/);
   assert.match(analysisFailureMessage("AI_AUTHENTICATION_FAILED") ?? "", /rejected the configured API key/);
   assert.match(analysisFailureMessage("AI_AUTHENTICATION_FAILED") ?? "", /non-empty credential/);
   assert.match(analysisFailureMessage("AI_OUTPUT_LIMIT_REACHED") ?? "", /output limit/);
   assert.match(analysisFailureMessage("AI_INCOMPLETE") ?? "", /structured response/);
   assert.match(analysisFailureMessage("AI_RESPONSE_CONTRACT_INVALID") ?? "", /required structured result/);
+});
+test("keeps conversation context available after an unsupported answer", () => {
+  assert.equal(conversationContextAnswer(null, "No answer was established."), "No answer was established.");
+  assert.equal(conversationContextAnswer("  A supported answer.  ", "No answer was established."), "A supported answer.");
 });
 test("keeps zero generated findings distinct from evidence rejections", () => {
   assert.deepEqual(analysisValidationCounts({ validation: {

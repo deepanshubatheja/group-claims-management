@@ -25,6 +25,7 @@ htmlcov/
 dist/
 test-dist/
 build/
+release/
 out/
 coverage/
 .vite/

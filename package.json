@@ -1,8 +1,9 @@
 {
   "name": "group-claims-management",
-  "version": "0.1.0",
+  "version": "0.1.1-beta",
   "private": true,
-  "description": "Single-user local-first group claims management desktop application.",
+  "description": "ClaimFlow is a single-user, local-first group claims management desktop application.",
+  "main": "electron/dist/main.js",
   "workspaces": [
     "frontend",
     "electron"
@@ -16,9 +17,86 @@
     "build": "npm run build --workspace frontend && npm run build --workspace electron",
     "typecheck": "npm run typecheck --workspace frontend && npm run typecheck --workspace electron",
     "test:electron": "npm run test --workspace electron",
-    "test:frontend": "npm run test --workspace frontend"
+    "test:frontend": "npm run test --workspace frontend",
+    "build:backend:mac": "./scripts/build-backend-macos.sh",
+    "build:credential-helper:mac": "./scripts/build-credential-helper-macos.sh",
+    "package:mac": "npm run build:credential-helper:mac && npm run build:backend:mac && npm run build && electron-builder --mac dmg --arm64",
+    "package:win": "npm run build && electron-builder --win nsis --x64"
   },
   "devDependencies": {
-    "concurrently": "9.1.2"
+    "concurrently": "9.1.2",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.claimflow.desktop",
+    "productName": "ClaimFlow",
+    "buildVersion": "0.1.1",
+    "electronVersion": "35.2.0",
+    "electronDist": "node_modules/electron/dist",
+    "afterPack": "./scripts/after-pack-macos.cjs",
+    "asar": true,
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/dist/**/*",
+      "frontend/dist/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "backend/dist/claimflow-backend",
+          "to": "backend",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "backend/build/ocr",
+          "to": "ocr",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "electron/credential-helper/build/claimflow-keychain-helper",
+          "to": "credential-helper/claimflow-keychain-helper"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "backend/dist/claimflow-backend-win",
+          "to": "backend",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

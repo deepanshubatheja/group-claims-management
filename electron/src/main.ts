@@ -1,19 +1,22 @@
 import { app, BrowserWindow, dialog, ipcMain, session } from "electron";
 import { access, lstat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, existsSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   BackendProcessError,
   BackendProcessManager,
   resolveDevelopmentBackendLaunch,
+  resolvePackagedBackendLaunch,
 } from "./backend-process";
+import { CredentialStoreError, MacOSCredentialStore } from "./credential-store";
 import {
   GET_APP_INFO_CHANNEL,
   GET_BACKEND_HEALTH_CHANNEL,
   GET_STORAGE_STATUS_CHANNEL,
   GET_AI_STATUS_CHANNEL, CHECK_AI_CONNECTION_CHANNEL, SET_AI_AUTHORIZATION_CHANNEL,
+  SAVE_AI_API_KEY_CHANNEL, REMOVE_AI_API_KEY_CHANNEL,
   GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL, START_DOCUMENT_ANALYSIS_CHANNEL,
   GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL, GET_DOCUMENT_ANALYSIS_FINDINGS_CHANNEL,
   PREVIEW_DOCUMENT_QUESTION_CHANNEL, ASK_DOCUMENT_QUESTION_CHANNEL, GET_DOCUMENT_QUESTION_STATUS_CHANNEL,
@@ -24,12 +27,12 @@ import {
   type AppInfo,
   type BackendHealthResponse,
   type StorageStatusResponse,
-  type AIStatusResponse, type AIConnectionCheckResponse, type AIConnectionCheck,
+  type AIStatusResponse, type AIConnectionCheckResponse, type AIConnectionCheck, type AICredentialResponse,
   type DocumentAnalysisPreviewResponse, type DocumentAnalysisStartResponse,
   type DocumentAnalysisStatusResponse, type DocumentAnalysisFindingsResponse,
   type DocumentAnalysisPreview, type DocumentAnalysisJob, type DocumentAnalysisFinding,
   type DocumentQuestionPreviewResponse, type DocumentQuestionStartResponse, type DocumentQuestionStatusResponse,
-  type DocumentQuestionPreview, type DocumentQuestionStatus,
+  type DocumentQuestionPreview, type DocumentQuestionStatus, type DocumentQuestionFollowUp,
   type MatterReviewResponse, type MatterAnalysisBatchPreviewResponse, type MatterAnalysisBatchResponse,
   type MatterQuestionPreviewResponse, type MatterQuestionResponse, type MatterQuestionFollowUp,
   type BillingPreviewResponse, type MatterReviewResult, type MatterAnalysisBatchPreview, type MatterAnalysisBatch, type MatterQuestionPreview, type MatterQuestionStatus, type BillingPreviewResult,
@@ -45,6 +48,7 @@ const rendererHtmlPath = path.join(__dirname, "../../frontend/dist/index.html");
 const rendererHtmlUrl = pathToFileURL(rendererHtmlPath).toString();
 const projectRoot = path.join(__dirname, "../..");
 let backendProcess: BackendProcessManager | undefined;
+let backendLaunchPromise: Promise<void> | undefined;
 const folderAuthorizations = new Map<string, { files: AuthorizedFolderFile[]; skipped: number; expiresAt: number }>();
 
 function isAllowedRendererUrl(url: string): boolean {
@@ -197,6 +201,13 @@ function documentFailure(error: unknown): { ok: false; error: { code: string; me
   return createBackendHealthFailure(error);
 }
 
+function credentialFailure(error: unknown): { ok: false; error: { code: string; message: string } } {
+  if (error instanceof CredentialStoreError) {
+    return { ok: false, error: { code: error.code, message: error.message } };
+  }
+  return { ok: false, error: { code: "CREDENTIAL_STORE_UNAVAILABLE", message: "macOS Keychain is unavailable. Your API key was not changed." } };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -338,6 +349,7 @@ function isMatterQuestionPreview(value: unknown): value is MatterQuestionPreview
   return isRecord(value) && (typeof value.provider === "string" || value.provider === null)
     && (typeof value.model === "string" || value.model === null)
     && typeof value.globalAuthorization === "boolean" && typeof value.configured === "boolean"
+    && typeof value.localOnly === "boolean"
     && isQuestionScope(value.scope) && isQuestionCost(value.cost);
 }
 
@@ -375,28 +387,60 @@ async function validateAuthorizedImportPaths(value: unknown): Promise<string[]> 
   return paths;
 }
 
-function startDevelopmentBackend(storageRoot: string): void {
-  if (app.isPackaged) {
-    // Packaging a standalone backend executable is a later release milestone.
-    return;
-  }
+function credentialHelperPath(): string | undefined {
+  if (process.platform !== "darwin") return undefined;
+  const candidate = app.isPackaged
+    ? path.join(process.resourcesPath, "credential-helper", "claimflow-keychain-helper")
+    : path.join(projectRoot, "electron", "credential-helper", "build", "claimflow-keychain-helper");
+  return existsSync(candidate) ? candidate : undefined;
+}
 
-  try {
-    backendProcess = new BackendProcessManager({
-      launch: resolveDevelopmentBackendLaunch(projectRoot, storageRoot),
-      onDiagnostic: (message) => console.error(`Backend process: ${message}`),
-    });
-    void backendProcess.start().catch(() => undefined);
-  } catch (error: unknown) {
-    console.error("Backend process could not be configured.");
+function credentialStore(): MacOSCredentialStore {
+  return new MacOSCredentialStore(credentialHelperPath());
+}
+
+async function startBackend(storageRoot: string): Promise<void> {
+  if (backendProcess !== undefined || backendLaunchPromise !== undefined) {
+    return backendLaunchPromise ?? Promise.resolve();
   }
+  backendLaunchPromise = (async () => {
+    let storedCredential: string | null = null;
+    try {
+      storedCredential = await credentialStore().read();
+    } catch {
+      // A Keychain issue must not prevent offline/local ClaimFlow operation.
+      // The renderer receives a controlled error only for explicit save/remove.
+    }
+    try {
+      const launch = app.isPackaged
+        ? resolvePackagedBackendLaunch(process.resourcesPath, storageRoot)
+        : resolveDevelopmentBackendLaunch(projectRoot, storageRoot);
+      if (storedCredential !== null) {
+        launch.options.env = { ...launch.options.env, OPENAI_API_KEY: storedCredential };
+      }
+      backendProcess = new BackendProcessManager({
+        launch,
+        onDiagnostic: (message) => console.error(`Backend process: ${message}`),
+      });
+      void backendProcess.start().catch(() => undefined);
+    } catch {
+      console.error("Backend process could not be configured.");
+    }
+  })().finally(() => { backendLaunchPromise = undefined; });
+  return backendLaunchPromise;
+}
+
+async function restartBackendWithCredential(): Promise<void> {
+  backendProcess?.stop();
+  backendProcess = undefined;
+  await startBackend(app.getPath("userData"));
 }
 
 // Called on explicit renderer health requests (initial load or user retry): restarts a
 // failed backend once per request, and retries configuration if the venv was missing.
-async function ensureDevelopmentBackend(): Promise<BackendProcessManager | undefined> {
+async function ensureBackend(): Promise<BackendProcessManager | undefined> {
   if (backendProcess === undefined) {
-    startDevelopmentBackend(app.getPath("userData"));
+    await startBackend(app.getPath("userData"));
   }
 
   if (backendProcess?.state === "failed") {
@@ -406,11 +450,11 @@ async function ensureDevelopmentBackend(): Promise<BackendProcessManager | undef
   return backendProcess;
 }
 
-app.setName("Group Claims Management");
+app.setName("ClaimFlow");
 
 app.whenReady().then(() => {
   configureSessionSecurity();
-  startDevelopmentBackend(app.getPath("userData"));
+  void startBackend(app.getPath("userData"));
 
   ipcMain.handle(GET_APP_INFO_CHANNEL, (event, ...arguments_: unknown[]) => {
     const senderFrame = event.senderFrame;
@@ -439,7 +483,7 @@ app.whenReady().then(() => {
       }
 
       try {
-        const backend = await ensureDevelopmentBackend();
+        const backend = await ensureBackend();
         if (backend === undefined) {
           return createBackendHealthFailure(
             new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."),
@@ -454,12 +498,12 @@ app.whenReady().then(() => {
   );
   ipcMain.handle(GET_AI_STATUS_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AIStatusResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid AI status request.");
-    try { const backend = await ensureDevelopmentBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.getAIStatus() as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
+    try { const backend = await ensureBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.getAIStatus() as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
   });
   ipcMain.handle(CHECK_AI_CONNECTION_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AIConnectionCheckResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid AI connection check request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const check = await backend.checkAIConnection();
       if (!isAIConnectionCheck(check)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid AI connection information.");
@@ -468,7 +512,30 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(SET_AI_AUTHORIZATION_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AIStatusResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url) || typeof payload !== "object" || payload === null || typeof (payload as { authorized?: unknown }).authorized !== "boolean") throw new Error("Invalid AI authorization request.");
-    try { const backend = await ensureDevelopmentBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.setAIAuthorization((payload as { authorized: boolean }).authorized) as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
+    try { const backend = await ensureBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.setAIAuthorization((payload as { authorized: boolean }).authorized) as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
+  });
+  ipcMain.handle(SAVE_AI_API_KEY_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AICredentialResponse> => {
+    if (
+      arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)
+      || !isRecord(payload) || Object.keys(payload).length !== 1 || typeof payload.apiKey !== "string"
+    ) throw new Error("Invalid API key request.");
+    try {
+      await credentialStore().save(payload.apiKey);
+      await restartBackendWithCredential();
+      return { ok: true, credentialPresent: true, message: "API key saved securely in macOS Keychain." };
+    } catch (error) {
+      return credentialFailure(error);
+    }
+  });
+  ipcMain.handle(REMOVE_AI_API_KEY_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AICredentialResponse> => {
+    if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid API key removal request.");
+    try {
+      await credentialStore().remove();
+      await restartBackendWithCredential();
+      return { ok: true, credentialPresent: false, message: "Stored API key removed from macOS Keychain." };
+    } catch (error) {
+      return credentialFailure(error);
+    }
   });
 
   const analysisDocumentId = (payload: unknown): string | undefined => {
@@ -487,7 +554,7 @@ app.whenReady().then(() => {
     const documentId = analysisDocumentId(payload);
     if (!validAnalysisSender(event, arguments_) || !documentId) throw new Error("Invalid document analysis preview request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const preview = await backend.requestDocumentOperation("ai.analysis_preview", { documentId });
       if (!isAnalysisPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid analysis information.");
@@ -498,7 +565,7 @@ app.whenReady().then(() => {
     const documentId = analysisDocumentId(payload);
     if (!validAnalysisSender(event, arguments_) || !documentId || (payload as { acknowledged?: unknown }).acknowledged !== true) throw new Error("Invalid document analysis request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const job = await backend.requestDocumentOperation("ai.analyze_document", { documentId, acknowledged: true });
       if (!isAnalysisJob(job)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned an invalid analysis job.");
@@ -509,7 +576,7 @@ app.whenReady().then(() => {
     const jobId = analysisJobId(payload);
     if (!validAnalysisSender(event, arguments_) || !jobId) throw new Error("Invalid analysis status request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const job = await backend.requestDocumentOperation("ai.analysis_status", { jobId });
       if (!isAnalysisJob(job)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned an invalid analysis job.");
@@ -520,7 +587,7 @@ app.whenReady().then(() => {
     const jobId = analysisJobId(payload);
     if (!validAnalysisSender(event, arguments_) || !jobId) throw new Error("Invalid analysis findings request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const result = await backend.requestDocumentOperation("ai.analysis_findings", { jobId, limit: 25 });
       if (!Array.isArray(result.findings) || !result.findings.every(isAnalysisFinding) || typeof result.hasMore !== "boolean") {
@@ -529,15 +596,19 @@ app.whenReady().then(() => {
       return { ok: true, findings: result.findings, hasMore: result.hasMore };
     } catch (error) { return documentFailure(error); }
   });
-  const documentQuestion = (payload: unknown, acknowledged: boolean): { documentId: string; question: string } | undefined => {
+  const documentQuestion = (payload: unknown, acknowledged: boolean): { documentId: string; question: string; followUp?: DocumentQuestionFollowUp } | undefined => {
     if (!isRecord(payload)) return undefined;
-    const expected = acknowledged ? ["documentId", "question", "acknowledged"] : ["documentId", "question"];
-    if (Object.keys(payload).length !== expected.length || Object.keys(payload).some((key) => !expected.includes(key))) return undefined;
+    const allowed = acknowledged ? ["documentId", "question", "acknowledged", "followUp"] : ["documentId", "question", "followUp"];
+    const required = acknowledged ? ["documentId", "question", "acknowledged"] : ["documentId", "question"];
+    if (Object.keys(payload).some((key) => !allowed.includes(key)) || !required.every((key) => key in payload)) return undefined;
     const documentId = analysisDocumentId(payload);
     const question = payload.question;
     if (!documentId || typeof question !== "string" || !question.trim() || question.length > 600) return undefined;
     if (acknowledged && payload.acknowledged !== true) return undefined;
-    return { documentId, question: question.trim() };
+    const candidateFollowUp = payload.followUp;
+    if (candidateFollowUp === undefined) return { documentId, question: question.trim() };
+    if (!isRecord(candidateFollowUp) || Object.keys(candidateFollowUp).length !== 2 || typeof candidateFollowUp.question !== "string" || typeof candidateFollowUp.answer !== "string" || !candidateFollowUp.question.trim() || !candidateFollowUp.answer.trim() || candidateFollowUp.question.length > 600 || candidateFollowUp.answer.length > 1200) return undefined;
+    return { documentId, question: question.trim(), followUp: { question: candidateFollowUp.question.trim(), answer: candidateFollowUp.answer.trim() } };
   };
   const questionId = (payload: unknown): string | undefined => {
     if (!isRecord(payload) || Object.keys(payload).length !== 1) return undefined;
@@ -548,7 +619,7 @@ app.whenReady().then(() => {
     const request = documentQuestion(payload, false);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid document question preview request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const preview = await backend.requestDocumentOperation("ai.question_preview", request);
       if (!isQuestionPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid question information.");
@@ -559,7 +630,7 @@ app.whenReady().then(() => {
     const request = documentQuestion(payload, true);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid document question request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const question = await backend.requestDocumentOperation("ai.ask_question", { ...request, acknowledged: true });
       if (!isQuestionStatus(question)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid question status.");
@@ -570,7 +641,7 @@ app.whenReady().then(() => {
     const id = questionId(payload);
     if (!validAnalysisSender(event, arguments_) || !id) throw new Error("Invalid document question status request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const question = await backend.requestDocumentOperation("ai.question_status", { questionId: id });
       if (!isQuestionStatus(question)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid question status.");
@@ -618,7 +689,7 @@ app.whenReady().then(() => {
     const documentIds = matterDocumentIds(payload);
     if (!validAnalysisSender(event, arguments_) || !documentIds) throw new Error("Invalid matter review request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const review = await backend.requestDocumentOperation("matter.review", { documentIds });
       if (!isMatterReview(review)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid matter review data.");
@@ -629,7 +700,7 @@ app.whenReady().then(() => {
     const documentIds = batchMatterDocumentIds(payload, false);
     if (!validAnalysisSender(event, arguments_) || !documentIds) throw new Error("Invalid batch analysis preview request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const preview = await backend.requestDocumentOperation("matter.analysis_batch_preview", { documentIds });
       if (!isMatterAnalysisBatchPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid batch analysis data.");
@@ -640,7 +711,7 @@ app.whenReady().then(() => {
     const documentIds = batchMatterDocumentIds(payload, true);
     if (!validAnalysisSender(event, arguments_) || !documentIds) throw new Error("Invalid batch analysis request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const batch = await backend.requestDocumentOperation("matter.start_analysis_batch", { documentIds, acknowledged: true });
       if (!isMatterAnalysisBatch(batch)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid batch analysis data.");
@@ -651,7 +722,7 @@ app.whenReady().then(() => {
     const batchId = isRecord(payload) && Object.keys(payload).length === 1 && typeof payload.batchId === "string" && /^[a-f0-9-]{36}$/i.test(payload.batchId) ? payload.batchId : undefined;
     if (!validAnalysisSender(event, arguments_) || batchId === undefined) throw new Error("Invalid batch analysis status request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const batch = await backend.requestDocumentOperation("matter.analysis_batch_status", { batchId });
       if (!isMatterAnalysisBatch(batch)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid batch analysis status.");
@@ -662,7 +733,7 @@ app.whenReady().then(() => {
     const request = matterQuestionRequest(payload, false);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid consolidated question preview request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const preview = await backend.requestDocumentOperation("matter.question_preview", request);
       if (!isMatterQuestionPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid consolidated question data.");
@@ -673,7 +744,7 @@ app.whenReady().then(() => {
     const request = matterQuestionRequest(payload, true);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid consolidated question request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const question = await backend.requestDocumentOperation("matter.ask_question", { ...request, acknowledged: true });
       if (!isMatterQuestionStatus(question)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid consolidated question status.");
@@ -684,7 +755,7 @@ app.whenReady().then(() => {
     const questionId = isRecord(payload) && Object.keys(payload).length === 1 && typeof payload.questionId === "string" && /^[a-f0-9-]{36}$/i.test(payload.questionId) ? payload.questionId : undefined;
     if (!validAnalysisSender(event, arguments_) || questionId === undefined) throw new Error("Invalid consolidated question status request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const question = await backend.requestDocumentOperation("matter.question_status", { questionId });
       if (!isMatterQuestionStatus(question)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid consolidated question status.");
@@ -695,7 +766,7 @@ app.whenReady().then(() => {
     const request = billingPreviewRequest(payload);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid billing preview request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const preview = await backend.requestDocumentOperation("matter.billing_preview", request);
       if (!isBillingPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid billing preview data.");
@@ -709,7 +780,7 @@ app.whenReady().then(() => {
   };
   const importPaths = async (paths: unknown): Promise<DocumentImportResponse> => {
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       return { ok: true as const, ...(await backend.requestDocumentOperation("documents.import", { paths: await validateAuthorizedImportPaths(paths) })) } as DocumentImportResponse;
     } catch (error) { return documentFailure(error); }
@@ -794,7 +865,7 @@ app.whenReady().then(() => {
       : undefined;
     if (documentId === undefined) throw new Error("Invalid document removal request.");
     try {
-      const backend = await ensureDevelopmentBackend();
+      const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
       const removed = await backend.requestDocumentOperation("documents.remove", { documentId });
       if (!isRecord(removed) || removed.documentId !== documentId) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned an invalid removal result.");
@@ -803,7 +874,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(LIST_DOCUMENTS_CHANNEL, async (event, ...arguments_: unknown[]) => {
     validateSender(event, arguments_);
-    try { const backend = await ensureDevelopmentBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.list", {})) }; } catch (error) { return documentFailure(error); }
+    try { const backend = await ensureBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.list", {})) }; } catch (error) { return documentFailure(error); }
   });
   ipcMain.handle(GET_DOCUMENT_CONTENT_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]) => {
     validateSender(event, arguments_);
@@ -816,13 +887,13 @@ app.whenReady().then(() => {
     const columnLimit = request.columnLimit === undefined ? 10 : request.columnLimit;
     const pageNumber = request.pageNumber;
     if (typeof documentId !== "string" || documentId.length > 128 || (sheetName !== undefined && (typeof sheetName !== "string" || sheetName.length === 0 || sheetName.length > 255)) || typeof rowStart !== "number" || !Number.isInteger(rowStart) || rowStart < 1 || rowStart > 1_000_000 || typeof rowLimit !== "number" || !Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > 10 || typeof columnStart !== "number" || !Number.isInteger(columnStart) || columnStart < 1 || columnStart > 16_384 || typeof columnLimit !== "number" || !Number.isInteger(columnLimit) || columnLimit < 1 || columnLimit > 10 || (pageNumber !== undefined && (typeof pageNumber !== "number" || !Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > 100_000))) throw new Error("Invalid document content request.");
-    try { const backend = await ensureDevelopmentBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.content", { documentId, limit: 1, sheetName, rowStart, rowLimit, columnStart, columnLimit, pageNumber })) }; } catch (error) { return documentFailure(error); }
+    try { const backend = await ensureBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.content", { documentId, limit: 1, sheetName, rowStart, rowLimit, columnStart, columnLimit, pageNumber })) }; } catch (error) { return documentFailure(error); }
   });
   ipcMain.handle(RETRY_DOCUMENT_PARSE_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]) => {
     validateSender(event, arguments_);
     const documentId = typeof payload === "object" && payload !== null ? (payload as { documentId?: unknown }).documentId : undefined;
     if (typeof documentId !== "string" || documentId.length > 128) throw new Error("Invalid retry request.");
-    try { const backend = await ensureDevelopmentBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.retry_parse", { documentId })) }; } catch (error) { return documentFailure(error); }
+    try { const backend = await ensureBackend(); return backend === undefined ? documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")) : { ok: true as const, ...(await backend.requestDocumentOperation("documents.retry_parse", { documentId })) }; } catch (error) { return documentFailure(error); }
   });
 
   ipcMain.handle(

@@ -98,14 +98,18 @@ export function analysisOverviewFromFindings(findings: AnalysisOverviewFinding[]
 }
 
 export function canStartDocumentAnalysis(
-  documentAuthorized: boolean,
   globalAuthorization: boolean,
   providerConfigured: boolean,
   costWithinLimit: boolean,
   jobState: AnalysisJobState,
 ): boolean {
-  return documentAuthorized && globalAuthorization && providerConfigured && costWithinLimit
+  return globalAuthorization && providerConfigured && costWithinLimit
     && jobState !== "queued" && jobState !== "running";
+}
+
+/** Keeps a conversation open even when the preceding turn was unsupported. */
+export function conversationContextAnswer(answer: string | null, unavailableAnswer: string): string {
+  return answer?.trim() || unavailableAnswer;
 }
 
 export function analysisFailureMessage(code: string | null): string | null {

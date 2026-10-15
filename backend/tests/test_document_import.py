@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import json
 import uuid
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -73,6 +74,58 @@ class XlsxExtractionTests(unittest.TestCase):
             result = DocumentImportService(storage).import_authorized_paths([str(source)])
 
         self.assertEqual(result["documents"][0]["document"]["original_filename"], "Bestätigung März.xlsx")
+
+    def test_reimport_retries_a_previously_failed_duplicate(self) -> None:
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "retry.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "Recovered"
+            workbook.save(source)
+            storage = StorageService(str(Path(directory) / "app-data"))
+            storage.initialize()
+            service = DocumentImportService(storage)
+            first = service.import_authorized_paths([str(source)])["documents"][0]["document"]
+            assert storage.database
+            with storage.database.transaction() as connection:
+                connection.execute(
+                    "UPDATE source_documents SET processing_status = 'failed', processing_error = 'Earlier parser failure' WHERE id = ?",
+                    (first["id"],),
+                )
+
+            retry = service.import_authorized_paths([str(source)])["documents"][0]
+
+        self.assertTrue(retry["ok"])
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["document"]["id"], first["id"])
+        self.assertEqual(retry["document"]["processing_status"], "parsed")
+
+    def test_xlsx_without_dimension_metadata_is_imported(self) -> None:
+        """Workbooks created by some tools omit the optional dimension XML."""
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "without-dimension.xlsx"
+            workbook = Workbook()
+            workbook.active.title = "Holdings"
+            workbook.active["A1"] = "Custodian account"
+            workbook.active["B2"] = "AC-1001"
+            workbook.save(source)
+
+            rewritten = Path(directory) / "without-dimension-rewritten.xlsx"
+            with zipfile.ZipFile(source) as original, zipfile.ZipFile(rewritten, "w") as target:
+                for member in original.infolist():
+                    payload = original.read(member.filename)
+                    if member.filename == "xl/worksheets/sheet1.xml":
+                        payload = payload.replace(b'<dimension ref="A1:B2"/>', b"")
+                    target.writestr(member, payload)
+
+            items = DeterministicDocumentParser()._parse_xlsx(rewritten)
+
+        values = {item.source_reference: item.value_text for item in items}
+        self.assertEqual(values["Holdings!A1"], "Custodian account")
+        self.assertEqual(values["Holdings!B2"], "AC-1001")
 
 
 class DocumentSummaryStatusTests(unittest.TestCase):

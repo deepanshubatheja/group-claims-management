@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIConnectionCheckResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
@@ -9,6 +9,15 @@ const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
 const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
 const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
+const SAVE_AI_API_KEY_CHANNEL = "app:save-ai-api-key" as const;
+const REMOVE_AI_API_KEY_CHANNEL = "app:remove-ai-api-key" as const;
+
+function documentQuestionFollowUpPayload(followUp: DocumentQuestionFollowUp): DocumentQuestionFollowUp {
+  return Object.freeze({
+    question: followUp.question.trim(),
+    answer: followUp.answer.trim(),
+  });
+}
 const GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL = "documents:get-analysis-preview" as const;
 const START_DOCUMENT_ANALYSIS_CHANNEL = "documents:start-analysis" as const;
 const GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL = "documents:get-analysis-status" as const;
@@ -175,6 +184,11 @@ const desktopApi = Object.freeze({
   async getAIStatus(): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(GET_AI_STATUS_CHANNEL) as AIStatusResponse); },
   async checkAIConnection(): Promise<AIConnectionCheckResponse> { return Object.freeze(await ipcRenderer.invoke(CHECK_AI_CONNECTION_CHANNEL) as AIConnectionCheckResponse); },
   async setAIAuthorization(authorized: boolean): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(SET_AI_AUTHORIZATION_CHANNEL, { authorized }) as AIStatusResponse); },
+  async saveAIApiKey(apiKey: string): Promise<AICredentialResponse> {
+    if (typeof apiKey !== "string" || !apiKey.trim() || apiKey.length > 1024) throw new Error("Invalid API key.");
+    return Object.freeze(await ipcRenderer.invoke(SAVE_AI_API_KEY_CHANNEL, { apiKey }) as AICredentialResponse);
+  },
+  async removeAIApiKey(): Promise<AICredentialResponse> { return Object.freeze(await ipcRenderer.invoke(REMOVE_AI_API_KEY_CHANNEL) as AICredentialResponse); },
   async getDocumentAnalysisPreview(documentId: string): Promise<DocumentAnalysisPreviewResponse> {
     if (!documentId || documentId.length > 128) throw new Error("Invalid document analysis request.");
     return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL, { documentId }) as DocumentAnalysisPreviewResponse);
@@ -191,13 +205,24 @@ const desktopApi = Object.freeze({
     if (!/^[a-f0-9-]{36}$/i.test(jobId)) throw new Error("Invalid analysis job reference.");
     return Object.freeze(await ipcRenderer.invoke(GET_DOCUMENT_ANALYSIS_FINDINGS_CHANNEL, { jobId, limit: 25 }) as DocumentAnalysisFindingsResponse);
   },
-  async previewDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionPreviewResponse> {
+  async previewDocumentQuestion(documentId: string, question: string, followUp?: DocumentQuestionFollowUp): Promise<DocumentQuestionPreviewResponse> {
     if (!documentId || documentId.length > 128 || !question.trim() || question.length > 600) throw new Error("Invalid document question.");
-    return Object.freeze(await ipcRenderer.invoke(PREVIEW_DOCUMENT_QUESTION_CHANNEL, { documentId, question: question.trim() }) as DocumentQuestionPreviewResponse);
+    if (followUp && (!followUp.question.trim() || !followUp.answer.trim() || followUp.question.length > 600 || followUp.answer.length > 1200)) throw new Error("Invalid document follow-up context.");
+    return Object.freeze(await ipcRenderer.invoke(PREVIEW_DOCUMENT_QUESTION_CHANNEL, {
+      documentId,
+      question: question.trim(),
+      ...(followUp ? { followUp: documentQuestionFollowUpPayload(followUp) } : {}),
+    }) as DocumentQuestionPreviewResponse);
   },
-  async askDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionStartResponse> {
+  async askDocumentQuestion(documentId: string, question: string, followUp?: DocumentQuestionFollowUp): Promise<DocumentQuestionStartResponse> {
     if (!documentId || documentId.length > 128 || !question.trim() || question.length > 600) throw new Error("Invalid document question.");
-    return Object.freeze(await ipcRenderer.invoke(ASK_DOCUMENT_QUESTION_CHANNEL, { documentId, question: question.trim(), acknowledged: true }) as DocumentQuestionStartResponse);
+    if (followUp && (!followUp.question.trim() || !followUp.answer.trim() || followUp.question.length > 600 || followUp.answer.length > 1200)) throw new Error("Invalid document follow-up context.");
+    return Object.freeze(await ipcRenderer.invoke(ASK_DOCUMENT_QUESTION_CHANNEL, {
+      documentId,
+      question: question.trim(),
+      acknowledged: true,
+      ...(followUp ? { followUp: documentQuestionFollowUpPayload(followUp) } : {}),
+    }) as DocumentQuestionStartResponse);
   },
   async getDocumentQuestionStatus(questionId: string): Promise<DocumentQuestionStatusResponse> {
     if (!/^[a-f0-9-]{36}$/i.test(questionId)) throw new Error("Invalid document question reference.");

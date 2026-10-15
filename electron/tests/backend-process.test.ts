@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   BackendProcessError,
   BackendProcessManager,
   resolveDevelopmentBackendLaunch,
+  resolvePackagedBackendLaunch,
   type BackendChildProcess,
   type BackendSpawn,
 } from "../src/backend-process";
@@ -328,6 +329,32 @@ test("passes a synthetic OpenAI environment value to the Python child without di
   } finally {
     if (previous === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previous;
+    rmSync(storageRoot, { recursive: true, force: true });
+  }
+});
+
+test("resolves the bundled backend and local OCR without a development Python environment", () => {
+  const resourcesRoot = mkdtempSync(path.join(os.tmpdir(), "claimflow-resources-test-"));
+  const storageRoot = mkdtempSync(path.join(os.tmpdir(), "claimflow-storage-test-"));
+  const executable = path.join(resourcesRoot, "backend", "claimflow-backend");
+  const tesseract = path.join(resourcesRoot, "ocr", "bin", "tesseract");
+  const tessdata = path.join(resourcesRoot, "ocr", "tessdata");
+  mkdirSync(path.dirname(executable), { recursive: true });
+  mkdirSync(path.dirname(tesseract), { recursive: true });
+  mkdirSync(tessdata, { recursive: true });
+  writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+  writeFileSync(tesseract, "#!/bin/sh\nexit 0\n");
+  chmodSync(executable, 0o700);
+  chmodSync(tesseract, 0o700);
+
+  try {
+    const launch = resolvePackagedBackendLaunch(resourcesRoot, storageRoot, "darwin");
+    assert.equal(launch.command, executable);
+    assert.deepEqual(launch.args, ["--storage-root", storageRoot]);
+    assert.equal(launch.options.env?.GROUP_CLAIMS_TESSERACT_CMD, tesseract);
+    assert.equal(launch.options.env?.TESSDATA_PREFIX, tessdata);
+  } finally {
+    rmSync(resourcesRoot, { recursive: true, force: true });
     rmSync(storageRoot, { recursive: true, force: true });
   }
 });

@@ -170,7 +170,18 @@ class DeterministicDocumentParser:
                 workbook = load_workbook(source, read_only=True, data_only=False)
                 try:
                     for worksheet_index, worksheet in enumerate(workbook.worksheets, start=1):
-                        cells = worksheet.max_row * worksheet.max_column
+                        # Some valid workbooks omit the optional worksheet
+                        # dimension metadata.  ``openpyxl`` then exposes both
+                        # dimensions as ``None`` in read-only mode even though
+                        # the worksheet contains cells.  Ask it to determine
+                        # the dimensions by scanning the sheet before applying
+                        # our extraction limit.  This keeps the memory-safe
+                        # streaming parser while accepting standards-compliant
+                        # workbooks produced by other spreadsheet tools.
+                        if worksheet.max_row is None or worksheet.max_column is None:
+                            worksheet.reset_dimensions()
+                            worksheet.calculate_dimension(force=True)
+                        cells = (worksheet.max_row or 0) * (worksheet.max_column or 0)
                         if cells + len(items) > MAX_EXTRACTED_ITEMS:
                             raise DocumentImportError("CONTENT_TOO_LARGE", "The workbook exceeds the safe extraction limit.")
                         for row_number, row in enumerate(worksheet.iter_rows(), start=1):
@@ -322,6 +333,17 @@ class DeterministicDocumentParser:
             return PdfPageExtraction(page_number, "unavailable", None, None,
                 "OCR dependencies are not installed for this backend.", None, None, None, ())
         try:
+            # A packaged ClaimFlow backend receives these paths only from the
+            # trusted Electron main process. Development keeps the normal local
+            # Tesseract discovery behaviour, so no user-installed path is
+            # required by the distributed application.
+            configured_command = os.environ.get("GROUP_CLAIMS_TESSERACT_CMD")
+            if configured_command:
+                command_path = Path(configured_command)
+                if not command_path.is_file():
+                    return PdfPageExtraction(page_number, "unavailable", None, None,
+                        "The bundled local OCR runtime is unavailable.", None, None, None, ())
+                pytesseract.pytesseract.tesseract_cmd = str(command_path)
             version = str(pytesseract.get_tesseract_version())
             available_languages = set(pytesseract.get_languages(config=""))
         except (pytesseract.TesseractNotFoundError, OSError):
@@ -427,6 +449,14 @@ class DocumentImportService:
             if not vault_result.duplicate:
                 self._set_document_format(document.id, file_format)
                 self._parse_document(document)
+            elif self._parse_retry_needed(document.id):
+                # A duplicate is normally a no-op, but an earlier local parse
+                # may have failed because of a corrected parser/runtime issue.
+                # Re-selecting the same user-authorized file is an explicit,
+                # safe retry of the immutable managed copy; it never creates
+                # a second document or alters the original source file.
+                self._set_document_format(document.id, file_format)
+                self._parse_document(document)
             return {"ok": True, "document": self._summary(document.id), "duplicate": vault_result.duplicate}
         except (DocumentImportError, VaultImportError) as error:
             return {"ok": False, "filename": filename, "error": self._error(getattr(error, "code", "IMPORT_FAILED"), str(error))}
@@ -435,6 +465,13 @@ class DocumentImportService:
         document = self._get_document(document_id)
         self._parse_document(document)
         return {"document": self._summary(document.id)}
+
+    def _parse_retry_needed(self, document_id: str) -> bool:
+        with self._database.connection() as connection:
+            row = connection.execute(
+                "SELECT processing_status FROM source_documents WHERE id = ?", (document_id,)
+            ).fetchone()
+        return row is not None and str(row["processing_status"]) in {"failed", "imported"}
 
     def list_documents(self) -> Mapping[str, object]:
         with self._database.connection() as connection:

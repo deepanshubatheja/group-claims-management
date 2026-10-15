@@ -64,6 +64,78 @@ class MatterReviewTests(unittest.TestCase):
         self.assertEqual(result["allocatedTotal"], "100.00")
         self.assertEqual([item["allocatedFee"] for item in result["allocations"]], ["33.34", "33.33", "33.33"])
 
+    def test_document_backed_billing_calculates_only_explicit_instruction_inputs(self) -> None:
+        """A local instruction can support a provisional result without an AI call."""
+        billing_document = self._add_billing_instruction()
+        service = MatterReviewService(self.storage)
+        question = "Using the approved instruction, calculate the pro-rata billing allocation."
+        preview = service.question_preview({"documentIds": [billing_document], "question": question})
+        self.assertTrue(preview["localOnly"])
+        self.assertEqual(preview["cost"]["estimatedCostUsd"], "0.000000")
+        started = service.ask_question({"documentIds": [billing_document], "question": question, "acknowledged": True})
+        self.assertEqual(started["status"], "completed")
+        self.assertEqual(started["model"], "local-document-calculation")
+        self.assertIn("USD 45,000.00", str(started["answer"]))
+        self.assertIn("USD 75,000.00", str(started["answer"]))
+        self.assertIn("Meridian Income Fund C (AC-3001) is excluded", str(started["answer"]))
+        self.assertEqual(started["citations"][0]["filename"], "approved-billing.pdf")
+        self.assertEqual(started["citations"][0]["sourceReference"], "page 1 block 0")
+
+    def test_document_backed_billing_conversation_uses_question_aware_provider(self) -> None:
+        billing_document = self._add_billing_instruction()
+        previous = {key: os.environ.get(key) for key in ("OPENAI_API_KEY", "GROUP_CLAIMS_AI_PROVIDER")}
+        try:
+            os.environ["OPENAI_API_KEY"] = "synthetic-key"
+            os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
+            provider = _BillingConversationProvider()
+            analysis = AIAnalysisService(self.storage, provider_factory=lambda: provider)  # type: ignore[arg-type]
+            AIService(self.storage).set_authorization({"authorized": True, "acknowledged": True})
+            service = MatterReviewService(self.storage, analysis)
+            question = "Do you give the same output when I mention pro rata?"
+            preview = service.question_preview({"documentIds": [billing_document], "question": question})
+            self.assertFalse(preview["localOnly"])
+            started = service.ask_question({"documentIds": [billing_document], "question": question, "acknowledged": True})
+            for _ in range(30):
+                status = service.question_status({"questionId": started["questionId"]})
+                if status["status"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["answer"], "No. I answer the question asked; an allocation is calculated only when requested.")
+            self.assertEqual(provider.questions, [question])
+            self.assertTrue(provider.saw_billing_instruction)
+            self.assertNotEqual(status["model"], "local-document-calculation")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_provider_internal_citation_key_is_not_rendered_to_user(self) -> None:
+        previous = {key: os.environ.get(key) for key in ("OPENAI_API_KEY", "GROUP_CLAIMS_AI_PROVIDER")}
+        try:
+            os.environ["OPENAI_API_KEY"] = "synthetic-key"
+            os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
+            analysis = AIAnalysisService(self.storage, provider_factory=lambda: _KeyLeakingQuestionProvider())  # type: ignore[arg-type]
+            AIService(self.storage).set_authorization({"authorized": True, "acknowledged": True})
+            service = MatterReviewService(self.storage, analysis)
+            started = service.ask_question({"documentIds": [self.document_id], "question": "Which fund is named?", "acknowledged": True})
+            for _ in range(30):
+                status = service.question_status({"questionId": started["questionId"]})
+                if status["status"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(status["status"], "completed")
+            self.assertNotIn("E1", str(status["answer"]))
+            self.assertIn("holdings.csv (CSV!A2)", str(status["answer"]))
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_preview_requires_explicit_assumptions_and_does_not_write_invoices(self) -> None:
         with self.assertRaises(MatterReviewError):
             self.service.billing_preview({"feePool": "0", "currency": "USD", "rows": []})
@@ -340,6 +412,48 @@ class MatterReviewTests(unittest.TestCase):
             )
         return document_id
 
+    def _add_billing_instruction(self) -> str:
+        document_id = str(uuid.uuid4())
+        extraction_id = str(uuid.uuid4())
+        page_id = str(uuid.uuid4())
+        text = """Approved synthetic billing instruction
+For the billing period 1 April 2023 to 30 April 2023, allocate the fee pool using eligible nominal holdings.
+Apply the stated formula with currency rounding so the allocations reconcile exactly to the fee pool.
+Input
+Approved synthetic value
+Fee pool
+USD 120,000.00
+Billing period
+1 April 2023 to 30 April 2023
+Allocation rule
+Eligible nominal amount / total eligible nominal amount x fee pool
+Eligible participant 1
+Horizon Credit Fund A (AC-1001): 600,000
+Eligible participant 2
+Horizon Credit Fund B (AC-2001): 1,000,000
+Excluded participant
+Meridian Income Fund C (AC-3001): withdrawn
+"""
+        assert self.storage.database
+        with self.storage.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO source_documents (id, original_filename, managed_relative_path, content_sha256, file_size_bytes, imported_at, file_format, processing_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'parsed')",
+                (document_id, "approved-billing.pdf", f"documents/{document_id}", (document_id.replace("-", "") * 2)[:64], 1, "2026-01-03T00:00:00+00:00", "pdf"),
+            )
+            connection.execute(
+                "INSERT INTO document_extractions (id, source_document_id, parser_version, status, started_at, completed_at) VALUES (?, ?, ?, 'parsed', ?, ?)",
+                (extraction_id, document_id, "synthetic", "2026-01-03T00:00:00+00:00", "2026-01-03T00:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO pdf_page_extractions (id, extraction_id, page_number, extraction_method, raw_text, cleaned_text, block_count) VALUES (?, ?, 1, 'native_text', ?, ?, 1)",
+                (page_id, extraction_id, text, text),
+            )
+            connection.execute(
+                "INSERT INTO pdf_text_blocks (id, pdf_page_extraction_id, block_index, text, is_table_candidate) VALUES (?, ?, 0, ?, 0)",
+                (str(uuid.uuid4()), page_id, text),
+            )
+        return document_id
+
 
 class _FakeAnalysis:
     def __init__(self) -> None:
@@ -442,5 +556,34 @@ class _UnknownMatterQuestionProvider:
             None, True,
             ({"sourceReference": allowed_citation_keys[0], "evidenceSnippet": "synthetic"},),
             "mock-matter-provider", 4, 3, 7,
+        )
+
+
+class _KeyLeakingQuestionProvider:
+    def answer_question(self, question: str, context: str, allowed_citation_keys=()) -> AnswerResult:
+        return AnswerResult(
+            "The requested information appears in E1.", False,
+            ({"sourceReference": "E1", "evidenceSnippet": "Fund A"},),
+            "mock-matter-provider", 4, 3, 7,
+        )
+
+
+class _BillingConversationProvider:
+    def __init__(self) -> None:
+        self.questions: list[str] = []
+        self.saw_billing_instruction = False
+
+    def answer_question(self, question: str, context: str, allowed_citation_keys=()) -> AnswerResult:
+        self.questions.append(question)
+        self.saw_billing_instruction = (
+            "DOCUMENT-BACKED BILLING INSTRUCTION; EVIDENCE:" in context
+            and "Billing period: 1 April 2023 to 30 April 2023." in context
+            and "Horizon Credit Fund A (AC-1001) has eligible nominal amount 600,000" in context
+        )
+        assert self.saw_billing_instruction
+        return AnswerResult(
+            "No. I answer the question asked; an allocation is calculated only when requested.", False,
+            ({"sourceReference": allowed_citation_keys[0], "evidenceSnippet": "Approved pro-rata billing instruction"},),
+            "mock-billing-conversation-provider", 4, 3, 7,
         )
 

@@ -35,6 +35,7 @@ type AIConnectionCheck = { outcome: "available" | "provider_not_configured" | "a
 type AIStatus = { enabled: boolean; authorized: boolean; provider: string | null; model: string | null; configured: boolean; credentialPresent: boolean; message: string; lastConnectionCheck: AIConnectionCheck | null; };
 type AIStatusResponse = { ok: true; ai: AIStatus } | { ok: false; error: { code: string; message: string } };
 type AIConnectionCheckResponse = { ok: true; check: AIConnectionCheck } | { ok: false; error: { code: string; message: string } };
+type AICredentialResponse = { ok: true; credentialPresent: boolean; message: string } | { ok: false; error: { code: string; message: string } };
 type DocumentAnalysisCost = { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; };
 type DocumentAnalysisUsage = { estimatedCostUsd: string | null; inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; };
 type DocumentAnalysisSummary = { text: string | null; unknown: boolean; citations: DocumentQuestionCitation[]; };
@@ -49,6 +50,7 @@ type DocumentQuestionScope = { sourceItems: number; totalSourceItems: number; ex
 type DocumentQuestionCost = { estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string | null; withinLimit: boolean; maxRequestAttempts: number; };
 type DocumentQuestionPreview = { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; };
 type DocumentQuestionCitation = { sourceReference: string; evidenceSnippet: string; };
+type DocumentQuestionFollowUp = { question: string; answer: string; };
 type DocumentQuestionStatus = { questionId: string; documentId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: DocumentQuestionCitation[]; errorCode: string | null; model: string | null; scope: DocumentQuestionScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; };
 type DocumentQuestionPreviewResponse = { ok: true; preview: DocumentQuestionPreview } | DocumentFailure;
 type DocumentQuestionStartResponse = { ok: true; question: DocumentQuestionStatus } | DocumentFailure;
@@ -64,7 +66,7 @@ type MatterAnalysisBatchPreviewResponse = { ok: true; preview: MatterAnalysisBat
 type MatterAnalysisBatchResponse = { ok: true; batch: MatterAnalysisBatch } | DocumentFailure;
 type MatterQuestionCitation = { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; };
 type MatterQuestionFollowUp = { question: string; answer: string; };
-type MatterQuestionPreview = { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; };
+type MatterQuestionPreview = { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; };
 type MatterQuestionStatus = { questionId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; scope: DocumentQuestionScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; };
 type MatterQuestionPreviewResponse = { ok: true; preview: MatterQuestionPreview } | DocumentFailure;
 type MatterQuestionResponse = { ok: true; question: MatterQuestionStatus } | DocumentFailure;
@@ -92,12 +94,14 @@ interface DesktopAPI {
   getAIStatus(): Promise<AIStatusResponse>;
   checkAIConnection(): Promise<AIConnectionCheckResponse>;
   setAIAuthorization(authorized: boolean): Promise<AIStatusResponse>;
+  saveAIApiKey(apiKey: string): Promise<AICredentialResponse>;
+  removeAIApiKey(): Promise<AICredentialResponse>;
   getDocumentAnalysisPreview(documentId: string): Promise<DocumentAnalysisPreviewResponse>;
   startDocumentAnalysis(documentId: string): Promise<DocumentAnalysisStartResponse>;
   getDocumentAnalysisStatus(jobId: string): Promise<DocumentAnalysisStatusResponse>;
   getDocumentAnalysisFindings(jobId: string): Promise<DocumentAnalysisFindingsResponse>;
-  previewDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionPreviewResponse>;
-  askDocumentQuestion(documentId: string, question: string): Promise<DocumentQuestionStartResponse>;
+  previewDocumentQuestion(documentId: string, question: string, followUp?: DocumentQuestionFollowUp): Promise<DocumentQuestionPreviewResponse>;
+  askDocumentQuestion(documentId: string, question: string, followUp?: DocumentQuestionFollowUp): Promise<DocumentQuestionStartResponse>;
   getDocumentQuestionStatus(questionId: string): Promise<DocumentQuestionStatusResponse>;
   getMatterReview(documentIds: string[]): Promise<MatterReviewResponse>;
   previewMatterAnalysisBatch(documentIds: string[]): Promise<MatterAnalysisBatchPreviewResponse>;

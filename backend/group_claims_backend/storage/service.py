@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -9,6 +10,9 @@ from .config import StorageConfigurationError, StoragePaths
 from .database import Database, DatabaseConnectionError
 from .migrations import MigrationError, MigrationRunner
 from .vault import FileVaultService, VaultStorageError
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,9 @@ class StorageService:
             self.vault = vault
             self._status = StorageStatus("ready", "connected", schema_version, True)
         except (StorageConfigurationError, DatabaseConnectionError, MigrationError, VaultStorageError):
+            # This stays in backend-only operational diagnostics; no source
+            # document content or provider payload is included.
+            logger.exception("Local storage initialization failed.")
             self.paths = None
             self.database = None
             self.vault = None

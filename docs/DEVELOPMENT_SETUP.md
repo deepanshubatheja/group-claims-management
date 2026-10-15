@@ -83,8 +83,13 @@ Phase 6.2B adds document-scoped analysis jobs. It transmits only bounded,
 evidence-referenced deterministic extraction fragments after both global Settings
 authorization and a deliberate per-document Analyze action. Original vault files
 are never uploaded by default. The current development environment uses
-`OPENAI_API_KEY`; packaged per-user OS-protected credential storage remains a
-future distribution requirement.
+`OPENAI_API_KEY`. The packaged macOS app also provides **Settings → AI
+Connection**, which stores a key in the current user's macOS Keychain. The
+stored value is never written to SQLite or a configuration file, never returned
+to React, and is supplied only to the private Python backend process when
+ClaimFlow launches. Removing the key from Settings removes that Keychain entry;
+a development-only terminal environment variable may still apply to a
+development process.
 
 If Settings reports that the key is not detected, use **Refresh AI
 configuration**. This is a boolean-only report from the Python backend: it
@@ -117,16 +122,20 @@ export GROUP_CLAIMS_AI_MODEL=gpt-4.1-mini
 npm run dev
 ```
 
-After Electron starts, open **Settings → AI Processing** and first use
-**Refresh AI configuration**. It reports only whether the running Python child
-received a non-empty key. If it says the key is present, **Check API
-Connection** is a separate, deliberate request to OpenAI's Models metadata
-endpoint; it sends no document content and creates no model response. It may
-still be subject to provider availability and account/project permissions. A
-connection-check result describes that explicit request only: `Key present` is
-not proof of authentication. The UI reports controlled authentication,
-permission, rate-limit, network, timeout, or generic provider errors without
-revealing provider response bodies, headers, or credentials.
+After Electron starts, open **Settings → AI Connection**. The page reports only
+whether the running Python child received a non-empty key. If it says a key is
+available, **Check Connection** is a separate, deliberate request to OpenAI's
+Models metadata endpoint; it sends no document content and creates no model
+response. It may still be subject to provider availability and account/project
+permissions. A connection-check result describes that explicit request only:
+key availability is not proof of authentication. The UI reports controlled
+authentication, permission, rate-limit, network, timeout, or generic provider
+errors without revealing provider response bodies, headers, or credentials.
+
+For the packaged macOS application, paste the key in **Settings → AI
+Connection**, select **Save API Key**, and use **Check Connection**. No terminal
+or `.env` file is required. Each document analysis and question remains subject
+to the existing cloud-authorization and explicit per-request consent controls.
 
 On Windows PowerShell, set the process environment variable in the same window
 before `npm run dev`, for example `$env:OPENAI_API_KEY = "..."`, then set the
@@ -203,3 +212,28 @@ backend session only; they are not logged or saved to SQLite.
 ## Cross-platform considerations
 
 Use platform-neutral path APIs and test macOS and Windows path behavior. User data, local databases, immutable imported-document copies, exports, backups, and logs must live in an OS-standard per-user application-data directory outside the repository and install location. Do not assume case-sensitive paths, POSIX-only behavior, or a globally installed Python runtime in packaged builds.
+
+## Packaging ClaimFlow for macOS (Apple Silicon)
+
+The release-builder Mac, not a client machine, needs Node, the project-local
+Python environment, and Homebrew Tesseract with English and German language
+data. From the repository root, build an unsigned testing DMG with:
+
+```zsh
+npm run package:mac
+```
+
+The command produces an Apple Silicon DMG under `release/`. It bundles the
+production Electron renderer, a PyInstaller standalone Python backend, and the
+local Tesseract runtime and language data. The installed app does not use a
+system Python, Node, npm, or SQLite installation. It stores new data under
+`~/Library/Application Support/ClaimFlow/`; it does not alter the older
+development-data directory (`Group Claims Management`).
+
+This initial build is unsigned and not notarized. It is suitable only for local
+and trusted testing with non-sensitive sample data. A public client release
+requires Apple Developer signing, notarization, and a clean-machine test.
+
+`npm run package:win` configures an NSIS installer but cannot produce a
+supported Windows release until the Python backend and OCR runtime are built
+and tested on Windows. Do not distribute that target from macOS.

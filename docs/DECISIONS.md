@@ -245,3 +245,50 @@ where a relevant statement outside a document's preliminary proposals could not
 be considered by Matter Review Q&A. It does not treat a holding, account, or
 security movement as evidence of litigation participation, and it does not
 create confirmed legal, claims, or billing records.
+
+## 2026-10-16 — Standalone macOS ClaimFlow packaging
+
+The initial distribution build uses `electron-builder` for an Apple Silicon
+DMG and PyInstaller in one-directory mode for the Python backend. Electron
+launches that immutable backend executable from its packaged resources using
+the existing private NDJSON stdin/stdout protocol; no HTTP service or
+development Python environment is introduced. Mutable databases, documents,
+exports, logs, backups, and settings remain under Electron's per-user data
+directory, outside both the DMG installation and the repository.
+
+The macOS release builder also copies Tesseract plus English and German
+language data into the app resources. The backend receives those trusted paths
+only from Electron in packaged mode and reports local OCR as unavailable if a
+future platform build omits them. The beta DMG is unsigned and not notarized;
+it is not a production release. Windows NSIS configuration is prepared, but
+Windows packaging and clean-machine verification remain outstanding.
+
+## 2026-10-16 — Packaged macOS OpenAI credential storage
+
+The packaged macOS application stores a user-provided OpenAI API key as a
+non-synchronizing Keychain generic-password item. A small native Security
+framework helper receives the key only on stdin, and Electron main receives it
+only on a private stdout pipe before launching the Python backend. The renderer
+can save, replace, remove, and learn the presence of a credential through typed
+allowlisted IPC, but cannot read a stored key. The key is never placed in
+SQLite, configuration files, logs, command-line arguments, or installer assets.
+Connection checks remain explicit Models metadata requests and document AI work
+continues to require existing global and per-request authorization.
+
+## 2026-10-16 — Document-backed provisional pro-rata answers
+
+Matter Review can produce an in-memory, local pro-rata calculation only when
+one selected parsed document expressly supplies an approved instruction, a fee
+pool and currency, an allocation rule based on eligible nominal amounts, and
+the named eligible participants with their bases. Python uses `Decimal` and the
+existing largest-remainder cent allocation. The result cites that instruction,
+does not contact OpenAI, and is labelled as a provisional calculation preview,
+not an invoice, billing record, or legal-entitlement decision. If zero or more
+than one qualifying instruction is selected, ClaimFlow does not infer or choose
+a billing policy; the normal evidence-linked Q&A path remains available.
+
+Opaque provider citation handles are never shown in the lawyer-facing answer.
+They are replaced with the resolved local filename and source reference before
+the answer is rendered. Follow-up questions retain their ordinary local-source
+retrieval scope rather than treating a prior answer or a provider handle as
+evidence.

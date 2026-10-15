@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { conversationContextAnswer } from "./analysis-ui";
 
 function matterQuestionFailure(code: string | null): string {
   if (code === "AI_AUTHORIZATION_WITHDRAWN") return "Cloud-processing authorization was withdrawn before this question could be sent.";
@@ -41,14 +42,17 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   const [loadingReview, setLoadingReview] = useState(false);
   const [batchPreview, setBatchPreview] = useState<MatterAnalysisBatchPreview | null>(null);
   const [batch, setBatch] = useState<MatterAnalysisBatch | null>(null);
-  const [batchConsent, setBatchConsent] = useState(false);
+  // Global Cloud AI is enabled once in Settings.  An Analyze or Ask AI click
+  // remains the explicit action for its bounded scope, so a second checkbox
+  // here would be repetitive rather than an additional safeguard.
   const [batchLoading, setBatchLoading] = useState(false);
   const [batchMessage, setBatchMessage] = useState("");
   const [questionDraft, setQuestionDraft] = useState("");
   const [questionPreview, setQuestionPreview] = useState<MatterQuestionPreview | null>(null);
   const [questionPreviewText, setQuestionPreviewText] = useState("");
   const [questionPreviewFollowUpId, setQuestionPreviewFollowUpId] = useState<string | null>(null);
-  const [questionAuthorized, setQuestionAuthorized] = useState(false);
+  const questionAuthorized = true;
+  const setQuestionAuthorized = (_value: boolean) => undefined;
   const [questionJob, setQuestionJob] = useState<MatterQuestionStatus | null>(null);
   const [questionPendingText, setQuestionPendingText] = useState("");
   const [questionPendingParentId, setQuestionPendingParentId] = useState<string | null>(null);
@@ -84,6 +88,11 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   const selected = useMemo(() => new Set(selectedIds), [selectedIds]);
   const selectableDocumentIds = useMemo(() => documents.slice(0, 20).map((document) => document.id), [documents]);
   const allSelectableDocumentsSelected = selectableDocumentIds.length > 0 && selectableDocumentIds.every((documentId) => selected.has(documentId));
+  const selectedNewDocumentIds = useMemo(
+    () => selectedIds.filter((documentId) => documents.find((document) => document.id === documentId)?.ai_review_status === "new"),
+    [documents, selectedIds],
+  );
+  const selectedReviewedDocumentCount = selectedIds.length - selectedNewDocumentIds.length;
   const documentNames = useMemo(() => new Map((review?.documents ?? []).map((document) => [document.id, document.filename])), [review]);
   const batchRunning = Boolean(batch && ["queued", "running"].includes(batch.status));
 
@@ -116,7 +125,7 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   }, [review]);
 
   const clearReviewState = () => {
-    setReview(null); setBatchPreview(null); setBatch(null); setBatchConsent(false); setBatchMessage("");
+    setReview(null); setBatchPreview(null); setBatch(null); setBatchMessage("");
     setBatchReviewDocumentIds([]);
     automaticReviewSelection.current = null;
     setQuestionPreview(null); setQuestionPreviewText(""); setQuestionPreviewFollowUpId(null); setQuestionAuthorized(false); setQuestionJob(null);
@@ -135,28 +144,25 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
     clearReviewState();
   };
 
-  const prepareBatch = async () => {
+  const analyzeNewSelectedDocuments = async () => {
     if (selectedIds.length === 0) { setBatchMessage("Select at least one parsed document."); return; }
-    const documentsToReview = selectedIds.filter((documentId) => documents.find((document) => document.id === documentId)?.ai_review_status === "new");
+    const documentsToReview = selectedNewDocumentIds;
     if (documentsToReview.length === 0) { setBatchMessage("All selected documents already have an AI review for their current extraction. Their summaries and Q&A remain available below."); return; }
     if (documentsToReview.length > 20) { setBatchMessage("Select up to 20 documents for one analysis batch."); return; }
-    setBatchLoading(true); setBatchMessage(""); setBatch(null); setBatchConsent(false);
+    setBatchLoading(true); setBatchMessage(""); setBatch(null);
     try {
       const response = await window.desktopAPI.previewMatterAnalysisBatch(documentsToReview);
       if (!response.ok) { setBatchMessage(response.error.message); return; }
-      setBatchPreview(response.preview);
-    } catch (error) { setBatchMessage(requestFailure(error, "The analysis plan is temporarily unavailable.")); }
-    finally { setBatchLoading(false); }
-  };
-  const startBatch = async () => {
-    if (!batchPreview || !batchConsent || !batchPreview.ready) return;
-    setBatchLoading(true); setBatchMessage("");
-    try {
-      const response = await window.desktopAPI.startMatterAnalysisBatch(batchPreview.documents.map((document) => document.documentId));
-      if (!response.ok) { setBatchMessage(response.error.message); return; }
+      // Analyze selected documents is the user's explicit authorization for
+      // this bounded batch.  When the local preflight is ready, start it in
+      // the same action; keep preflight details on screen only when a setting
+      // or cost limit prevents a transfer.
+      if (!response.preview.ready) { setBatchPreview(response.preview); return; }
+      const startResponse = await window.desktopAPI.startMatterAnalysisBatch(documentsToReview);
+      if (!startResponse.ok) { setBatchMessage(startResponse.error.message); return; }
       setBatchReviewDocumentIds(selectedIds);
-      setBatch(response.batch);
-    } catch (error) { setBatchMessage(requestFailure(error, "The selected-document analysis could not be started.")); }
+      setBatch(startResponse.batch);
+    } catch (error) { setBatchMessage(requestFailure(error, "The analysis plan is temporarily unavailable.")); }
     finally { setBatchLoading(false); }
   };
 
@@ -196,7 +202,9 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   }, [questionJob, questionPendingParentId, questionPendingText]);
 
   const activeQuestionText = questionFollowUp ? conversationDraft.trim() : questionDraft.trim();
-  const prepareQuestion = useCallback(async (questionOverride?: string, followUpOverride?: MatterFollowUp | null) => {
+  const prepareQuestion = useCallback(async (
+    questionOverride?: string, followUpOverride?: MatterFollowUp | null, submitWhenReady = false,
+  ) => {
     // The root composer is the only caller without an explicit question.
     // Conversation planning always passes its current draft explicitly so a
     // follow-up state update cannot cause another planning cycle.
@@ -208,6 +216,23 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
       const response = await window.desktopAPI.previewMatterQuestion(selectedIds, question, followUp ? { question: followUp.question, answer: followUp.answer } : undefined);
       if (!response.ok) { setQuestionMessage(response.error.message); return; }
       setQuestionPreview(response.preview); setQuestionPreviewText(question); setQuestionPreviewFollowUpId(followUp?.id ?? null);
+      // A deliberate Ask AI click checks the local scope first, then submits
+      // only if the resulting request is ready. Typing never reaches here.
+      const readyToSubmit = response.preview.localOnly || (
+        response.preview.globalAuthorization
+        && response.preview.configured
+        && response.preview.cost.withinLimit
+      );
+      if (submitWhenReady && readyToSubmit) {
+        const answerResponse = await window.desktopAPI.askMatterQuestion(
+          selectedIds, question, followUp ? { question: followUp.question, answer: followUp.answer } : undefined,
+        );
+        if (!answerResponse.ok) { setQuestionMessage(answerResponse.error.message); return; }
+        setQuestionPendingText(question); setQuestionPendingParentId(followUp?.id ?? null); setQuestionJob(answerResponse.question);
+        if (followUp) setConversationDraft("");
+        else setQuestionDraft("");
+        setQuestionFollowUp(null); setQuestionPreview(null); setQuestionPreviewText(""); setQuestionPreviewFollowUpId(null); setQuestionAuthorized(false);
+      }
     } catch (error) { setQuestionMessage(requestFailure(error, "The Q&A plan is temporarily unavailable.")); }
     finally { setQuestionLoading(false); }
   }, [questionDraft, selectedIds]);
@@ -238,7 +263,7 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   };
   const currentQuestionPreview = questionPreviewText === activeQuestionText && questionPreviewFollowUpId === (questionFollowUp?.id ?? null) ? questionPreview : null;
   const askingQuestion = questionLoading || questionJob?.status === "queued" || questionJob?.status === "running";
-  const canAskQuestion = Boolean(currentQuestionPreview && questionAuthorized && currentQuestionPreview.globalAuthorization && currentQuestionPreview.configured && currentQuestionPreview.cost.withinLimit && !askingQuestion);
+  const canAskQuestion = Boolean(currentQuestionPreview && questionAuthorized && (currentQuestionPreview.localOnly || (currentQuestionPreview.globalAuthorization && currentQuestionPreview.configured && currentQuestionPreview.cost.withinLimit)) && !askingQuestion);
   const conversationTurns = useMemo(() => {
     if (!activeConversationId) return [];
     const included = new Set<string>([activeConversationId]);
@@ -253,50 +278,33 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
   }, [activeConversationId, questionTurns]);
   const latestConversationTurn = conversationTurns[conversationTurns.length - 1] ?? null;
 
-  // Planning is local and does not send content to the provider. Prepare the
-  // bounded follow-up scope after the user pauses typing so the conversation
-  // needs one visible action: consent, then Ask AI. This avoids a separate
-  // "prepare" button without weakening the explicit transmission consent.
-  useEffect(() => {
-    if (!activeConversationId || !latestConversationTurn?.answer) return;
-    const question = conversationDraft.trim();
-    if (!question) return;
-    if (questionPreviewText === question && questionPreviewFollowUpId === latestConversationTurn.id) return;
-    const followUp = { id: latestConversationTurn.id, question: latestConversationTurn.question, answer: latestConversationTurn.answer };
-    const timer = window.setTimeout(() => {
-      setQuestionFollowUp(followUp);
-      void prepareQuestion(question, followUp);
-    }, 350);
-    return () => window.clearTimeout(timer);
-  }, [activeConversationId, conversationDraft, latestConversationTurn?.answer, latestConversationTurn?.id, latestConversationTurn?.question, prepareQuestion, questionPreviewFollowUpId, questionPreviewText]);
-
   return <>
     <header className="page-header"><div><p className="eyebrow">Matter review</p><h1>Review a matter</h1><p className="page-subtitle">Review concise document summaries, then ask questions across the selected material.</p></div></header>
     <section className="matter-notice"><strong>For review only</strong><p>AI answers are provisional. They do not confirm legal entitlement, claim transfers, or billing responsibility.</p></section>
     <section className="documents-card matter-selection">
-      <div><div><p className="section-label">Documents</p><h2>Select documents</h2><p>Choose up to 20 parsed documents to review together.</p></div><div className="matter-selection-actions"><label className="select-all-control"><input type="checkbox" checked={allSelectableDocumentsSelected} disabled={documents.length === 0} onChange={toggleAllDocuments} /><span>Select all{documents.length > 20 ? " (first 20)" : ""}</span></label><button className="secondary-button" type="button" disabled={loadingReview || selectedIds.length === 0} onClick={() => void loadReview()}>{loadingReview ? "Updating…" : "Update summaries"}</button></div></div>
+      <div><div><p className="section-label">Documents</p><h2>Select documents</h2><p>Choose up to 20 parsed documents to review together. {selectedIds.length > 0 && `${selectedReviewedDocumentCount} reviewed · ${selectedNewDocumentIds.length} new.`}</p></div><div className="matter-selection-actions"><label className="select-all-control"><input type="checkbox" checked={allSelectableDocumentsSelected} disabled={documents.length === 0} onChange={toggleAllDocuments} /><span>Select all{documents.length > 20 ? " (first 20)" : ""}</span></label><button className="secondary-button" type="button" disabled={loadingReview || selectedIds.length === 0} onClick={() => void loadReview()}>{loadingReview ? "Refreshing…" : "Refresh reviewed summaries"}</button></div></div>
       {documents.map((document) => <label className="matter-document" key={document.id}><input type="checkbox" checked={selected.has(document.id)} onChange={() => toggleDocument(document.id)} /><span><strong>{document.original_filename}</strong><small>{document.file_format.toUpperCase()} · imported {new Date(document.imported_at).toLocaleDateString()}</small></span><span className={`review-label ${document.ai_review_status}`}>{document.ai_review_status === "reviewed" ? "AI reviewed" : "New"}</span></label>)}
       {message && <p className="viewer-state" role="status">{message}</p>}
       <div className="matter-batch-action"><p className="section-label">AI review</p>
-        {!batchPreview && <button className="primary-button" type="button" disabled={batchLoading || selectedIds.length === 0 || batchRunning} onClick={() => void prepareBatch()}>{batchLoading ? "Preparing analysis…" : "Analyze selected documents"}</button>}
+        {!batchPreview && <button className="primary-button" type="button" disabled={batchLoading || selectedNewDocumentIds.length === 0 || batchRunning} onClick={() => void analyzeNewSelectedDocuments()}>{batchLoading ? "Starting analysis…" : `Analyze ${selectedNewDocumentIds.length} new selected document${selectedNewDocumentIds.length === 1 ? "" : "s"}`}</button>}
         {batchPreview && <><p>One bounded OpenAI request will be made for each selected document. No automatic retries are used.</p><p>Estimated total: USD {batchPreview.estimatedCostUsd} (batch limit: USD {batchPreview.costLimitUsd}). This is an estimate, not a bill.</p>
           {!batchPreview.globalAuthorization && <p className="viewer-warning">Cloud processing is disabled. Enable it in Settings before starting.</p>}{!batchPreview.configured && <p className="viewer-warning">OpenAI is not configured for this backend process.</p>}{!batchPreview.withinCostLimit && <p className="viewer-warning">The combined estimate exceeds the development batch limit; no content will be sent.</p>}
           {batchPreview.documents.filter((document) => !document.ready).map((document) => <p className="viewer-warning" key={document.documentId}>{document.filename} cannot be included ({document.errorCode ?? "analysis preparation unavailable"}).</p>)}
-          <label className="consent-check"><input type="checkbox" checked={batchConsent} disabled={!batchPreview.ready || batchLoading || batchRunning} onChange={(event) => setBatchConsent(event.target.checked)} /><span>I authorize OpenAI to process extracted content from these selected documents for this review.</span></label>
-          <button className="primary-button" type="button" disabled={!batchConsent || !batchPreview.ready || batchLoading || batchRunning} onClick={() => void startBatch()}>{batchLoading ? "Starting analysis…" : "Start analysis"}</button><button className="text-button" type="button" disabled={batchLoading || batchRunning} onClick={() => { setBatchPreview(null); setBatchConsent(false); }}>Change selection</button></>}
+          <p className="support-note">Analysis did not start because the local preflight needs attention. Original files remain local until the issue above is resolved.</p>
+          <button className="text-button" type="button" disabled={batchLoading || batchRunning} onClick={() => { setBatchPreview(null); }}>Change selection</button></>}
         {batch && <div className="matter-batch-progress" role="status"><strong>{batch.status === "completed" ? "Analysis complete" : batch.status === "partial" ? "Analysis completed with unavailable documents" : <><span className="loading-spinner" aria-hidden="true" />Analyzing selected documents</>}</strong><p>{batch.summary.completed} of {batch.summary.total} document{batch.summary.total === 1 ? "" : "s"} complete; {batch.summary.failed} failed; {batch.summary.pending} remaining.</p>{batchRunning && <p className="batch-timing">One document is processed at a time · {elapsedTime(batch.createdAt)}</p>}{batch.documents.filter((document) => document.status === "failed" || document.status === "blocked").map((document) => <p className="viewer-warning" key={document.documentId}>{document.filename}: {document.errorCode ?? "analysis unavailable"}</p>)}</div>}
         {batchMessage && <p className="viewer-error" role="alert">{batchMessage}</p>}
       </div>
     </section>
     {review && <>
       <section className="documents-card matter-outcomes"><div><p className="section-label">Document summaries</p><h2>What the selected documents show</h2><p>{review.summary.analyzedDocuments} of {review.summary.selectedDocuments} selected document{review.summary.selectedDocuments === 1 ? " has" : "s have"} a completed AI review.</p></div>
-        {review.summary.documentsWithoutCompletedAnalysis.length > 0 && <p className="viewer-warning">Some selected documents have not been reviewed yet. Analyze them above, or refresh after an active batch completes.</p>}{review.summary.findingsTruncated && <p className="viewer-warning">Some source material was outside the bounded analysis. Ask a focused question to review what was included.</p>}
+        {review.summary.documentsWithoutCompletedAnalysis.length > 0 && <p className="viewer-warning">{review.summary.documentsWithoutCompletedAnalysis.length} selected document{review.summary.documentsWithoutCompletedAnalysis.length === 1 ? " has" : "s have"} not been reviewed yet. Use “Analyze {selectedNewDocumentIds.length} new selected document{selectedNewDocumentIds.length === 1 ? "" : "s"}” above; refresh only reloads existing summaries.</p>}{review.summary.findingsTruncated && <p className="viewer-warning">Some source material was outside the bounded analysis. Ask a focused question to review what was included.</p>}
         {review.summaries.length > 0 && <div className="matter-summaries">{review.summaries.map((summary) => <article key={summary.documentId}><p className="section-label">{documentNames.get(summary.documentId) ?? "Document"}</p><strong>Summary</strong><p>{summary.unknown || !summary.text ? "The reviewed material did not establish a concise supported summary." : summary.text}</p>{summary.citations.length > 0 && <details className="answer-evidence"><summary>Supporting evidence</summary>{summary.citations.map((citation) => <p className="answer-citation" key={`${summary.documentId}:${citation.sourceReference}`}><span>{documentNames.get(summary.documentId) ?? "Document"} · {citation.sourceReference}</span>{citation.evidenceSnippet}</p>)}</details>}</article>)}</div>}
       </section>
       {review.summary.analyzedDocuments > 0 && <section className="documents-card matter-question"><div><p className="section-label">Ask a question</p><h3>Ask about the selected documents</h3><p>Answers use locally cited evidence, including question-relevant source excerpts. A holdings movement is kept separate from an explicit change to litigation participation or rights.</p></div>
         {!questionFollowUp && <><label className="question-field">Your question<textarea value={questionDraft} maxLength={600} placeholder="For example: What changes, transfers, or unresolved rights are identified across these documents?" onChange={(event) => updateQuestion(event.target.value)} /></label><small>{questionDraft.length}/600</small>
-          {questionDraft.trim() && <div className="question-consent"><p>Your question and bounded, question-relevant extracted excerpts, summaries, and findings from the selected documents will be sent to OpenAI. Original files are not uploaded.</p>{!currentQuestionPreview && <p className="support-note">Click Ask AI to prepare the local scope before authorizing transmission.</p>}{currentQuestionPreview && <>{currentQuestionPreview.scope.truncated && <p className="viewer-warning">Only part of the selected evidence can be included in this question.</p>}{currentQuestionPreview.scope.comparisonCoverageComplete === false && <p className="viewer-warning">This comparison currently has evidence from {currentQuestionPreview.scope.documentsWithEvidence ?? 0} of {currentQuestionPreview.scope.documentsSelected ?? selectedIds.length} selected documents. It cannot be presented as a complete all-document comparison.</p>}{!currentQuestionPreview.globalAuthorization && <p className="viewer-warning">Enable cloud-processing authorization in Settings before asking.</p>}{!currentQuestionPreview.cost.withinLimit && <p className="viewer-warning">This question exceeds the current development safety limit.</p>}<label className="analysis-consent"><input type="checkbox" checked={questionAuthorized} onChange={(event) => setQuestionAuthorized(event.target.checked)} /> I authorize OpenAI to process this question and the selected evidence-linked material.</label></>}<button className="primary-button" type="button" disabled={askingQuestion || !questionDraft.trim() || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => { if (!currentQuestionPreview) void prepareQuestion(); else void askQuestion(); }}>{questionLoading ? "Preparing…" : askingQuestion ? "Answering…" : "Ask AI"}</button></div>}</>}
-        {questionTurns.some((turn) => turn.parentId === null) && <div className="question-transcript">{questionTurns.filter((turn) => turn.parentId === null).map((turn) => <article className="question-answer" key={turn.id}><p className="section-label">Your question</p><p>{turn.question}</p><p className="section-label">Provisional answer</p>{turn.unknown || !turn.answer ? <p>The selected evidence does not establish an answer to this question.</p> : <p>{turn.answer}</p>}{turn.citations.length > 0 && <details className="answer-evidence"><summary>Supporting evidence</summary>{turn.citations.map((citation) => <p className="answer-citation" key={`${citation.documentId}:${citation.sourceReference}`}><span>{citation.filename} · {citation.sourceReference}</span>{citation.evidenceSnippet}</p>)}</details>}{turn.answer && <button className="secondary-button conversation-button" type="button" onClick={() => openConversation(turn)}>Continue conversation</button>}</article>)}</div>}
+          {questionDraft.trim() && <div className="question-consent"><p>{currentQuestionPreview?.localOnly ? "This document-backed calculation runs locally. No content will be sent to OpenAI." : "Choosing Ask AI sends your question and bounded, question-relevant extracted excerpts, summaries, and findings to OpenAI. Original files are not uploaded."}</p>{!currentQuestionPreview && <p className="support-note">Ask AI checks the local scope before anything is sent.</p>}{currentQuestionPreview && <>{currentQuestionPreview.scope.truncated && <p className="viewer-warning">Only part of the selected evidence can be included in this question.</p>}{currentQuestionPreview.scope.comparisonCoverageComplete === false && <p className="viewer-warning">This comparison currently has evidence from {currentQuestionPreview.scope.documentsWithEvidence ?? 0} of {currentQuestionPreview.scope.documentsSelected ?? selectedIds.length} selected documents. It cannot be presented as a complete all-document comparison.</p>}{!currentQuestionPreview.localOnly && !currentQuestionPreview.globalAuthorization && <p className="viewer-warning">Enable Cloud AI in Settings before asking.</p>}{!currentQuestionPreview.localOnly && !currentQuestionPreview.cost.withinLimit && <p className="viewer-warning">This question exceeds the current development safety limit.</p>}</>}<button className="primary-button" type="button" disabled={askingQuestion || !questionDraft.trim() || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => { if (!currentQuestionPreview) void prepareQuestion(undefined, undefined, true); else void askQuestion(); }}>{questionLoading ? "Preparing…" : askingQuestion ? "Answering…" : "Ask AI"}</button></div>}</>}
+        {questionTurns.some((turn) => turn.parentId === null) && <div className="question-transcript">{questionTurns.filter((turn) => turn.parentId === null).map((turn) => <article className="question-answer" key={turn.id}><p className="section-label">Your question</p><p>{turn.question}</p><p className="section-label">Provisional answer</p>{turn.unknown || !turn.answer ? <p>The selected evidence does not establish an answer to this question.</p> : <p>{turn.answer}</p>}{turn.citations.length > 0 && <details className="answer-evidence"><summary>Supporting evidence</summary>{turn.citations.map((citation) => <p className="answer-citation" key={`${citation.documentId}:${citation.sourceReference}`}><span>{citation.filename} · {citation.sourceReference}</span>{citation.evidenceSnippet}</p>)}</details>}<button className="secondary-button conversation-button" type="button" onClick={() => openConversation(turn)}>Continue conversation</button></article>)}</div>}
         {questionJob?.status === "failed" && <p className="viewer-error" role="alert">{matterQuestionFailure(questionJob.errorCode)}</p>}{questionMessage && <p className="viewer-error" role="alert">{questionMessage}</p>}
       </section>}
     </>}
@@ -313,15 +321,22 @@ export default function MatterReviewScreen({ isActive }: MatterReviewScreenProps
             {turn.citations.length > 0 && <details className="answer-evidence"><summary>Supporting evidence</summary>{turn.citations.map((citation) => <p className="answer-citation" key={`${citation.documentId}:${citation.sourceReference}`}><span>{citation.filename} · {citation.sourceReference}</span>{citation.evidenceSnippet}</p>)}</details>}
           </article>)}
         </div>
-        {latestConversationTurn.answer && <footer className="conversation-composer">
+        <footer className="conversation-composer">
           <label>Ask a follow-up<textarea value={conversationDraft} maxLength={600} placeholder="For example: What source supports that conclusion?" onChange={(event) => { setConversationDraft(event.target.value); setQuestionFollowUp(null); setQuestionPreview(null); setQuestionPreviewText(""); setQuestionPreviewFollowUpId(null); setQuestionAuthorized(false); setQuestionMessage(""); }} /></label>
           <small>{conversationDraft.length}/600</small>
           {conversationDraft.trim() && <>
-            {!currentQuestionPreview && <p className="support-note">{questionLoading ? "Checking the local evidence scope…" : "Checking the local evidence scope…"}</p>}
-            {currentQuestionPreview && <><p>This follow-up includes the previous question and answer as context, but only cited document evidence can support the response.</p>{currentQuestionPreview.scope.truncated && <p className="viewer-warning">Only part of the selected evidence can be included in this follow-up.</p>}{currentQuestionPreview.scope.comparisonCoverageComplete === false && <p className="viewer-warning">This comparison currently has evidence from {currentQuestionPreview.scope.documentsWithEvidence ?? 0} of {currentQuestionPreview.scope.documentsSelected ?? selectedIds.length} selected documents.</p>}<label className="analysis-consent"><input type="checkbox" checked={questionAuthorized} onChange={(event) => setQuestionAuthorized(event.target.checked)} /> I authorize OpenAI to process this follow-up and the selected evidence-linked material.</label></>}
-            <button className="primary-button" type="button" disabled={!conversationDraft.trim() || !canAskQuestion} onClick={() => void askQuestion()}>{askingQuestion ? "Answering…" : "Ask AI"}</button>
+            {!currentQuestionPreview && <p className="support-note">Click Ask AI to check the local evidence scope.</p>}
+            {currentQuestionPreview && <><p>{currentQuestionPreview.localOnly ? "This document-backed calculation runs locally. No content will be sent to OpenAI." : "This follow-up includes the previous question and answer as context, but only cited document evidence can support the response."}</p>{currentQuestionPreview.scope.truncated && <p className="viewer-warning">Only part of the selected evidence can be included in this follow-up.</p>}{currentQuestionPreview.scope.comparisonCoverageComplete === false && <p className="viewer-warning">This comparison currently has evidence from {currentQuestionPreview.scope.documentsWithEvidence ?? 0} of {currentQuestionPreview.scope.documentsSelected ?? selectedIds.length} selected documents.</p>}</>}
+            <button className="primary-button" type="button" disabled={!conversationDraft.trim() || askingQuestion || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => {
+              if (currentQuestionPreview) { void askQuestion(); return; }
+              const parentAnswer = conversationContextAnswer(latestConversationTurn.answer, "The selected evidence does not establish an answer to this question.");
+              const followUp = { id: latestConversationTurn.id, question: latestConversationTurn.question, answer: parentAnswer };
+              void prepareQuestion(conversationDraft, followUp, true);
+            }}>{questionLoading ? "Checking…" : askingQuestion ? "Answering…" : "Ask AI"}</button>
+            {questionJob?.status === "failed" && <p className="viewer-error" role="alert">{matterQuestionFailure(questionJob.errorCode)}</p>}
+            {questionMessage && <p className="viewer-error" role="alert">{questionMessage}</p>}
           </>}
-        </footer>}
+        </footer>
       </section>
     </div>}
   </>;

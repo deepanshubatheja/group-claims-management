@@ -1,9 +1,9 @@
 """Read-only consolidated review and deterministic billing preview services.
 
-This module deliberately operates on provisional, evidence-validated AI findings
-only.  It does not create or update holdings, claims, billing agreements, or
-invoices.  A billing result is an in-memory calculation using assumptions the
-user enters for the current review.
+This module deliberately operates on provisional, evidence-linked material.
+It does not create or update holdings, claims, billing agreements, or invoices.
+Billing remains an in-memory calculation using either user-entered assumptions
+or one explicitly approved instruction stored in the selected documents.
 """
 
 from __future__ import annotations
@@ -61,6 +61,15 @@ class AllocationRow:
     identifier: str
     label: str
     eligible_amount: Decimal
+
+
+@dataclass(frozen=True)
+class DocumentBillingAnswer:
+    """A non-persistent calculation and its evidence-derived instruction context."""
+
+    answer: str
+    citations: tuple[tuple[str, str, str, str], ...]
+    instruction_context: str
 
 
 @dataclass
@@ -245,6 +254,224 @@ class MatterReviewService:
             ],
         }
 
+    def _document_billing_answer(
+        self, documents: Sequence[sqlite3.Row], question: str,
+    ) -> DocumentBillingAnswer | None:
+        """Calculate only from an expressly approved local billing instruction.
+
+        This is intentionally narrower than the configurable preview: it does
+        not infer a fee pool, participants, eligibility, or a legal effect
+        from holdings, assignments, or an AI summary.  It is useful when the
+        selected material itself supplies all of those inputs, such as the
+        synthetic matter supplied with ClaimFlow.
+        """
+        if not self._is_document_billing_question(question):
+            return None
+        document_ids = [str(document["id"]) for document in documents]
+        placeholders = ",".join("?" for _ in document_ids)
+        with self._database.connection() as connection:
+            sources = connection.execute(
+                f"SELECT d.id AS document_id, d.original_filename, e.id AS extraction_id, p.page_number, "
+                f"'page ' || p.page_number || ' block ' || b.block_index AS source_reference, b.text "
+                f"FROM source_documents d JOIN document_extractions e ON e.source_document_id = d.id "
+                f"JOIN pdf_page_extractions p ON p.extraction_id = e.id "
+                f"JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
+                f"WHERE d.id IN ({placeholders}) AND e.status = 'parsed' AND b.text <> '' "
+                f"AND e.id = (SELECT latest.id FROM document_extractions latest "
+                f"WHERE latest.source_document_id = d.id AND latest.status = 'parsed' "
+                f"ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1) "
+                f"ORDER BY d.id, p.page_number, b.block_index",
+                document_ids,
+            ).fetchall()
+
+        pages: dict[tuple[str, str, str, int], list[sqlite3.Row]] = {}
+        for source in sources:
+            page_identity = (
+                str(source["document_id"]), str(source["extraction_id"]),
+                str(source["original_filename"]), int(source["page_number"]),
+            )
+            pages.setdefault(page_identity, []).append(source)
+        instructions: list[tuple[list[sqlite3.Row], str, Decimal, list[AllocationRow], str]] = []
+        for page_sources in pages.values():
+            source_text = "\n".join(str(source["text"]) for source in page_sources)
+            parsed = self._parse_document_billing_instruction(source_text)
+            if parsed is None:
+                continue
+            currency, fee_pool, rows, period = parsed
+            instructions.append((page_sources, currency, fee_pool, rows, period))
+        # Multiple valid instructions could represent conflicting billing
+        # agreements.  Refuse to choose between them automatically.
+        if len(instructions) != 1:
+            return None
+        page_sources, currency, fee_pool, rows, period = instructions[0]
+        source_text = "\n".join(str(source["text"]) for source in page_sources)
+        allocations = self._allocate_pro_rata(fee_pool, rows)
+        total_eligible = sum((row.eligible_amount for row in rows), Decimal("0"))
+        allocations_text = "; ".join(
+            f"{row.label}: {currency} {fee:,.2f}"
+            for row, fee in allocations
+        )
+        excluded_match = re.search(
+            r"Excluded\s+participant\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([^\n]+)",
+            source_text, flags=re.IGNORECASE,
+        )
+        exclusion = ""
+        if excluded_match is not None:
+            exclusion = (
+                f" {excluded_match.group(1).strip()} ({excluded_match.group(2).strip()}) is excluded by the "
+                f"instruction because it is recorded as {excluded_match.group(3).strip()}."
+            )
+        citation_sources = [
+            source for source in page_sources
+            if re.match(
+                r"^\s*(Fee\s+pool|Allocation\s+rule|Eligible\s+participant|Excluded\s+participant)\b",
+                str(source["text"]), flags=re.IGNORECASE,
+            )
+        ]
+        # A parser may preserve an instruction as one large page block. That
+        # single block remains a valid precise citation when field-level
+        # layout blocks are not available.
+        if not citation_sources:
+            citation_sources = page_sources
+        intent = self._document_billing_intent(question)
+        if intent == "verification":
+            steps = "; ".join(
+                f"{row.label}: {self._document_decimal(row.eligible_amount)} / "
+                f"{self._document_decimal(total_eligible)} × {currency} {fee_pool:,.2f} = {currency} {fee:,.2f}"
+                for row, fee in allocations
+            )
+            answer = (
+                f"To verify this provisional billing for {period}, first confirm the approved fee pool "
+                f"({currency} {fee_pool:,.2f}) and the stated rule: eligible nominal amount / total eligible "
+                f"nominal amount × fee pool. The eligible total is {self._document_decimal(total_eligible)}. "
+                f"Recompute: {steps}. The allocations total {currency} {fee_pool:,.2f}.{exclusion} "
+                "Also confirm that the instruction remains applicable to the relevant legal parties and period; "
+                "this calculation alone is not an invoice or a legal-entitlement determination."
+            )
+        elif intent == "explanation":
+            answer = (
+                "No. The same allocation is returned only when the question asks about the same approved "
+                f"pro-rata instruction for {period}, because its inputs are fixed: {currency} {fee_pool:,.2f} "
+                f"and eligible nominal amounts totaling {self._document_decimal(total_eligible)}. "
+                "A verification question should receive the calculation steps; a question about a different "
+                "period, fee pool, participant, or legal entitlement needs matching document evidence. "
+                "This remains a local calculation preview, not an invoice or a legal-entitlement determination."
+            )
+        elif intent == "allocation":
+            answer = (
+                f"Using the approved document-backed pro-rata instruction for {period}, the provisional allocation "
+                f"of {currency} {fee_pool:,.2f} is {allocations_text}. "
+                "The instruction applies eligible nominal amount divided by total eligible nominal amount, with "
+                f"currency rounding to reconcile to the fee pool.{exclusion} This is a local calculation preview, "
+                "not an invoice or a determination of legal entitlement."
+            )
+        else:
+            participant_labels = ", ".join(row.label for row in rows)
+            answer = (
+                f"The selected material contains one approved document-backed pro-rata instruction for {period}. "
+                f"It sets a {currency} {fee_pool:,.2f} fee pool and uses eligible nominal amount divided by total "
+                f"eligible nominal amount for the listed eligible participants: {participant_labels}.{exclusion} "
+                "Ask to calculate the provisional allocation to receive the documented amounts, or ask how to "
+                "verify the billing for the recomputation steps. This is a local calculation preview, not an "
+                "invoice or a determination of legal entitlement."
+            )
+        instruction_context = (
+            f"Approved pro-rata billing instruction. Billing period: {period}. Fee pool: {currency} {fee_pool:,.2f}. "
+            "Allocation rule: eligible nominal amount / total eligible nominal amount × fee pool, with currency "
+            "rounding to reconcile to the fee pool. Eligible participants: "
+            + "; ".join(
+                f"{row.label} has eligible nominal amount {self._document_decimal(row.eligible_amount)}"
+                for row in rows
+            )
+            + "."
+            + exclusion
+            + " This is an instruction and evidence context, not an invoice or a legal-entitlement determination."
+        )
+        return DocumentBillingAnswer(
+            answer=answer,
+            citations=tuple(
+                (
+                    str(source["document_id"]), str(source["extraction_id"]),
+                    str(source["source_reference"]), str(source["original_filename"]),
+                )
+                for source in citation_sources
+            ),
+            instruction_context=instruction_context,
+        )
+
+    @staticmethod
+    def _document_billing_intent(question: str) -> str:
+        """Choose a response form without treating a billing keyword as a calculation request."""
+        query = question.casefold()
+        if any(term in query for term in ("verify", "verification", "validate", "validation", "audit", "reconcile", "check the billing")):
+            return "verification"
+        if "what do you mean" in query or (
+            "same" in query and any(term in query for term in ("answer", "output", "result", "response"))
+        ) or any(term in query for term in (
+            "why the same", "why is it the same", "repeat the allocation", "repeating the allocation",
+        )):
+            return "explanation"
+        if any(term in query for term in (
+            "calculate", "calculation", "allocate", "allocation", "how much", "show me the amount",
+            "give me the amount", "generate the allocation", "prepare the allocation", "split the fee",
+        )):
+            return "allocation"
+        return "overview"
+
+    @staticmethod
+    def _document_decimal(value: Decimal) -> str:
+        """Render a document amount without inventing decimal precision."""
+        return f"{value:,.6f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _parse_document_billing_instruction(
+        source_text: str,
+    ) -> tuple[str, Decimal, list[AllocationRow], str] | None:
+        """Recognise one explicit instruction without turning document prose into policy."""
+        normalized = " ".join(source_text.split())
+        folded = normalized.casefold()
+        if not all(term in folded for term in (
+            "approved", "fee pool", "allocation rule", "eligible participant",
+            "eligible nominal amount / total eligible nominal amount",
+        )):
+            return None
+        money = re.search(r"\b([A-Z]{3})\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b", source_text)
+        period = re.search(r"Billing\s+period\s*\n\s*([^\n]+)", source_text, flags=re.IGNORECASE)
+        participants = re.findall(
+            r"Eligible\s+participant(?:\s+\d+)?\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([0-9][0-9,]*(?:\.[0-9]{1,6})?)",
+            source_text, flags=re.IGNORECASE,
+        )
+        if money is None or period is None or not participants:
+            return None
+        try:
+            fee_pool = Decimal(money.group(2).replace(",", ""))
+            rows = [
+                AllocationRow(f"document-{index}", f"{name.strip()} ({account.strip()})", Decimal(amount.replace(",", "")))
+                for index, (name, account, amount) in enumerate(participants, start=1)
+            ]
+        except InvalidOperation:
+            return None
+        if fee_pool <= 0 or any(row.eligible_amount <= 0 for row in rows):
+            return None
+        return money.group(1), fee_pool, rows, period.group(1).strip()
+
+    @staticmethod
+    def _allocate_pro_rata(fee_pool: Decimal, rows: Sequence[AllocationRow]) -> list[tuple[AllocationRow, Decimal]]:
+        """Allocate in cents with a stable largest-remainder tie-breaker."""
+        total = sum((row.eligible_amount for row in rows), Decimal("0"))
+        if total <= 0:
+            raise MatterReviewError("At least one eligible basis must be greater than zero.")
+        pool_cents = int((fee_pool / _CENT).to_integral_exact())
+        raw_cents = [(row, Decimal(pool_cents) * row.eligible_amount / total) for row in rows]
+        allocated_cents = {row.identifier: int(value.to_integral_value(rounding=ROUND_DOWN)) for row, value in raw_cents}
+        residual = pool_cents - sum(allocated_cents.values())
+        for row, _value in sorted(
+            raw_cents,
+            key=lambda item: (-(item[1] - item[1].to_integral_value(rounding=ROUND_DOWN)), item[0].identifier),
+        )[:residual]:
+            allocated_cents[row.identifier] += 1
+        return [(row, Decimal(allocated_cents[row.identifier]) * _CENT) for row in rows]
+
     def analysis_batch_preview(self, params: object) -> Mapping[str, object]:
         """Prepare local-only per-document analysis scopes and aggregate cost.
 
@@ -373,6 +600,23 @@ class MatterReviewService:
         self._analysis._refresh_configuration()
         configuration = self._analysis._configuration
         controls = self._analysis._cost_controls
+        if isinstance(plan.get("documentBilling"), DocumentBillingAnswer):
+            return {
+                "provider": None,
+                "model": None,
+                "globalAuthorization": self._analysis._global_authorized(),
+                "configured": configuration.state() == "configured_not_live_tested",
+                "localOnly": True,
+                "scope": plan["scope"],
+                "cost": {
+                    "estimatedInputTokens": 0,
+                    "maxOutputTokens": 0,
+                    "estimatedCostUsd": "0.000000",
+                    "limitUsd": self._analysis._cost_string(controls.max_estimated_cost_usd),
+                    "withinLimit": True,
+                    "maxRequestAttempts": 0,
+                },
+            }
         estimate = controls.estimate_cost(plan["inputTokens"], plan["maxOutputTokens"])
         estimated_cost = self._analysis._cost_string(estimate)
         within_limit = estimate is not None and estimate <= controls.max_estimated_cost_usd
@@ -381,6 +625,7 @@ class MatterReviewService:
             "model": configuration.model,
             "globalAuthorization": self._analysis._global_authorized(),
             "configured": configuration.state() == "configured_not_live_tested",
+            "localOnly": False,
             "scope": plan["scope"],
             "cost": {
                 "estimatedInputTokens": plan["inputTokens"],
@@ -399,6 +644,19 @@ class MatterReviewService:
         question text and answer remain in memory for the current backend run.
         """
         document_ids, question, follow_up = self._matter_question_params(params, acknowledged=True)
+        plan = self._matter_question_plan(document_ids, question, follow_up)
+        document_billing = plan.get("documentBilling")
+        if isinstance(document_billing, DocumentBillingAnswer):
+            citations = self._validate_direct_matter_citations(document_billing.citations)
+            if not citations:
+                raise MatterReviewError("The approved billing instruction could not be revalidated locally.")
+            job = MatterQuestion(
+                id=str(uuid.uuid4()), document_ids=tuple(document_ids), status="completed", scope=plan["scope"],
+                answer=document_billing.answer, citations=tuple(citations), model="local-document-calculation",
+            )
+            with self._question_lock:
+                self._questions[job.id] = job
+            return self.question_status({"questionId": job.id})
         preview_params: dict[str, object] = {"documentIds": document_ids, "question": question}
         if follow_up is not None:
             preview_params["followUp"] = follow_up
@@ -410,7 +668,6 @@ class MatterReviewService:
         cost = preview["cost"]
         if not isinstance(cost, dict) or not cost["withinLimit"]:
             raise MatterReviewError("This question exceeds the current development safety limit.")
-        plan = self._matter_question_plan(document_ids, question, follow_up)
         with self._question_lock:
             if any(job.status in {"queued", "running"} for job in self._questions.values()):
                 raise MatterReviewError("Another consolidated question is already being answered.")
@@ -489,7 +746,7 @@ class MatterReviewService:
                 if job is None:
                     return
                 job.status = "completed"
-                job.answer = result.answer
+                job.answer = self._humanize_citation_keys(str(result.answer or ""), plan["citationTargets"])
                 job.unknown = result.unknown
                 job.citations = tuple(citations)
                 job.model = result.model
@@ -518,6 +775,15 @@ class MatterReviewService:
     ) -> Mapping[str, object]:
         documents = self._source_documents(document_ids)
         names = {str(row["id"]): str(row["original_filename"]) for row in documents}
+        billing_instruction = self._document_billing_answer(documents, question)
+        # The deterministic calculator owns only an explicit allocation
+        # request. Every other billing conversation goes through the
+        # question-aware provider with this instruction as cited evidence.
+        document_billing = (
+            billing_instruction
+            if billing_instruction is not None and self._document_billing_intent(question) == "allocation"
+            else None
+        )
         placeholders = ",".join("?" for _ in document_ids)
         with self._database.connection() as connection:
             summary_rows = connection.execute(
@@ -680,10 +946,57 @@ class MatterReviewService:
                     )
 
             candidates = reconciliation_candidates + candidates
+            if billing_instruction is not None:
+                # The parser has already validated the exact instruction
+                # inputs. Provide them to the AI as evidence rather than
+                # bypassing the question-answering path with a canned answer.
+                billing_sources = {
+                    (document_id, reference)
+                    for document_id, _extraction_id, reference, _filename in billing_instruction.citations
+                }
+                candidates = [
+                    candidate for candidate in candidates
+                    if (candidate[0], candidate[2]) not in billing_sources
+                ]
+                for document_id, extraction_id, reference, filename in reversed(billing_instruction.citations):
+                    candidates.insert(
+                        0,
+                        (
+                            document_id,
+                            extraction_id,
+                            reference,
+                            filename,
+                            "DOCUMENT-BACKED BILLING INSTRUCTION; EVIDENCE: "
+                            + billing_instruction.instruction_context,
+                        ),
+                    )
 
         total = len(candidates)
-        if not candidates:
+        if not candidates and document_billing is None:
             raise MatterReviewError("Complete AI analysis for at least one selected document before asking a consolidated question.")
+
+        if document_billing is not None:
+            self._analysis._refresh_configuration()
+            controls = self._analysis._cost_controls
+            return {
+                "context": "",
+                "citationKeys": (),
+                "citationTargets": {},
+                "documentBilling": document_billing,
+                "localFallback": None,
+                "comparisonCoverageComplete": True,
+                "inputTokens": 0,
+                "maxOutputTokens": 0,
+                "scope": {
+                    "sourceItems": len(document_billing.citations),
+                    "totalSourceItems": len(document_billing.citations),
+                    "excludedSourceItems": 0,
+                    "truncated": False,
+                    "documentsSelected": len(document_ids),
+                    "documentsWithEvidence": len({citation[0] for citation in document_billing.citations}),
+                    "comparisonCoverageComplete": True,
+                },
+            }
 
         # A broad request such as "what can you tell me about these files?"
         # should start with one verified excerpt per selected document where
@@ -731,7 +1044,13 @@ class MatterReviewService:
                 compact_filename = self._bounded_text(filename, 96) or "selected document"
                 evidence_marker = "; EVIDENCE:"
                 marker_index = description.find(evidence_marker)
-                if marker_index >= 0:
+                if description.startswith("DOCUMENT-BACKED BILLING INSTRUCTION;"):
+                    # This is a compact, deterministic transcription of a
+                    # single cited instruction. Keep all of its inputs so a
+                    # conversational answer is not based on a clipped fee
+                    # pool or participant list.
+                    compact_description = self._bounded_text(description, 1_600) or "Billing instruction"
+                elif marker_index >= 0:
                     # Keep the literal source at the end even when an earlier
                     # AI summary is long; the fallback and the provider both
                     # need actual locally resolved evidence, not just a
@@ -955,6 +1274,52 @@ class MatterReviewService:
                     })
         return validated
 
+    def _validate_direct_matter_citations(
+        self, citations: Sequence[tuple[str, str, str, str]],
+    ) -> list[Mapping[str, str]]:
+        """Re-resolve locally produced calculation citations before display."""
+        validated: list[Mapping[str, str]] = []
+        with self._database.connection() as connection:
+            for document_id, extraction_id, reference, filename in citations:
+                evidence = self._analysis._source_evidence(connection, extraction_id, reference)
+                if evidence is None:
+                    continue
+                canonical_reference, source_text = evidence
+                excerpt = self._analysis._evidence_excerpt(source_text)
+                if excerpt:
+                    validated.append({
+                        "documentId": document_id,
+                        "filename": filename,
+                        "sourceReference": canonical_reference,
+                        "evidenceSnippet": excerpt,
+                    })
+        return validated
+
+    @staticmethod
+    def _humanize_citation_keys(answer: str, targets: object) -> str:
+        """Keep provider-internal E-keys out of lawyer-facing answer text."""
+        if not isinstance(targets, dict):
+            return answer
+        rendered = answer
+        for key, target in targets.items():
+            if not isinstance(key, str) or not isinstance(target, tuple) or len(target) != 4:
+                continue
+            _document_id, _extraction_id, reference, filename = target
+            if not isinstance(reference, str) or not isinstance(filename, str):
+                continue
+            label = f"{filename} ({reference})"
+            rendered = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])", label, rendered,
+            )
+        return rendered
+
+    @staticmethod
+    def _is_document_billing_question(question: str) -> bool:
+        query = question.casefold()
+        return any(term in query for term in (
+            "pro rata", "pro-rata", "allocation", "allocate", "billing", "invoice", "fee pool",
+        ))
+
     @staticmethod
     def _is_question_relevant_source(question: str, source_text: str) -> bool:
         """Select only bounded source material likely to bear on the question.
@@ -965,7 +1330,12 @@ class MatterReviewService:
         query = question.casefold()
         text = source_text.casefold()
         legal_status_question = MatterReviewService._is_legal_status_question(question)
-        if legal_status_question:
+        if MatterReviewService._is_document_billing_question(question):
+            terms = {
+                "billing", "pro-rata", "pro rata", "fee pool", "allocation", "eligible", "nominal",
+                "invoice", "currency", "withdraw", "excluded",
+            }
+        elif legal_status_question:
             terms = {
                 "litig", "claim", "right", "assign", "transfer", "withdraw", "settle", "mandate", "participat",
                 "entitle", "abtret", "übertrag", "uebertrag", "klage", "anspruch", "verfahren", "vergleich",

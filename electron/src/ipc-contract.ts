@@ -4,6 +4,8 @@ export const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 export const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
 export const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
 export const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
+export const SAVE_AI_API_KEY_CHANNEL = "app:save-ai-api-key" as const;
+export const REMOVE_AI_API_KEY_CHANNEL = "app:remove-ai-api-key" as const;
 export const GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL = "documents:get-analysis-preview" as const;
 export const START_DOCUMENT_ANALYSIS_CHANNEL = "documents:start-analysis" as const;
 export const GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL = "documents:get-analysis-status" as const;
@@ -102,6 +104,8 @@ export interface AIConnectionCheck { outcome: "available" | "provider_not_config
 export interface AIStatus { enabled: boolean; authorized: boolean; provider: string | null; model: string | null; configured: boolean; credentialPresent: boolean; message: string; lastConnectionCheck: AIConnectionCheck | null; }
 export type AIStatusResponse = { ok: true; ai: AIStatus } | BackendHealthFailure;
 export type AIConnectionCheckResponse = { ok: true; check: AIConnectionCheck } | BackendHealthFailure;
+/** Never includes an API-key value or fingerprint. */
+export type AICredentialResponse = { ok: true; credentialPresent: boolean; message: string } | BackendHealthFailure;
 export interface AnalysisScope { extractionId: string; chunks: number; sourceItems: number; totalSourceItems: number; excludedSourceItems: number; includedCharacters: number; excludedCharacters: number; truncated: boolean; }
 export interface AnalysisCostPreview { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; }
 export interface AnalysisUsage { estimatedCostUsd: string | null; inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }
@@ -117,6 +121,7 @@ export interface DocumentQuestionScope { sourceItems: number; totalSourceItems: 
 export interface DocumentQuestionCost { estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string | null; withinLimit: boolean; maxRequestAttempts: number; }
 export interface DocumentQuestionPreview { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; }
 export interface DocumentQuestionCitation { sourceReference: string; evidenceSnippet: string; }
+export interface DocumentQuestionFollowUp { question: string; answer: string; }
 export interface DocumentQuestionStatus { questionId: string; documentId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: DocumentQuestionCitation[]; errorCode: string | null; model: string | null; scope: DocumentQuestionScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
 export type DocumentQuestionPreviewResponse = { ok: true; preview: DocumentQuestionPreview } | DocumentOperationFailure;
 export type DocumentQuestionStartResponse = { ok: true; question: DocumentQuestionStatus } | DocumentOperationFailure;
@@ -139,7 +144,7 @@ export interface MatterQuestionCitation { documentId: string; filename: string; 
  * transient request context, not a stored chat history or a source citation.
  */
 export interface MatterQuestionFollowUp { question: string; answer: string; }
-export interface MatterQuestionPreview { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; }
+export interface MatterQuestionPreview { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; }
 export interface MatterQuestionStatus { questionId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; scope: DocumentQuestionScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
 export type MatterQuestionPreviewResponse = { ok: true; preview: MatterQuestionPreview } | DocumentOperationFailure;
 export type MatterQuestionResponse = { ok: true; question: MatterQuestionStatus } | DocumentOperationFailure;
