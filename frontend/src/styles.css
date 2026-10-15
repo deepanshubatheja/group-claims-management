@@ -474,6 +474,8 @@ h2 {
 .secondary-button { border: 1px solid #b7c4d6; border-radius: 7px; padding: 10px 14px; background: #fff; color: #183c66; font: inherit; cursor: pointer; }
 .folder-import-confirmation, .folder-import-progress { margin-top: 14px; padding: 12px; border: 1px solid #cbd8e8; border-radius: 7px; background: #f5f8fc; }
 .folder-import-confirmation h2 { margin-top: 0; font-size: 1rem; }
+.staged-import-label { margin: 14px 0 6px; color: #365b78; font-size: .84rem; font-weight: 700; }
+.staged-import-list { display: grid; gap: 5px; max-height: 152px; margin: 0 0 14px; overflow-y: auto; padding: 9px 12px 9px 29px; border: 1px solid #d6e3ee; border-radius: 6px; background: #fff; color: #47647d; font-size: .88rem; }
 .support-note { margin: 14px 0 0; color: #5c7591; font-size: .8rem; }
 .document-row { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 16px; margin-top: 10px; border: 1px solid #e0e8ef; border-radius: 8px; padding: 14px; background: #fff; color: #173b5c; text-align: left; cursor: pointer; transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease; }
 .document-row:hover, .document-row:focus-visible { border-color: #9abbd8; background: #fbfdff; box-shadow: 0 3px 10px rgb(28 69 103 / 5%); outline: none; }
