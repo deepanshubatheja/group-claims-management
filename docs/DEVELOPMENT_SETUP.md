@@ -1,239 +1,100 @@
-# Development Setup
+# Developer setup
 
-## Confirmed stack
+ClaimFlow is an Electron + React/TypeScript + Vite + Python + SQLite desktop application. This guide is for developers running the source code; normal users should install the DMG instead.
 
-The application will use Electron, React, TypeScript, Vite, Python, and SQLite. It is a single-user, local-first desktop application for macOS and Windows.
+## Requirements
 
-## Directory responsibilities
+macOS Apple Silicon is the supported development and packaging environment.
 
-- `frontend/` — React and TypeScript renderer code only: interface and display state. It must not access the filesystem, SQLite, secrets, billing logic, or external AI providers directly.
-- `electron/` — Electron main process and secure preload code: app lifecycle, native dialogs, validated IPC, and Python-core lifecycle management.
-- `backend/` — Python application core: domain rules, imports, validation, reconciliation, billing, audit, and SQLite access.
-- `docs/` — Project instructions, architectural notes, decisions, setup guidance, and operational documentation.
+- Git
+- Node.js 22+ and npm 10+
+- Python 3.11+
+- Xcode Command Line Tools (`xcrun swiftc`)
+- Tesseract OCR with English (`eng`) and German (`deu`) language data
 
-## Development environment
-
-- A supported Node.js runtime and package manager for Electron, React, TypeScript, and Vite work.
-- Python 3 for the backend core and isolated backend dependencies.
-- SQLite for local development and verification.
-- Git for source control.
-- macOS or Windows for supported desktop behavior.
-
-For the Phase 3 backend, create a project-local virtual environment with
-`python3 -m venv backend/.venv` (on Windows, use the installed Python launcher
-or interpreter). Phase 3 has no third-party Python runtime dependencies.
-
-## Dependency management
-
-Frontend and Electron dependencies will be declared in the repository's Node package manifest and installed through a lockfile-backed package-manager workflow. Backend dependencies will be declared in a Python dependency manifest and installed into a project-local virtual environment. No dependencies are installed during Phase 1.
-
-The Phase 3 Electron-to-Python boundary is private newline-delimited UTF-8 JSON
-over the Python child process's stdin/stdout; it does not open a network port.
-Electron starts the development backend from `backend/.venv` and exposes only
-allowlisted, typed IPC methods to the renderer. Production packaging will bundle
-a standalone backend executable in a later milestone, so end users will not need
-to install Python.
-
-Phase 4 storage is initialized by the Python backend from Electron's
-`app.getPath('userData')` value. On macOS this is normally under
-`~/Library/Application Support/Group Claims Management`; on Windows it is under
-the current user's `%APPDATA%\\Group Claims Management`. The repository and app
-install directory never contain user documents or runtime databases. The managed
-layout is `database/`, `documents/`, `exports/`, `backups/`, and `logs/`.
-Local storage is not encrypted automatically.
-
-Run Python protocol tests with `cd backend && ./.venv/bin/python -m unittest discover -s tests -v`
-on macOS/Linux, or the corresponding `.venv\\Scripts\\python.exe` command on Windows.
-
-## Phase 5 document parsing dependencies
-
-Install the declared backend parser dependencies into the project virtual environment with
-`cd backend && ./.venv/bin/python -m pip install -e .`. They provide deterministic XLSX
-(`openpyxl`), legacy XLS (`xlrd`), coordinate-aware PDF native text (`PyMuPDF`, with `pypdf`
-retained for compatibility), and local OCR handoff (`Pillow`, `pytesseract`); CSV uses Python's
-standard library. The Dashboard supports native file/folder selection and drag-and-drop. Drop paths are
-available only inside the preload/main-process boundary; the renderer receives a bounded import preview,
-then the existing explicit confirmation imports supported local files.
-
-## Phase 5.2 local OCR
-
-Tesseract is a separate local runtime; the Python package does not install it. In development,
-install Tesseract and its required language data with the platform's normal package manager, then
-verify it with `tesseract --list-langs`. English (`eng`) is required for OCR; German (`deu`) is used
-when installed. On Windows, a future packaged app must bundle a reviewed Tesseract runtime and the
-selected `tessdata`; end users must not need to install Python or Tesseract.
-
-The parser always tries native PDF text first. It renders and OCRs only pages without a usable text
-layer, sequentially with page, pixel, and per-page-time limits. OCR stays local, stores page-level
-provenance and a quality warning, and must be reviewed against the immutable source PDF. If the
-runtime or language data is unavailable, the document reports a controlled OCR-unavailable result
-instead of a false successful parse.
-
-## Phase 6.2A OpenAI provider dependency
-
-The Python-only OpenAI adapter uses the official `openai` SDK, declared in
-`backend/pyproject.toml`. Install all backend dependencies with
-`backend/.venv/bin/python -m pip install -e backend` (on Windows, use the
-virtual-environment interpreter). For development only, export
-`OPENAI_API_KEY` in the terminal that starts Electron; optionally set
-`GROUP_CLAIMS_AI_PROVIDER=openai` and `GROUP_CLAIMS_AI_MODEL=gpt-4.1-mini`.
-Never put credentials in source files, SQLite, renderer code, or committed
-`.env` files. The adapter does not test credentials or send content on startup.
-Phase 6.2B adds document-scoped analysis jobs. It transmits only bounded,
-evidence-referenced deterministic extraction fragments after both global Settings
-authorization and a deliberate per-document Analyze action. Original vault files
-are never uploaded by default. The current development environment uses
-`OPENAI_API_KEY`. The packaged macOS app also provides **Settings → AI
-Connection**, which stores a key in the current user's macOS Keychain. The
-stored value is never written to SQLite or a configuration file, never returned
-to React, and is supplied only to the private Python backend process when
-ClaimFlow launches. Removing the key from Settings removes that Keychain entry;
-a development-only terminal environment variable may still apply to a
-development process.
-
-If Settings reports that the key is not detected, use **Refresh AI
-configuration**. This is a boolean-only report from the Python backend: it
-never displays, logs, stores, or sends the key through IPC. Export the key in
-the *same terminal* before running `npm run dev`, then stop the existing
-development processes and start them again. A shell variable that was not
-exported, or a key added after Electron and its Python child were launched,
-cannot be inherited by that child.
-
-"Key detected" means only that the Python backend inherited a non-empty value;
-it does not validate that OpenAI will accept it. If an analysis reports
-`AI_AUTHENTICATION_FAILED`, stop the running app, replace the terminal value
-with an active API key for the intended OpenAI project (do not include quote
-characters in the key itself), and restart `npm run dev`. Do not repeatedly
-retry a rejected key. The application trims accidental surrounding whitespace,
-but never displays, logs, persists, or transmits the key through IPC.
-
-### Explicit OpenAI connection check (development)
-
-From the same macOS Terminal that will start the application, set the values for
-the current shell session, then start the app from that terminal. To avoid
-echoing the key while it is entered in zsh:
+Check the installation:
 
 ```zsh
-read -r -s "OPENAI_API_KEY?Paste OpenAI project API key, then press Return: "
-printf '\n'
-export OPENAI_API_KEY
-export GROUP_CLAIMS_AI_PROVIDER=openai
-export GROUP_CLAIMS_AI_MODEL=gpt-4.1-mini
+node --version
+npm --version
+python3 --version
+xcode-select -p
+tesseract --list-langs
+```
+
+Tesseract is required for OCR and for the macOS package build. Install it and its language data with your normal package manager before continuing.
+
+## First run
+
+From the repository root:
+
+```zsh
+git clone <repository-url>
+cd group-claims-management
+npm ci
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install --upgrade pip
+backend/.venv/bin/python -m pip install -e backend
+npm run build:credential-helper:mac
 npm run dev
 ```
 
-After Electron starts, open **Settings → AI Connection**. The page reports only
-whether the running Python child received a non-empty key. If it says a key is
-available, **Check Connection** is a separate, deliberate request to OpenAI's
-Models metadata endpoint; it sends no document content and creates no model
-response. It may still be subject to provider availability and account/project
-permissions. A connection-check result describes that explicit request only:
-key availability is not proof of authentication. The UI reports controlled
-authentication, permission, rate-limit, network, timeout, or generic provider
-errors without revealing provider response bodies, headers, or credentials.
+Electron should open automatically. Stop the development app with `Ctrl-C` in the terminal that runs it.
 
-For the packaged macOS application, paste the key in **Settings → AI
-Connection**, select **Save API Key**, and use **Check Connection**. No terminal
-or `.env` file is required. Each document analysis and question remains subject
-to the existing cloud-authorization and explicit per-request consent controls.
+`build:credential-helper:mac` builds the local Keychain helper used by **Settings → AI Connection**. Run it again after changing the helper or after a clean checkout. The app can still run local-only features if the helper is unavailable, but saving an API key will show a controlled error.
 
-On Windows PowerShell, set the process environment variable in the same window
-before `npm run dev`, for example `$env:OPENAI_API_KEY = "..."`, then set the
-two `GROUP_CLAIMS_*` variables similarly. Do not place a key in `package.json`,
-source code, SQLite, or a committed `.env` file. Stop all existing `npm run dev`
-processes before changing environment values: an already-running Electron/Python
-process cannot inherit a later shell export.
+## AI configuration
 
-## Phase 6.2D development AI cost controls
+AI is optional. In the running app:
 
-AI analysis is never started by import, document selection, or backend startup.
-For the first explicitly initiated OpenAI test, the safe defaults are one
-document and one request, 4,000 full-request input characters, 1,500 estimated
-input tokens, 1,000 output tokens, zero automatic retries, and a USD 0.01
-per-analysis estimate limit. The backend sets SDK retries to zero and only
-permits application retries when a developer explicitly sets a higher bounded
-`GROUP_CLAIMS_AI_MAX_REQUEST_ATTEMPTS` value.
+1. Open **Settings → AI Connection**.
+2. Paste an OpenAI API key and select **Save API Key**.
+3. Select **Check Connection**.
+4. Enable Cloud AI before deliberately requesting analysis or Q&A.
 
-Before transmission, input tokens are conservatively estimated as one token per
-three full request characters (including instructions); the maximum output token
-limit is included in the cost calculation. The bundled pricing profile applies
-only to `gpt-4.1-mini`: USD 0.40/M input and USD 1.60/M output tokens. For
-another model, configure both `GROUP_CLAIMS_AI_INPUT_USD_PER_MILLION` and
-`GROUP_CLAIMS_AI_OUTPUT_USD_PER_MILLION`, based on the current official pricing,
-or the backend will block the request. The Documents UI shows planned/excluded
-coverage and an estimated—not actual billed—cost before the user can authorize
-the request. It does not fetch or claim to know an OpenAI account balance.
+The key is stored in the signed-in macOS user's Keychain, not in the repository, SQLite, or a configuration file. Never commit API keys, `.env` files, or screenshots containing keys.
 
-### Consolidated Matter Review analysis
+The connection check sends no document content. AI requests send only bounded, relevant extracted evidence after the user explicitly requests analysis or asks a question; original vault files are kept local. Use non-sensitive sample data for development and testing unless you have appropriate authorization.
 
-Matter Review can prepare an explicitly authorized, bounded batch for up to
-20 already parsed documents. It never runs when documents are imported. The
-screen first shows the per-document scope and aggregate estimate; after the
-user checks the batch-specific consent control, the backend runs at most one
-request per selected document sequentially, with no automatic retries. The
-aggregate development ceiling defaults to USD 0.20 and can be reduced with:
+## Run checks
+
+Run these from the repository root:
 
 ```zsh
-export GROUP_CLAIMS_AI_MAX_BATCH_ESTIMATED_COST_USD=0.20
+npm run typecheck
+npm run test:frontend
+npm run test:electron
 ```
 
-The individual per-document limits still apply. A batch stops new transfers if
-global authorization is withdrawn; completed document analyses are preserved.
+Run backend tests separately:
 
-After completed analyses are consolidated, Matter Review also offers a
-separate **Consolidated Q&A** action. It sends the user's question plus a
-bounded set of evidence-linked findings from the currently selected documents,
-never original vault files. It requires a new per-question consent checkbox,
-uses the existing per-question cost limit and no automatic retries, and keeps
-questions and answers only in the running backend's memory.
+```zsh
+cd backend
+./.venv/bin/python -m unittest discover -s tests -v
+```
 
-### Document Q&A
+## Build a macOS testing installer
 
-The lawyer-facing Documents workspace deliberately hides the raw parser grid
-and PDF text. Deterministic extraction remains stored locally for provenance;
-AI findings and cited source excerpts are shown instead. As a question is typed,
-the application calculates its bounded scope and estimate locally; this does
-not contact OpenAI. **Ask AI** is enabled only after global cloud authorization
-and a fresh per-question confirmation. Each question is a separate request,
-with no automatic retries and a maximum of 500 output tokens. The Python backend
-sends only the question, current evidence-validated findings, and bounded
-deterministic source excerpts; it never sends vault paths or whole original
-files by default. Questions and answers are kept in memory for the running
-backend session only; they are not logged or saved to SQLite.
-
-## Naming and organization
-
-- Use TypeScript for Electron and frontend code, with explicit types at process boundaries.
-- Use Python type hints for backend code.
-- Prefer clear, domain-oriented names; keep UI, desktop-boundary, and domain logic separate.
-- Keep modules focused and avoid speculative abstractions.
-- Document approved significant design decisions in `docs/DECISIONS.md` when they arise.
-
-## Cross-platform considerations
-
-Use platform-neutral path APIs and test macOS and Windows path behavior. User data, local databases, immutable imported-document copies, exports, backups, and logs must live in an OS-standard per-user application-data directory outside the repository and install location. Do not assume case-sensitive paths, POSIX-only behavior, or a globally installed Python runtime in packaged builds.
-
-## Packaging ClaimFlow for macOS (Apple Silicon)
-
-The release-builder Mac, not a client machine, needs Node, the project-local
-Python environment, and Homebrew Tesseract with English and German language
-data. From the repository root, build an unsigned testing DMG with:
+With the requirements above installed:
 
 ```zsh
 npm run package:mac
 ```
 
-The command produces an Apple Silicon DMG under `release/`. It bundles the
-production Electron renderer, a PyInstaller standalone Python backend, and the
-local Tesseract runtime and language data. The installed app does not use a
-system Python, Node, npm, or SQLite installation. It stores new data under
-`~/Library/Application Support/ClaimFlow/`; it does not alter the older
-development-data directory (`Group Claims Management`).
+The Apple Silicon DMG is written to `release/`. The build includes Electron, the production renderer, a PyInstaller-packaged Python backend, and the local Tesseract runtime/language data. Client machines do not need Python, Node.js, npm, SQLite, or Tesseract installed.
 
-This initial build is unsigned and not notarized. It is suitable only for local
-and trusted testing with non-sensitive sample data. A public client release
-requires Apple Developer signing, notarization, and a clean-machine test.
+The current macOS build is unsigned and not notarized. It is for local or trusted internal testing with non-sensitive sample data only. Do not describe Windows as supported until its installer is built and tested on Windows.
 
-`npm run package:win` configures an NSIS installer but cannot produce a
-supported Windows release until the Python backend and OCR runtime are built
-and tested on Windows. Do not distribute that target from macOS.
+## Data and source-control rules
+
+- Runtime databases, immutable imported-document copies, exports, backups, logs, and settings live in the per-user application-data directory, outside the repository and install directory.
+- Do not delete, overwrite, or move runtime data to troubleshoot a source checkout unless the user explicitly approves it.
+- Do not commit `node_modules/`, `backend/.venv/`, `release/`, generated installers, API keys, or client documents.
+- Keep renderer code inside the typed, allowlisted Electron IPC boundary. Do not add Node.js access or secrets to the renderer.
+
+## Common setup failures
+
+- **Backend unavailable:** recreate/activate `backend/.venv`, reinstall with `backend/.venv/bin/python -m pip install -e backend`, then restart `npm run dev`.
+- **Cannot save API key:** run `npm run build:credential-helper:mac`; verify Xcode Command Line Tools are selected with `xcode-select -p`.
+- **OCR unavailable:** run `tesseract --list-langs` and ensure `eng` (and, where needed, `deu`) is listed.
+- **Packaging fails:** confirm the Node, Python, Xcode, and Tesseract requirements above, then rerun `npm run package:mac`.

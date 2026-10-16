@@ -1,6 +1,6 @@
 {
   "name": "group-claims-management",
-  "version": "0.1.1-beta",
+  "version": "0.1.2-beta",
   "private": true,
   "description": "ClaimFlow is a single-user, local-first group claims management desktop application.",
   "main": "electron/dist/main.js",
@@ -30,7 +30,7 @@
   "build": {
     "appId": "com.claimflow.desktop",
     "productName": "ClaimFlow",
-    "buildVersion": "0.1.1",
+    "buildVersion": "0.1.2",
     "electronVersion": "35.2.0",
     "electronDist": "node_modules/electron/dist",
     "afterPack": "./scripts/after-pack-macos.cjs",

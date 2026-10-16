@@ -1,6 +1,6 @@
 [project]
 name = "group-claims-backend"
-version = "0.1.0"
+version = "0.1.2b0"
 description = "Local application core for Group Claims Management."
 requires-python = ">=3.11"
 dependencies = [
