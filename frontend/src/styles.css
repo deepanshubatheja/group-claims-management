@@ -169,6 +169,7 @@ button {
 @keyframes matter-spin { to { transform: rotate(360deg); } }
 .matter-question { display: grid; gap: 12px; margin-top: 24px; border-top: 1px solid #dfe8f0; padding-top: 22px; }
 .matter-question > small { color: #64798f; }
+.matter-question > .primary-button { justify-self: start; }
 .matter-outcomes,
 .billing-preview { display: grid; gap: 18px; }
 .matter-summaries {
@@ -880,8 +881,6 @@ dd {
 .question-field textarea:focus { border-color: #4e8cce; outline: 2px solid rgb(78 140 206 / 20%); }
 .question-actions { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
 .question-actions span { color: #6f8294; font-size: .76rem; }
-.question-consent { margin-top: 15px; border: 1px solid #d8e5ef; border-radius: 8px; padding: 14px; background: #f8fbfe; }
-.question-consent > p:first-child { margin-bottom: 8px; color: #3e5c75; font-size: .89rem; line-height: 1.45; }
 .question-answer { display: grid; gap: 10px; margin-top: 18px; border: 1px solid #bfd5e7; border-radius: 9px; padding: 16px; background: #f5faff; color: #274a67; }
 .question-transcript { display: grid; gap: 12px; margin-top: 18px; }
 .question-transcript .question-answer { margin-top: 0; }
