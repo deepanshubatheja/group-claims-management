@@ -31,12 +31,13 @@ interface StorageStatus {
 type StorageStatusResponse =
   | { ok: true; storage: StorageStatus }
   | { ok: false; error: { code: string; message: string } };
-type AIConnectionCheck = { outcome: "available" | "provider_not_configured" | "api_key_missing" | "authentication_rejected" | "permission_denied" | "rate_limited" | "network_unavailable" | "timeout" | "provider_error"; checkedAt: string; };
+type AIConnectionCheck = { outcome: "available" | "provider_not_configured" | "api_key_missing" | "codex_login_required" | "authentication_rejected" | "permission_denied" | "rate_limited" | "network_unavailable" | "timeout" | "provider_error"; checkedAt: string; };
 type AIStatus = { enabled: boolean; authorized: boolean; provider: string | null; model: string | null; configured: boolean; credentialPresent: boolean; message: string; lastConnectionCheck: AIConnectionCheck | null; };
 type AIStatusResponse = { ok: true; ai: AIStatus } | { ok: false; error: { code: string; message: string } };
 type AIConnectionCheckResponse = { ok: true; check: AIConnectionCheck } | { ok: false; error: { code: string; message: string } };
 type AICredentialResponse = { ok: true; credentialPresent: boolean; message: string } | { ok: false; error: { code: string; message: string } };
-type DocumentAnalysisCost = { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; };
+type CodexConnectionResponse = { ok: true; message: string } | { ok: false; error: { code: string; message: string } };
+type DocumentAnalysisCost = { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string | null; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; };
 type DocumentAnalysisUsage = { estimatedCostUsd: string | null; inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; };
 type DocumentAnalysisSummary = { text: string | null; unknown: boolean; citations: DocumentQuestionCitation[]; };
 type DocumentAnalysisJob = { jobId: string; documentId: string; extractionId: string; provider: string; model: string | null; promptVersion: string; schemaVersion: string; status: "queued" | "running" | "completed" | "failed" | "blocked"; errorCode: string | null; coverage: Record<string, unknown> | null; summary: DocumentAnalysisSummary; usage: DocumentAnalysisUsage; createdAt: string; completedAt: string | null; };
@@ -60,8 +61,8 @@ type MatterReviewSummary = { selectedDocuments: number; analyzedDocuments: numbe
 type MatterReviewFinding = { id: string; documentId: string; proposalType: string; fieldName: string; value: unknown; unknown: boolean; sourceReference: string; evidenceSnippet: string | null; };
 type MatterReviewResult = { documents: MatterReviewDocument[]; summaries: Array<{ documentId: string; text: string | null; unknown: boolean; citations: DocumentQuestionCitation[] }>; findings: MatterReviewFinding[]; summary: MatterReviewSummary; };
 type MatterReviewResponse = { ok: true; review: MatterReviewResult } | DocumentFailure;
-type MatterAnalysisBatchPreview = { documents: Array<{ documentId: string; filename: string; ready: boolean; errorCode: string | null; scope: DocumentAnalysisPreview["scope"] | null; cost: DocumentAnalysisCost | null; }>; globalAuthorization: boolean; configured: boolean; estimatedCostUsd: string; costLimitUsd: string; withinCostLimit: boolean; ready: boolean; maxDocuments: number; maxRequestsPerDocument: number; automaticRetries: number; };
-type MatterAnalysisBatch = { batchId: string; createdAt: string; status: "queued" | "running" | "completed" | "partial"; estimatedCostUsd: string | null; costLimitUsd: string; documents: Array<{ documentId: string; filename: string; status: "pending" | "running" | "completed" | "failed" | "blocked"; analysisJobId: string | null; errorCode: string | null; }>; summary: { total: number; completed: number; failed: number; pending: number; }; };
+type MatterAnalysisBatchPreview = { documents: Array<{ documentId: string; filename: string; ready: boolean; errorCode: string | null; scope: DocumentAnalysisPreview["scope"] | null; cost: DocumentAnalysisCost | null; }>; globalAuthorization: boolean; configured: boolean; estimatedCostUsd: string | null; costLimitUsd: string | null; withinCostLimit: boolean; ready: boolean; maxDocuments: number; maxRequestsPerDocument: number; automaticRetries: number; };
+type MatterAnalysisBatch = { batchId: string; createdAt: string; status: "queued" | "running" | "completed" | "partial"; estimatedCostUsd: string | null; costLimitUsd: string | null; documents: Array<{ documentId: string; filename: string; status: "pending" | "running" | "completed" | "failed" | "blocked"; analysisJobId: string | null; errorCode: string | null; }>; summary: { total: number; completed: number; failed: number; pending: number; }; };
 type MatterAnalysisBatchPreviewResponse = { ok: true; preview: MatterAnalysisBatchPreview } | DocumentFailure;
 type MatterAnalysisBatchResponse = { ok: true; batch: MatterAnalysisBatch } | DocumentFailure;
 type MatterQuestionCitation = { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; };
@@ -92,6 +93,9 @@ interface DesktopAPI {
   getBackendHealth(): Promise<BackendHealthResponse>;
   getStorageStatus(): Promise<StorageStatusResponse>;
   getAIStatus(): Promise<AIStatusResponse>;
+  setAIProvider(provider: "codex" | "openai"): Promise<AIStatusResponse>;
+  connectCodex(): Promise<CodexConnectionResponse>;
+  disconnectCodex(): Promise<CodexConnectionResponse>;
   checkAIConnection(): Promise<AIConnectionCheckResponse>;
   setAIAuthorization(authorized: boolean): Promise<AIStatusResponse>;
   saveAIApiKey(apiKey: string): Promise<AICredentialResponse>;

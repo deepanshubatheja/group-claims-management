@@ -242,11 +242,11 @@ class DeterministicDocumentParser:
         a page-level fallback, never a replacement for usable native text.
         """
         try:
-            import fitz
+            import pymupdf
         except ImportError:
             self._require("PyMuPDF")
         try:
-            document = fitz.open(path)
+            document = pymupdf.open(path)
         except Exception as error:
             raise DocumentImportError("INVALID_PDF", "The PDF could not be read.") from error
         try:
@@ -354,7 +354,9 @@ class DeterministicDocumentParser:
             return PdfPageExtraction(page_number, "unavailable", None, None,
                 "Neither English nor German Tesseract language data is available.", None, version, None, ())
         try:
-            matrix = __import__("fitz").Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
+            from pymupdf import Matrix
+
+            matrix = Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)  # type: ignore[attr-defined]
             if pixmap.width * pixmap.height > MAX_OCR_PIXELS:
                 raise DocumentImportError("OCR_PAGE_TOO_LARGE", "A PDF page exceeds the safe OCR rendering limit.")

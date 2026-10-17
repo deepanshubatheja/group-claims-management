@@ -87,7 +87,7 @@ class AnalysisBatch:
     status: str
     documents: list[BatchDocument]
     estimated_cost_usd: str | None
-    cost_limit_usd: str
+    cost_limit_usd: str | None
     created_at: str
 
 
@@ -482,6 +482,7 @@ class MatterReviewService:
         documents = self._source_documents(document_ids)
         results: list[dict[str, object]] = []
         estimated_total = Decimal("0")
+        codex_plan = False
         all_ready = True
         global_authorization = False
         configured = False
@@ -490,13 +491,14 @@ class MatterReviewService:
             try:
                 preview = self._analysis.preview({"documentId": document_id})
                 cost = preview.get("cost")
+                codex_plan = preview.get("provider") == "codex"
                 estimated_cost = cost.get("estimatedCostUsd") if isinstance(cost, dict) else None
                 within_document_limit = bool(cost.get("withinLimit")) if isinstance(cost, dict) else False
                 if isinstance(estimated_cost, str):
                     estimated_total += Decimal(estimated_cost)
-                else:
+                elif not codex_plan:
                     all_ready = False
-                ready = bool(preview.get("configured")) and within_document_limit and isinstance(estimated_cost, str)
+                ready = bool(preview.get("configured")) and within_document_limit and (codex_plan or isinstance(estimated_cost, str))
                 all_ready = all_ready and ready
                 global_authorization = bool(preview.get("globalAuthorization"))
                 configured = bool(preview.get("configured"))
@@ -525,10 +527,10 @@ class MatterReviewService:
             "documents": results,
             "globalAuthorization": global_authorization,
             "configured": configured,
-            "estimatedCostUsd": self._decimal_string(estimated_total, places=6),
-            "costLimitUsd": self._decimal_string(limit, places=2),
-            "withinCostLimit": estimated_total <= limit,
-            "ready": all_ready and estimated_total <= limit and global_authorization and configured,
+            "estimatedCostUsd": None if codex_plan else self._decimal_string(estimated_total, places=6),
+            "costLimitUsd": None if codex_plan else self._decimal_string(limit, places=2),
+            "withinCostLimit": codex_plan or estimated_total <= limit,
+            "ready": all_ready and (codex_plan or estimated_total <= limit) and global_authorization and configured,
             "maxDocuments": MAX_BATCH_DOCUMENTS,
             "maxRequestsPerDocument": 1,
             "automaticRetries": 0,
@@ -541,7 +543,7 @@ class MatterReviewService:
         if not preview["globalAuthorization"]:
             raise MatterReviewError("Enable cloud-processing authorization in Settings before starting a batch analysis.")
         if not preview["configured"]:
-            raise MatterReviewError("OpenAI is not configured for this backend process.")
+            raise MatterReviewError("Connect the selected AI provider in Settings.")
         if not preview["withinCostLimit"]:
             raise MatterReviewError("The combined estimate exceeds the development batch cost limit.")
         if not preview["ready"]:
@@ -553,8 +555,8 @@ class MatterReviewService:
             id=str(uuid.uuid4()),
             status="queued",
             documents=[BatchDocument(document_id, str(document_by_id[document_id]["filename"])) for document_id in document_ids],
-            estimated_cost_usd=str(preview["estimatedCostUsd"]),
-            cost_limit_usd=str(preview["costLimitUsd"]),
+            estimated_cost_usd=preview["estimatedCostUsd"],
+            cost_limit_usd=preview["costLimitUsd"],
             created_at=now,
         )
         with self._batch_lock:
@@ -577,7 +579,7 @@ class MatterReviewService:
                 (
                     str(uuid.uuid4()), "ai_matter_batch_authorized", "matter_analysis_batch", batch.id,
                     "user", now,
-                    json.dumps({"document_count": len(document_ids), "provider": "openai", "payload_logged": False}),
+                    json.dumps({"document_count": len(document_ids), "provider": "codex" if preview["estimatedCostUsd"] is None else "openai", "payload_logged": False}),
                 ),
             )
         worker = threading.Thread(target=self._run_batch, args=(batch.id,), daemon=True, name=f"group-claims-batch-{batch.id[:8]}")
@@ -617,9 +619,10 @@ class MatterReviewService:
                     "maxRequestAttempts": 0,
                 },
             }
-        estimate = controls.estimate_cost(plan["inputTokens"], plan["maxOutputTokens"])
+        estimate = self._analysis._estimate_cost(plan["inputTokens"], plan["maxOutputTokens"])
         estimated_cost = self._analysis._cost_string(estimate)
-        within_limit = estimate is not None and estimate <= controls.max_estimated_cost_usd
+        codex_plan = configuration.provider == "codex"
+        within_limit = codex_plan or (estimate is not None and estimate <= controls.max_estimated_cost_usd)
         return {
             "provider": configuration.provider,
             "model": configuration.model,
@@ -629,11 +632,11 @@ class MatterReviewService:
             "scope": plan["scope"],
             "cost": {
                 "estimatedInputTokens": plan["inputTokens"],
-                "maxOutputTokens": plan["maxOutputTokens"],
-                "estimatedCostUsd": estimated_cost,
-                "limitUsd": self._analysis._cost_string(controls.max_estimated_cost_usd),
+                "maxOutputTokens": 0 if codex_plan else plan["maxOutputTokens"],
+                "estimatedCostUsd": None if codex_plan else estimated_cost,
+                "limitUsd": None if codex_plan else self._analysis._cost_string(controls.max_estimated_cost_usd),
                 "withinLimit": within_limit,
-                "maxRequestAttempts": controls.max_request_attempts,
+                "maxRequestAttempts": 1 if codex_plan else controls.max_request_attempts,
             },
         }
 
@@ -664,7 +667,7 @@ class MatterReviewService:
         if not preview["globalAuthorization"]:
             raise MatterReviewError("Enable cloud-processing authorization in Settings before asking a consolidated question.")
         if not preview["configured"]:
-            raise MatterReviewError("OpenAI is not configured for this backend process.")
+            raise MatterReviewError("Connect the selected AI provider in Settings.")
         cost = preview["cost"]
         if not isinstance(cost, dict) or not cost["withinLimit"]:
             raise MatterReviewError("This question exceeds the current development safety limit.")
@@ -717,8 +720,8 @@ class MatterReviewService:
             if not self._analysis._global_authorized():
                 raise AIAnalysisError("AI_AUTHORIZATION_WITHDRAWN", "Cloud-processing authorization was withdrawn.")
             configuration = self._analysis._configuration
-            if configuration.provider != "openai" or not configuration.credential_configured:
-                raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "OpenAI is not configured.")
+            if configuration.provider not in {"openai", "codex"} or not configuration.credential_configured:
+                raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "Connect the selected AI provider in Settings.")
             result = self._analysis._new_provider(int(plan["maxOutputTokens"])).answer_question(
                 question, str(plan["context"]), tuple(plan["citationKeys"])
             )
@@ -740,7 +743,7 @@ class MatterReviewService:
             if not citations:
                 raise AIAnalysisError("AI_ANSWER_EVIDENCE_UNSUPPORTED", "The answer did not include supported local evidence.")
             controls = self._analysis._cost_controls
-            actual_cost = controls.estimate_cost(result.input_tokens, result.output_tokens) if result.input_tokens is not None and result.output_tokens is not None else None
+            actual_cost = self._analysis._estimate_cost(result.input_tokens, result.output_tokens) if result.input_tokens is not None and result.output_tokens is not None else None
             with self._question_lock:
                 job = self._questions.get(question_id)
                 if job is None:

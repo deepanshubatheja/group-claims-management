@@ -292,3 +292,42 @@ They are replaced with the resolved local filename and source reference before
 the answer is rendered. Follow-up questions retain their ordinary local-source
 retrieval scope rather than treating a prior answer or a provider handle as
 evidence.
+
+## 2026-10-16 — Local Codex/ChatGPT connection for AI review
+
+The desktop app now selects `codex` by default for its Python-owned AI review.
+The user explicitly starts browser sign-in from Settings. The backend runs the
+published `openai-codex` Python SDK with its pinned local Codex runtime, an
+app-data `CODEX_HOME`, and OS keyring credential storage. It does not use an
+OpenAI API key for this path. The previous API-key adapter remains available.
+
+Connection and consent are separate. Sign-in and metadata checks send no
+document content. Every analysis or question still requires existing global
+cloud authorization and a specific user action. Only bounded extracted text is
+sent; original files remain local. Codex uses ephemeral, read-only threads
+with approvals denied; shell, connector, multi-agent, and web-search features
+are disabled for this dedicated runtime. Its JSON responses still pass the
+same local schema, evidence, and citation checks before display or persistence.
+The app does not log prompts, OAuth URLs, credentials, or raw model responses.
+
+Codex subscription usage is governed by the connected ChatGPT plan, not the
+OpenAI API pricing profile. Previews therefore show no USD estimate or USD
+limit for Codex; local input-size and request-count bounds still apply. The
+Codex SDK path cannot enforce the Responses API's output-token cap, and the UI
+does not claim that it can.
+
+This app-server managed sign-in is for the local single-user/internal build.
+Official OpenAI documentation permits existing local or open-source app-server
+integrations but says managed app-server authentication is not permitted for
+commercial or hosted services. Before distributing ClaimFlow commercially,
+replace this login flow with the official Sign in with ChatGPT integration
+and complete its required onboarding/review.
+
+## 2026-10-17 — Per-user AI provider selection
+
+Settings can select `codex` or `openai` and saves only that provider name in a
+small per-user app-data file. A saved choice overrides the development
+`GROUP_CLAIMS_AI_PROVIDER` fallback. The backend restarts on a change, and
+cloud-processing authorization is withdrawn before the new provider is used;
+the user must enable it again for the selected provider. Credentials remain in
+their existing OS-protected stores and are never copied into this settings file.

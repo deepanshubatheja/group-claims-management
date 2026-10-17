@@ -47,7 +47,7 @@ export interface BackendLaunchConfiguration {
   options: SpawnOptionsWithoutStdio;
 }
 
-type BackendCommand = "health.check" | "storage.status" | "ai.status" | "ai.check_connection" | "ai.set_authorization" | "ai.analysis_preview" | "ai.analyze_document" | "ai.analysis_status" | "ai.analysis_findings" | "ai.question_preview" | "ai.ask_question" | "ai.question_status" | "matter.review" | "matter.billing_preview" | "matter.analysis_batch_preview" | "matter.start_analysis_batch" | "matter.analysis_batch_status" | "matter.question_preview" | "matter.ask_question" | "matter.question_status" | "documents.import" | "documents.list" | "documents.remove" | "documents.content" | "documents.retry_parse";
+type BackendCommand = "health.check" | "storage.status" | "ai.status" | "ai.check_connection" | "ai.codex_connect" | "ai.codex_disconnect" | "ai.set_authorization" | "ai.analysis_preview" | "ai.analyze_document" | "ai.analysis_status" | "ai.analysis_findings" | "ai.question_preview" | "ai.ask_question" | "ai.question_status" | "matter.review" | "matter.billing_preview" | "matter.analysis_batch_preview" | "matter.start_analysis_batch" | "matter.analysis_batch_status" | "matter.question_preview" | "matter.ask_question" | "matter.question_status" | "documents.import" | "documents.list" | "documents.remove" | "documents.content" | "documents.retry_parse";
 
 export type BackendSpawn = (
   command: string,

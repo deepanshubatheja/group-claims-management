@@ -10,9 +10,12 @@ from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from datetime import UTC, datetime
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence
 
 from ..storage.service import StorageService
+
+if TYPE_CHECKING:
+    from .codex import CodexManager
 
 AUTHORIZATION_TEXT_VERSION = "ai-cloud-consent-v1"
 PROPOSAL_SCHEMA_VERSION = "ai-proposal-v4"
@@ -211,21 +214,21 @@ class AIConfiguration:
     credential_configured: bool
 
     @classmethod
-    def from_environment(cls) -> "AIConfiguration":
+    def from_environment(cls, codex_connected: bool = False) -> "AIConfiguration":
         api_key_present = _openai_api_key_from_environment() is not None
         provider = os.environ.get("GROUP_CLAIMS_AI_PROVIDER") or (
             "openai" if api_key_present else None
         )
-        model = os.environ.get("GROUP_CLAIMS_AI_MODEL") or (
-            OPENAI_DEFAULT_MODEL if provider == "openai" else None
-        )
-        return cls(provider, model, api_key_present)
+        model = (os.environ.get("GROUP_CLAIMS_AI_MODEL") or OPENAI_DEFAULT_MODEL) if provider == "openai" else None
+        return cls(provider, model, codex_connected if provider == "codex" else api_key_present)
 
     def state(self) -> str:
-        if self.provider is None:
+        if self.provider not in {"openai", "codex"}:
             return "provider_not_configured"
         if self.provider == "openai" and not self.credential_configured:
             return "api_key_missing"
+        if self.provider == "codex" and not self.credential_configured:
+            return "codex_login_required"
         return "configured_not_live_tested"
 
 
@@ -236,18 +239,27 @@ class AIService:
         self,
         storage: StorageService,
         connection_provider_factory: Callable[[], "OpenAIProvider"] | None = None,
+        codex_manager: "CodexManager | None" = None,
     ) -> None:
         if storage.database is None:
             raise AIServiceError("STORAGE_UNAVAILABLE", "Local storage is unavailable.")
         self._database = storage.database
+        self._codex_manager = codex_manager
         self._configuration = AIConfiguration.from_environment()
         self._connection_provider_factory = connection_provider_factory
+
+    def _refresh_configuration(self) -> None:
+        self._configuration = AIConfiguration.from_environment(
+            self._codex_manager.connected()
+            if self._codex_manager is not None and os.environ.get("GROUP_CLAIMS_AI_PROVIDER") == "codex"
+            else False
+        )
 
     def status(self) -> Mapping[str, object]:
         # Read the current backend process environment for diagnostics instead of
         # presenting a stale in-memory configuration snapshot. This never returns
         # the key value; it only reports whether a non-empty value is present.
-        self._configuration = AIConfiguration.from_environment()
+        self._refresh_configuration()
         with self._database.connection() as connection:
             row = connection.execute(
                 "SELECT authorized, provider, model FROM ai_authorizations "
@@ -257,7 +269,11 @@ class AIService:
                 "SELECT occurred_at, details_json FROM audit_events WHERE event_type = 'ai_connection_checked' "
                 "ORDER BY occurred_at DESC LIMIT 1"
             ).fetchone()
-        authorized = row is not None and bool(row["authorized"])
+        authorized = (
+            row is not None
+            and row["provider"] == self._configuration.provider
+            and bool(row["authorized"])
+        )
         provider = self._configuration.provider or (
             str(row["provider"]) if row and row["provider"] else None
         )
@@ -268,6 +284,7 @@ class AIService:
         message = {
             "provider_not_configured": "Cloud AI is not configured.",
             "api_key_missing": "OpenAI is selected, but its API key is not configured.",
+            "codex_login_required": "Connect ChatGPT in Settings to use Codex.",
             "configured_not_live_tested": (
                 "Cloud AI is configured but has not been live-tested. "
                 "No document content is sent without document-level authorization."
@@ -282,20 +299,22 @@ class AIService:
             "configurationState": configuration_state,
             "credentialPresent": self._configuration.credential_configured,
             "message": message,
-            "lastConnectionCheck": self._last_connection_check(latest_check),
+            "lastConnectionCheck": self._last_connection_check(latest_check, self._configuration.provider),
         }
 
     @staticmethod
-    def _last_connection_check(row: object) -> Mapping[str, object] | None:
+    def _last_connection_check(row: object, provider: str | None) -> Mapping[str, object] | None:
         if row is None:
             return None
         try:
             details = json.loads(str(row["details_json"]))
         except (TypeError, ValueError, KeyError):
             return None
-        outcome = details.get("outcome") if isinstance(details, dict) else None
+        if not isinstance(details, dict) or details.get("provider") != provider:
+            return None
+        outcome = details.get("outcome")
         if outcome not in {
-            "available", "provider_not_configured", "api_key_missing",
+            "available", "provider_not_configured", "api_key_missing", "codex_login_required",
             "authentication_rejected", "permission_denied", "rate_limited",
             "network_unavailable", "timeout", "provider_error", "request_failed",
         }:
@@ -317,7 +336,7 @@ class AIService:
         """
         if params != {}:
             raise AIServiceError("INVALID_AI_CONNECTION_CHECK", "Invalid AI connection check request.")
-        self._configuration = AIConfiguration.from_environment()
+        self._refresh_configuration()
         outcome = "provider_not_configured"
         if self._configuration.provider == "openai":
             if not self._configuration.credential_configured:
@@ -343,6 +362,16 @@ class AIService:
                     # error. Do not expose its implementation details, but do
                     # record a controlled, distinguishable provider result.
                     outcome = "provider_error"
+        elif self._configuration.provider == "codex":
+            if not self._configuration.credential_configured:
+                outcome = "codex_login_required"
+            else:
+                try:
+                    assert self._codex_manager is not None
+                    self._codex_manager.check_connection()
+                    outcome = "available"
+                except AIServiceError:
+                    outcome = "provider_error"
         now = datetime.now(UTC).isoformat()
         with self._database.transaction() as connection:
             connection.execute(
@@ -350,7 +379,7 @@ class AIService:
                 "(id, event_type, target_type, target_id, actor_type, occurred_at, details_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    str(uuid.uuid4()), "ai_connection_checked", "ai_provider", "openai",
+                    str(uuid.uuid4()), "ai_connection_checked", "ai_provider", self._configuration.provider or "none",
                     "user", now,
                     json.dumps({
                         "outcome": outcome,
@@ -363,7 +392,19 @@ class AIService:
             )
         return {"outcome": outcome, "checkedAt": now}
 
+    def codex_connect(self, params: object) -> Mapping[str, object]:
+        if params != {} or self._codex_manager is None:
+            raise AIServiceError("INVALID_CODEX_LOGIN", "Codex sign-in is unavailable.")
+        return {"authUrl": self._codex_manager.start_login()}
+
+    def codex_disconnect(self, params: object) -> Mapping[str, object]:
+        if params != {} or self._codex_manager is None:
+            raise AIServiceError("INVALID_CODEX_LOGOUT", "Codex sign-out is unavailable.")
+        self._codex_manager.logout()
+        return {"connected": False}
+
     def set_authorization(self, params: object) -> Mapping[str, object]:
+        self._refresh_configuration()
         if (
             not isinstance(params, dict)
             or params.get("authorized") not in (True, False)

@@ -4,5 +4,5 @@
     "rootDir": ".",
     "outDir": "test-dist"
   },
-  "include": ["src/backend-process.ts", "src/folder-import.ts", "src/ipc-contract.ts", "tests/**/*.ts"]
+  "include": ["src/ai-provider-settings.ts", "src/backend-process.ts", "src/folder-import.ts", "src/ipc-contract.ts", "tests/**/*.ts"]
 }

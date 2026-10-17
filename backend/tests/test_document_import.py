@@ -234,7 +234,7 @@ class SpreadsheetContentTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    __import__("importlib").util.find_spec("fitz") is not None,
+    __import__("importlib").util.find_spec("pymupdf") is not None,
     "PyMuPDF is required for PDF extraction tests",
 )
 class PdfExtractionTests(unittest.TestCase):
@@ -250,22 +250,22 @@ class PdfExtractionTests(unittest.TestCase):
         return output.getvalue()
 
     def _mixed_pdf(self, target: Path) -> None:
-        import fitz
+        import pymupdf
 
-        document = fitz.open()
+        document = pymupdf.open()
         native = document.new_page()
         native.insert_text((72, 72), "Native PDF text")
         scanned = document.new_page(width=600, height=300)
-        scanned.insert_image(fitz.Rect(0, 0, 600, 300), stream=self._image_bytes())
+        scanned.insert_image(pymupdf.Rect(0, 0, 600, 300), stream=self._image_bytes())
         document.save(target)
         document.close()
 
     def test_native_text_uses_coordinate_aware_blocks(self) -> None:
-        import fitz
+        import pymupdf
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "native.pdf"
-            document = fitz.open()
+            document = pymupdf.open()
             page = document.new_page()
             page.insert_text((72, 72), "Native document text")
             document.save(path)
@@ -299,10 +299,10 @@ class PdfExtractionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "scanned.pdf"
-            import fitz
-            document = fitz.open()
+            import pymupdf
+            document = pymupdf.open()
             page = document.new_page(width=600, height=300)
-            page.insert_image(fitz.Rect(0, 0, 600, 300), stream=self._image_bytes())
+            page.insert_image(pymupdf.Rect(0, 0, 600, 300), stream=self._image_bytes())
             document.save(path)
             document.close()
             with patch.object(pytesseract, "get_tesseract_version", side_effect=pytesseract.TesseractNotFoundError()):
@@ -313,8 +313,8 @@ class PdfExtractionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "app-data"
             source = Path(directory) / "native.pdf"
-            import fitz
-            document = fitz.open()
+            import pymupdf
+            document = pymupdf.open()
             page = document.new_page()
             page.insert_text((72, 72), "Persisted PDF page")
             document.save(source)
@@ -338,8 +338,8 @@ class PdfExtractionTests(unittest.TestCase):
     def test_pdf_content_uses_source_page_numbers_for_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "five-pages.pdf"
-            import fitz
-            document = fitz.open()
+            import pymupdf
+            document = pymupdf.open()
             for page_number in range(1, 6):
                 page = document.new_page()
                 page.insert_text((72, 72), f"Page {page_number}")

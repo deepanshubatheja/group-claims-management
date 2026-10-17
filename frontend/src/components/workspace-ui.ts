@@ -7,15 +7,16 @@ export function platformName(platform: string | undefined): string { return plat
 export function aiConnectionMessage(check: AIConnectionCheck | null): string | null {
   if (check === null) return null;
   return {
-    available: "OpenAI accepted the configured credential during the last explicit connection check. No document content was sent and no model response was generated.",
-    provider_not_configured: "No OpenAI provider is configured for the last explicit connection check.",
+    available: "The selected AI provider accepted the connected account. No document content was sent and no model response was generated.",
+    provider_not_configured: "No AI provider is configured for the last explicit connection check.",
     api_key_missing: "The last explicit connection check found no usable API key in the running backend.",
+    codex_login_required: "Connect ChatGPT in Settings before checking Codex.",
     authentication_rejected: "OpenAI rejected the configured credential during the last explicit connection check.",
     permission_denied: "OpenAI accepted the request but denied permission for the last explicit connection check.",
     rate_limited: "The last explicit connection check was rate-limited.",
     network_unavailable: "The last explicit connection check could not reach OpenAI.",
     timeout: "The last explicit connection check timed out.",
-    provider_error: "OpenAI could not complete the last explicit connection check. Try again later or review the non-sensitive backend diagnostics.",
+    provider_error: "The AI provider could not complete the last explicit connection check. Try again later.",
   }[check.outcome];
 }
 export type WorkspaceNotice = "backend" | "storage";
