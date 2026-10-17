@@ -115,17 +115,18 @@ export function conversationContextAnswer(answer: string | null, unavailableAnsw
 export function analysisFailureMessage(code: string | null): string | null {
   if (code === null) return null;
   if (code === "AI_AUTHORIZATION_WITHDRAWN") return "Cloud-processing authorization was withdrawn before analysis completed.";
+  if (code === "CODEX_LOGIN_REQUIRED") return "Connect ChatGPT in Settings, then try the analysis again.";
   if (code === "AI_AUTHENTICATION_FAILED") {
     return "OpenAI rejected the configured API key. The application passed a non-empty credential, so restarting alone cannot repair a revoked, incorrect, or wrong-project key. Create or copy an active OpenAI Platform project key, export it in the same terminal that starts npm run dev, then restart the application.";
   }
   if (code === "AI_OUTPUT_LIMIT_REACHED") {
-    return "OpenAI reached the configured output limit before completing the structured response. No findings were stored; restart the app and deliberately retry with the updated development budget.";
+    return "The AI provider reached its output limit before completing the structured response. No findings were stored.";
   }
   if (code === "AI_INCOMPLETE") {
-    return "OpenAI stopped before completing the structured response. No findings were stored; review the analysis budget before deliberately retrying.";
+    return "The AI provider stopped before completing the structured response. No findings were stored.";
   }
   if (code === "AI_RESPONSE_TEXT_MISSING" || code === "AI_RESPONSE_JSON_INVALID" || code === "AI_RESPONSE_CONTRACT_INVALID") {
-    return "OpenAI completed the request but did not return the required structured result. No findings were stored; the response contract has been tightened before any deliberate retry.";
+    return "The AI provider did not return the required structured result. No findings were stored.";
   }
   return "AI analysis did not complete. No confirmed records were changed.";
 }

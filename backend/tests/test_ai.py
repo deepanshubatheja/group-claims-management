@@ -58,6 +58,27 @@ class AIServiceTests(unittest.TestCase):
         self.assertTrue(status["configured"])
         self.assertTrue(status["credentialPresent"])
 
+    def test_codex_connection_is_separate_from_cloud_authorization(self):
+        class FakeCodex:
+            signed_in = False
+
+            def connected(self):
+                return self.signed_in
+
+            def check_connection(self):
+                return None
+
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "codex"
+        codex = FakeCodex()
+        service = AIService(self.storage, codex_manager=codex)
+        self.assertEqual(service.status()["configurationState"], "codex_login_required")
+        self.assertEqual(service.check_connection({})["outcome"], "codex_login_required")
+        codex.signed_in = True
+        status = service.status()
+        self.assertTrue(status["configured"])
+        self.assertFalse(status["authorized"])
+        self.assertEqual(service.check_connection({})["outcome"], "available")
+
     def test_whitespace_only_key_is_missing_and_surrounding_whitespace_is_not_sent(self):
         os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
         os.environ["OPENAI_API_KEY"] = " \n\t "
@@ -65,10 +86,20 @@ class AIServiceTests(unittest.TestCase):
         self.assertIsNone(_normalized_openai_api_key(" \n\t "))
         self.assertEqual(_normalized_openai_api_key("  synthetic-key\n"), "synthetic-key")
     def test_authorization_is_audited_without_payload(self):
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
         service = AIService(self.storage); self.assertTrue(service.set_authorization({"authorized": True, "acknowledged": True})["authorized"])
         assert self.storage.database
         with self.storage.database.connection() as connection: details = connection.execute("SELECT details_json FROM audit_events WHERE event_type = 'ai_authorization_updated'").fetchone()[0]
         self.assertNotIn("secret", details); self.assertNotIn("document", details)
+    def test_authorization_does_not_carry_to_another_provider(self):
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
+        service = AIService(self.storage)
+        self.assertTrue(service.set_authorization({"authorized": True, "acknowledged": True})["authorized"])
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "codex"
+        self.assertFalse(service.status()["authorized"])
+        self.assertFalse(service.set_authorization({"authorized": False, "acknowledged": True})["authorized"])
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "openai"
+        self.assertFalse(service.status()["authorized"])
     def test_invalid_authorization_and_proposals_are_rejected(self):
         with self.assertRaises(AIServiceError): AIService(self.storage).set_authorization({"authorized": True})
         with self.assertRaises(AIServiceError): validate_proposal({"proposalType": "holding"})
@@ -333,6 +364,8 @@ class AIConnectionStatusTests(unittest.TestCase):
             details = connection.execute("SELECT details_json FROM audit_events WHERE event_type = 'ai_connection_checked'").fetchone()[0]
         self.assertNotIn("synthetic-secret", details)
         self.assertIn('"document_content_sent":false', details)
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "codex"
+        self.assertIsNone(service.status()["lastConnectionCheck"])
 
     def test_explicit_check_reports_rejected_authentication_without_disclosing_the_key(self):
         def rejected():

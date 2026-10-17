@@ -2,10 +2,13 @@ export const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 export const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 export const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 export const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
+export const SET_AI_PROVIDER_CHANNEL = "app:set-ai-provider" as const;
 export const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
 export const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
 export const SAVE_AI_API_KEY_CHANNEL = "app:save-ai-api-key" as const;
 export const REMOVE_AI_API_KEY_CHANNEL = "app:remove-ai-api-key" as const;
+export const CONNECT_CODEX_CHANNEL = "app:connect-codex" as const;
+export const DISCONNECT_CODEX_CHANNEL = "app:disconnect-codex" as const;
 export const GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL = "documents:get-analysis-preview" as const;
 export const START_DOCUMENT_ANALYSIS_CHANNEL = "documents:start-analysis" as const;
 export const GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL = "documents:get-analysis-status" as const;
@@ -100,14 +103,16 @@ export interface StorageStatusSuccess {
 }
 
 export type StorageStatusResponse = StorageStatusSuccess | StorageStatusFailure;
-export interface AIConnectionCheck { outcome: "available" | "provider_not_configured" | "api_key_missing" | "authentication_rejected" | "permission_denied" | "rate_limited" | "network_unavailable" | "timeout" | "provider_error"; checkedAt: string; }
+export interface AIConnectionCheck { outcome: "available" | "provider_not_configured" | "api_key_missing" | "codex_login_required" | "authentication_rejected" | "permission_denied" | "rate_limited" | "network_unavailable" | "timeout" | "provider_error"; checkedAt: string; }
 export interface AIStatus { enabled: boolean; authorized: boolean; provider: string | null; model: string | null; configured: boolean; credentialPresent: boolean; message: string; lastConnectionCheck: AIConnectionCheck | null; }
 export type AIStatusResponse = { ok: true; ai: AIStatus } | BackendHealthFailure;
+export type AIProviderSelectionResponse = AIStatusResponse;
 export type AIConnectionCheckResponse = { ok: true; check: AIConnectionCheck } | BackendHealthFailure;
 /** Never includes an API-key value or fingerprint. */
 export type AICredentialResponse = { ok: true; credentialPresent: boolean; message: string } | BackendHealthFailure;
+export type CodexConnectionResponse = { ok: true; message: string } | BackendHealthFailure;
 export interface AnalysisScope { extractionId: string; chunks: number; sourceItems: number; totalSourceItems: number; excludedSourceItems: number; includedCharacters: number; excludedCharacters: number; truncated: boolean; }
-export interface AnalysisCostPreview { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; }
+export interface AnalysisCostPreview { estimateMethod: string; estimatedInputTokens: number; maxOutputTokens: number; estimatedCostUsd: string | null; limitUsd: string | null; withinLimit: boolean; maxRequests: number; maxRequestAttempts: number; }
 export interface AnalysisUsage { estimatedCostUsd: string | null; inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }
 export interface DocumentAnalysisSummary { text: string | null; unknown: boolean; citations: DocumentQuestionCitation[]; }
 export interface DocumentAnalysisJob { jobId: string; documentId: string; extractionId: string; provider: string; model: string | null; promptVersion: string; schemaVersion: string; status: "queued" | "running" | "completed" | "failed" | "blocked"; errorCode: string | null; coverage: Record<string, unknown> | null; summary: DocumentAnalysisSummary; usage: AnalysisUsage; createdAt: string; completedAt: string | null; }
@@ -133,9 +138,9 @@ export interface MatterReviewFinding { id: string; documentId: string; proposalT
 export interface MatterReviewResult { documents: MatterReviewDocument[]; summaries: Array<{ documentId: string; text: string | null; unknown: boolean; citations: DocumentQuestionCitation[] }>; findings: MatterReviewFinding[]; summary: MatterReviewSummary; }
 export type MatterReviewResponse = { ok: true; review: MatterReviewResult } | DocumentOperationFailure;
 export interface MatterAnalysisBatchPreviewDocument { documentId: string; filename: string; ready: boolean; errorCode: string | null; scope: AnalysisScope | null; cost: AnalysisCostPreview | null; }
-export interface MatterAnalysisBatchPreview { documents: MatterAnalysisBatchPreviewDocument[]; globalAuthorization: boolean; configured: boolean; estimatedCostUsd: string; costLimitUsd: string; withinCostLimit: boolean; ready: boolean; maxDocuments: number; maxRequestsPerDocument: number; automaticRetries: number; }
+export interface MatterAnalysisBatchPreview { documents: MatterAnalysisBatchPreviewDocument[]; globalAuthorization: boolean; configured: boolean; estimatedCostUsd: string | null; costLimitUsd: string | null; withinCostLimit: boolean; ready: boolean; maxDocuments: number; maxRequestsPerDocument: number; automaticRetries: number; }
 export interface MatterAnalysisBatchDocument { documentId: string; filename: string; status: "pending" | "running" | "completed" | "failed" | "blocked"; analysisJobId: string | null; errorCode: string | null; }
-export interface MatterAnalysisBatch { batchId: string; createdAt: string; status: "queued" | "running" | "completed" | "partial"; estimatedCostUsd: string | null; costLimitUsd: string; documents: MatterAnalysisBatchDocument[]; summary: { total: number; completed: number; failed: number; pending: number; }; }
+export interface MatterAnalysisBatch { batchId: string; createdAt: string; status: "queued" | "running" | "completed" | "partial"; estimatedCostUsd: string | null; costLimitUsd: string | null; documents: MatterAnalysisBatchDocument[]; summary: { total: number; completed: number; failed: number; pending: number; }; }
 export type MatterAnalysisBatchPreviewResponse = { ok: true; preview: MatterAnalysisBatchPreview } | DocumentOperationFailure;
 export type MatterAnalysisBatchResponse = { ok: true; batch: MatterAnalysisBatch } | DocumentOperationFailure;
 export interface MatterQuestionCitation { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; }

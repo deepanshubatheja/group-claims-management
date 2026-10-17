@@ -542,6 +542,9 @@ h2 {
 .document-search input:focus { border-color: #4e8cce; outline: 2px solid rgb(78 140 206 / 20%); }
 
 .settings-section { max-width: 900px; margin-top: 28px; }
+.settings-provider { display: grid; gap: 6px; max-width: 320px; margin: 14px 0; color: #315775; font-size: .88rem; font-weight: 700; }
+.settings-provider select { border: 1px solid #b8cadb; border-radius: 7px; padding: 9px 10px; background: #fff; color: #173b5c; font: inherit; font-weight: 400; }
+.settings-provider select:focus { border-color: #4e8cce; outline: 2px solid rgb(78 140 206 / 20%); }
 .settings-key-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0 14px; }
 .settings-key-row input { flex: 1 1 320px; min-width: 0; }
 .settings-section-heading { margin-bottom: 16px; }

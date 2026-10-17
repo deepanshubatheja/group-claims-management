@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIProviderSelectionResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
@@ -7,10 +7,13 @@ const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
+const SET_AI_PROVIDER_CHANNEL = "app:set-ai-provider" as const;
 const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
 const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
 const SAVE_AI_API_KEY_CHANNEL = "app:save-ai-api-key" as const;
 const REMOVE_AI_API_KEY_CHANNEL = "app:remove-ai-api-key" as const;
+const CONNECT_CODEX_CHANNEL = "app:connect-codex" as const;
+const DISCONNECT_CODEX_CHANNEL = "app:disconnect-codex" as const;
 
 function documentQuestionFollowUpPayload(followUp: DocumentQuestionFollowUp): DocumentQuestionFollowUp {
   return Object.freeze({
@@ -182,6 +185,12 @@ const desktopApi = Object.freeze({
     return Object.freeze(response);
   },
   async getAIStatus(): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(GET_AI_STATUS_CHANNEL) as AIStatusResponse); },
+  async setAIProvider(provider: "codex" | "openai"): Promise<AIProviderSelectionResponse> {
+    if (provider !== "codex" && provider !== "openai") throw new Error("Invalid AI provider.");
+    return Object.freeze(await ipcRenderer.invoke(SET_AI_PROVIDER_CHANNEL, { provider }) as AIProviderSelectionResponse);
+  },
+  async connectCodex() { return Object.freeze(await ipcRenderer.invoke(CONNECT_CODEX_CHANNEL)); },
+  async disconnectCodex() { return Object.freeze(await ipcRenderer.invoke(DISCONNECT_CODEX_CHANNEL)); },
   async checkAIConnection(): Promise<AIConnectionCheckResponse> { return Object.freeze(await ipcRenderer.invoke(CHECK_AI_CONNECTION_CHANNEL) as AIConnectionCheckResponse); },
   async setAIAuthorization(authorized: boolean): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(SET_AI_AUTHORIZATION_CHANNEL, { authorized }) as AIStatusResponse); },
   async saveAIApiKey(apiKey: string): Promise<AICredentialResponse> {

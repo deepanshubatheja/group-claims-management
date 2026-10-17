@@ -121,6 +121,29 @@ class ProtocolServerTests(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertNotIn("health.check", stderr)
 
+    def test_pdf_import_keeps_stdout_json_only(self) -> None:
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "native.pdf"
+            pdf = pymupdf.open()
+            pdf.new_page().insert_text((72, 72), "Native PDF text")
+            pdf.save(source)
+            pdf.close()
+
+            payload = "".join(json.dumps(item) + "\n" for item in (
+                request("pdf-import", "documents.import", params={"paths": [str(source)]}),
+                request("after-pdf-import"),
+            ))
+            responses, _ = run_backend(payload.encode(), root / "app-data")
+
+        self.assertEqual([response["id"] for response in responses], ["pdf-import", "after-pdf-import"])
+        self.assertTrue(responses[0]["ok"])
+        self.assertTrue(responses[0]["result"]["documents"][0]["ok"])
+        self.assertEqual(responses[0]["result"]["documents"][0]["document"]["processing_status"], "parsed")
+        self.assertTrue(responses[1]["ok"])
+
     def test_storage_status_initializes_supplied_temporary_storage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "app-data"

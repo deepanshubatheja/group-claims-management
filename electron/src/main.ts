@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, session } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, session, shell } from "electron";
 import { access, lstat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, existsSync } from "node:fs";
@@ -11,12 +11,13 @@ import {
   resolvePackagedBackendLaunch,
 } from "./backend-process";
 import { CredentialStoreError, MacOSCredentialStore } from "./credential-store";
+import { isAIProvider, readAIProviderPreference, saveAIProviderPreference, selectedAIProvider } from "./ai-provider-settings";
 import {
   GET_APP_INFO_CHANNEL,
   GET_BACKEND_HEALTH_CHANNEL,
   GET_STORAGE_STATUS_CHANNEL,
-  GET_AI_STATUS_CHANNEL, CHECK_AI_CONNECTION_CHANNEL, SET_AI_AUTHORIZATION_CHANNEL,
-  SAVE_AI_API_KEY_CHANNEL, REMOVE_AI_API_KEY_CHANNEL,
+  GET_AI_STATUS_CHANNEL, SET_AI_PROVIDER_CHANNEL, CHECK_AI_CONNECTION_CHANNEL, SET_AI_AUTHORIZATION_CHANNEL,
+  SAVE_AI_API_KEY_CHANNEL, REMOVE_AI_API_KEY_CHANNEL, CONNECT_CODEX_CHANNEL, DISCONNECT_CODEX_CHANNEL,
   GET_DOCUMENT_ANALYSIS_PREVIEW_CHANNEL, START_DOCUMENT_ANALYSIS_CHANNEL,
   GET_DOCUMENT_ANALYSIS_STATUS_CHANNEL, GET_DOCUMENT_ANALYSIS_FINDINGS_CHANNEL,
   PREVIEW_DOCUMENT_QUESTION_CHANNEL, ASK_DOCUMENT_QUESTION_CHANNEL, GET_DOCUMENT_QUESTION_STATUS_CHANNEL,
@@ -27,7 +28,7 @@ import {
   type AppInfo,
   type BackendHealthResponse,
   type StorageStatusResponse,
-  type AIStatusResponse, type AIConnectionCheckResponse, type AIConnectionCheck, type AICredentialResponse,
+  type AIStatusResponse, type AIProviderSelectionResponse, type AIConnectionCheckResponse, type AIConnectionCheck, type AICredentialResponse, type CodexConnectionResponse,
   type DocumentAnalysisPreviewResponse, type DocumentAnalysisStartResponse,
   type DocumentAnalysisStatusResponse, type DocumentAnalysisFindingsResponse,
   type DocumentAnalysisPreview, type DocumentAnalysisJob, type DocumentAnalysisFinding,
@@ -49,6 +50,7 @@ const rendererHtmlUrl = pathToFileURL(rendererHtmlPath).toString();
 const projectRoot = path.join(__dirname, "../..");
 let backendProcess: BackendProcessManager | undefined;
 let backendLaunchPromise: Promise<void> | undefined;
+let switchingAIProvider = false;
 const folderAuthorizations = new Map<string, { files: AuthorizedFolderFile[]; skipped: number; expiresAt: number }>();
 
 function isAllowedRendererUrl(url: string): boolean {
@@ -248,7 +250,7 @@ function isAnalysisPreview(value: unknown): value is DocumentAnalysisPreview {
     && typeof value.cost.estimateMethod === "string" && typeof value.cost.estimatedInputTokens === "number"
     && typeof value.cost.maxOutputTokens === "number"
     && (typeof value.cost.estimatedCostUsd === "string" || value.cost.estimatedCostUsd === null)
-    && typeof value.cost.limitUsd === "string" && typeof value.cost.withinLimit === "boolean"
+    && (typeof value.cost.limitUsd === "string" || value.cost.limitUsd === null) && typeof value.cost.withinLimit === "boolean"
     && typeof value.cost.maxRequests === "number" && typeof value.cost.maxRequestAttempts === "number"
     && (value.latestJob === null || isAnalysisJob(value.latestJob));
 }
@@ -320,8 +322,8 @@ function isBillingPreview(value: unknown): value is BillingPreviewResult {
 
 function isMatterAnalysisBatchPreview(value: unknown): value is MatterAnalysisBatchPreview {
   return isRecord(value) && Array.isArray(value.documents) && typeof value.globalAuthorization === "boolean"
-    && typeof value.configured === "boolean" && typeof value.estimatedCostUsd === "string"
-    && typeof value.costLimitUsd === "string" && typeof value.withinCostLimit === "boolean"
+    && typeof value.configured === "boolean" && (typeof value.estimatedCostUsd === "string" || value.estimatedCostUsd === null)
+    && (typeof value.costLimitUsd === "string" || value.costLimitUsd === null) && typeof value.withinCostLimit === "boolean"
     && typeof value.ready === "boolean" && typeof value.maxDocuments === "number"
     && typeof value.maxRequestsPerDocument === "number" && typeof value.automaticRetries === "number"
     && value.documents.every((document) => isRecord(document) && typeof document.documentId === "string"
@@ -335,7 +337,7 @@ function isMatterAnalysisBatch(value: unknown): value is MatterAnalysisBatch {
   return isRecord(value) && typeof value.batchId === "string" && typeof value.createdAt === "string"
     && ["queued", "running", "completed", "partial"].includes(String(value.status))
     && (typeof value.estimatedCostUsd === "string" || value.estimatedCostUsd === null)
-    && typeof value.costLimitUsd === "string" && isRecord(value.summary)
+    && (typeof value.costLimitUsd === "string" || value.costLimitUsd === null) && isRecord(value.summary)
     && typeof value.summary.total === "number" && typeof value.summary.completed === "number"
     && typeof value.summary.failed === "number" && typeof value.summary.pending === "number"
     && Array.isArray(value.documents) && value.documents.every((document) => isRecord(document)
@@ -371,7 +373,7 @@ function isMatterQuestionStatus(value: unknown): value is MatterQuestionStatus {
 
 function isAIConnectionCheck(value: unknown): value is AIConnectionCheck {
   return isRecord(value)
-    && ["available", "provider_not_configured", "api_key_missing", "authentication_rejected", "permission_denied", "rate_limited", "network_unavailable", "timeout", "provider_error"].includes(String(value.outcome))
+    && ["available", "provider_not_configured", "api_key_missing", "codex_login_required", "authentication_rejected", "permission_denied", "rate_limited", "network_unavailable", "timeout", "provider_error"].includes(String(value.outcome))
     && typeof value.checkedAt === "string";
 }
 
@@ -404,17 +406,27 @@ async function startBackend(storageRoot: string): Promise<void> {
     return backendLaunchPromise ?? Promise.resolve();
   }
   backendLaunchPromise = (async () => {
-    let storedCredential: string | null = null;
+    let preference = null;
     try {
-      storedCredential = await credentialStore().read();
+      preference = await readAIProviderPreference(storageRoot);
     } catch {
-      // A Keychain issue must not prevent offline/local ClaimFlow operation.
-      // The renderer receives a controlled error only for explicit save/remove.
+      console.error("AI provider preference could not be read; using the launch default.");
+    }
+    const selectedProvider = selectedAIProvider(preference, process.env.GROUP_CLAIMS_AI_PROVIDER);
+    let storedCredential: string | null = null;
+    if (selectedProvider === "openai") {
+      try {
+        storedCredential = await credentialStore().read();
+      } catch {
+        // A Keychain issue must not prevent offline/local ClaimFlow operation.
+        // The renderer receives a controlled error only for explicit save/remove.
+      }
     }
     try {
       const launch = app.isPackaged
         ? resolvePackagedBackendLaunch(process.resourcesPath, storageRoot)
         : resolveDevelopmentBackendLaunch(projectRoot, storageRoot);
+      launch.options.env = { ...launch.options.env, GROUP_CLAIMS_AI_PROVIDER: selectedProvider };
       if (storedCredential !== null) {
         launch.options.env = { ...launch.options.env, OPENAI_API_KEY: storedCredential };
       }
@@ -430,7 +442,7 @@ async function startBackend(storageRoot: string): Promise<void> {
   return backendLaunchPromise;
 }
 
-async function restartBackendWithCredential(): Promise<void> {
+async function restartBackend(): Promise<void> {
   backendProcess?.stop();
   backendProcess = undefined;
   await startBackend(app.getPath("userData"));
@@ -500,6 +512,35 @@ app.whenReady().then(() => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid AI status request.");
     try { const backend = await ensureBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.getAIStatus() as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
   });
+  ipcMain.handle(SET_AI_PROVIDER_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AIProviderSelectionResponse> => {
+    if (
+      arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)
+      || !isRecord(payload) || Object.keys(payload).length !== 1 || !isAIProvider(payload.provider)
+    ) throw new Error("Invalid AI provider request.");
+    if (switchingAIProvider) return { ok: false, error: { code: "AI_PROVIDER_SWITCH_IN_PROGRESS", message: "The AI provider is already changing." } };
+    switchingAIProvider = true;
+    try {
+      const backend = await ensureBackend();
+      if (!backend) throw new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.");
+      const currentStatus = await backend.getAIStatus();
+      if (currentStatus.provider === payload.provider) {
+        return { ok: true, ai: currentStatus as AIStatusResponse extends { ok: true; ai: infer T } ? T : never };
+      }
+      // A new provider must never inherit authorization granted to the old one.
+      await backend.setAIAuthorization(false);
+      await saveAIProviderPreference(app.getPath("userData"), payload.provider);
+      await restartBackend();
+      const selectedBackend = await ensureBackend();
+      if (!selectedBackend) throw new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.");
+      const selectedStatus = await selectedBackend.getAIStatus();
+      return { ok: true, ai: selectedStatus as AIStatusResponse extends { ok: true; ai: infer T } ? T : never };
+    } catch (error) {
+      if (error instanceof BackendProcessError) return createBackendHealthFailure(error);
+      return { ok: false, error: { code: "AI_PROVIDER_SWITCH_FAILED", message: "The AI provider could not be changed. Restart ClaimFlow and check Settings." } };
+    } finally {
+      switchingAIProvider = false;
+    }
+  });
   ipcMain.handle(CHECK_AI_CONNECTION_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AIConnectionCheckResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid AI connection check request.");
     try {
@@ -508,6 +549,28 @@ app.whenReady().then(() => {
       const check = await backend.checkAIConnection();
       if (!isAIConnectionCheck(check)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid AI connection information.");
       return { ok: true, check };
+    } catch (error) { return createBackendHealthFailure(error); }
+  });
+  ipcMain.handle(CONNECT_CODEX_CHANNEL, async (event, ...arguments_: unknown[]): Promise<CodexConnectionResponse> => {
+    if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid Codex sign-in request.");
+    try {
+      const backend = await ensureBackend();
+      if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation("ai.codex_connect", {});
+      if (!isRecord(result) || typeof result.authUrl !== "string") throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned an invalid sign-in URL.");
+      const url = new URL(result.authUrl);
+      if (url.protocol !== "https:" || !["chatgpt.com", "auth.openai.com"].includes(url.hostname) || url.username || url.password) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned an invalid sign-in URL.");
+      await shell.openExternal(url.toString());
+      return { ok: true, message: "Complete ChatGPT sign-in in your browser, then return to Settings." };
+    } catch (error) { return createBackendHealthFailure(error); }
+  });
+  ipcMain.handle(DISCONNECT_CODEX_CHANNEL, async (event, ...arguments_: unknown[]): Promise<CodexConnectionResponse> => {
+    if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid Codex sign-out request.");
+    try {
+      const backend = await ensureBackend();
+      if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      await backend.requestDocumentOperation("ai.codex_disconnect", {});
+      return { ok: true, message: "ChatGPT disconnected from ClaimFlow." };
     } catch (error) { return createBackendHealthFailure(error); }
   });
   ipcMain.handle(SET_AI_AUTHORIZATION_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AIStatusResponse> => {
@@ -521,7 +584,7 @@ app.whenReady().then(() => {
     ) throw new Error("Invalid API key request.");
     try {
       await credentialStore().save(payload.apiKey);
-      await restartBackendWithCredential();
+      await restartBackend();
       return { ok: true, credentialPresent: true, message: "API key saved securely in macOS Keychain." };
     } catch (error) {
       return credentialFailure(error);
@@ -531,7 +594,7 @@ app.whenReady().then(() => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid API key removal request.");
     try {
       await credentialStore().remove();
-      await restartBackendWithCredential();
+      await restartBackend();
       return { ok: true, credentialPresent: false, message: "Stored API key removed from macOS Keychain." };
     } catch (error) {
       return credentialFailure(error);
