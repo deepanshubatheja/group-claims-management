@@ -58,6 +58,14 @@ class CodexManager:
                     client_name="claimflow",
                     client_title="ClaimFlow",
                 ))
+            except ModuleNotFoundError as error:
+                if error.name not in {"openai_codex", "codex_cli_bin"}:
+                    raise AIServiceError("CODEX_UNAVAILABLE", "The Codex runtime is unavailable.") from error
+                raise AIServiceError(
+                    "CODEX_UNAVAILABLE",
+                    "Codex support is missing from this build. Reinstall ClaimFlow; developers must install "
+                    "the backend dependencies and rebuild the application.",
+                ) from error
             except Exception as error:
                 raise AIServiceError("CODEX_UNAVAILABLE", "The Codex runtime is unavailable.") from error
         return self._client

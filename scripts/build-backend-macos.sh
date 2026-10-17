@@ -23,6 +23,10 @@ if [[ ! -x "$PYTHON" ]]; then
   print -u2 "Missing backend virtual environment: $PYTHON"
   exit 1
 fi
+if ! "$PYTHON" -c 'import openai_codex, codex_cli_bin' >/dev/null 2>&1; then
+  print -u2 "Missing Codex backend runtime. Install the declared backend dependencies before packaging."
+  exit 1
+fi
 if ! command -v tesseract >/dev/null 2>&1; then
   print -u2 "Tesseract is required on the release-builder Mac to bundle local OCR."
   exit 1
