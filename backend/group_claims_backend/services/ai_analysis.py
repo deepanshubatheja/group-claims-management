@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -24,6 +25,7 @@ from .ai import (
     ProviderResult,
     validate_proposal,
 )
+from .codex import CodexManager, CodexProvider
 from ..storage.service import StorageService
 
 ANALYSIS_PROMPT_VERSION = "document-analysis-v5"
@@ -149,7 +151,7 @@ class QuestionJob:
     actual_cost_estimate_usd: str | None = None
 
 
-ProviderFactory = Callable[[], OpenAIProvider]
+ProviderFactory = Callable[[], OpenAIProvider | CodexProvider]
 
 
 def _now() -> str:
@@ -163,6 +165,7 @@ class AIAnalysisService:
         self,
         storage: StorageService,
         provider_factory: ProviderFactory | None = None,
+        codex_manager: CodexManager | None = None,
     ) -> None:
         if storage.database is None:
             raise AIAnalysisError("STORAGE_UNAVAILABLE", "Local storage is unavailable.")
@@ -170,6 +173,7 @@ class AIAnalysisService:
         self._configuration = AIConfiguration.from_environment()
         self._cost_controls = AICostControls.from_environment(self._configuration.model)
         self._provider_factory = provider_factory
+        self._codex_manager = codex_manager
         self._threads: dict[str, threading.Thread] = {}
         self._question_jobs: dict[str, QuestionJob] = {}
         self._question_lock = threading.Lock()
@@ -210,10 +214,10 @@ class AIAnalysisService:
                 "AI_AUTHORIZATION_REQUIRED",
                 "Enable cloud-processing authorization in Settings before analyzing a document.",
             )
-        if self._configuration.provider != "openai":
-            raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "OpenAI is not configured.")
+        if self._configuration.provider not in {"openai", "codex"}:
+            raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "Cloud AI is not configured.")
         if not self._configuration.credential_configured:
-            raise AIAnalysisError("AI_KEY_MISSING", "OpenAI is not configured.")
+            raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "Connect the selected AI provider in Settings.")
 
         document_id = self._document_id(params)
         document, extraction, plan = self._prepare(document_id)
@@ -246,7 +250,7 @@ class AIAnalysisService:
                         document_id,
                         "user",
                         now,
-                        json.dumps({"provider": "openai", "payload_logged": False}),
+                        json.dumps({"provider": self._configuration.provider, "payload_logged": False}),
                     ),
                 )
                 connection.execute(
@@ -258,7 +262,7 @@ class AIAnalysisService:
                         job_id,
                         document_id,
                         str(extraction["id"]),
-                        "openai",
+                        self._configuration.provider,
                         self._configuration.model,
                         ANALYSIS_PROMPT_VERSION,
                         PROPOSAL_SCHEMA_VERSION,
@@ -285,7 +289,11 @@ class AIAnalysisService:
 
     def _refresh_configuration(self) -> None:
         """Use the current backend-process environment for each explicit action."""
-        self._configuration = AIConfiguration.from_environment()
+        self._configuration = AIConfiguration.from_environment(
+            self._codex_manager.connected()
+            if self._codex_manager is not None and os.environ.get("GROUP_CLAIMS_AI_PROVIDER") == "codex"
+            else False
+        )
         self._cost_controls = AICostControls.from_environment(self._configuration.model)
 
     def job_status(self, params: object) -> Mapping[str, object]:
@@ -386,8 +394,8 @@ class AIAnalysisService:
                 "AI_AUTHORIZATION_REQUIRED",
                 "Enable cloud-processing authorization in Settings before asking about a document.",
             )
-        if self._configuration.provider != "openai" or not self._configuration.credential_configured:
-            raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "OpenAI is not configured.")
+        if self._configuration.provider not in {"openai", "codex"} or not self._configuration.credential_configured:
+            raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "Connect the selected AI provider in Settings.")
         _document, extraction, plan = self._prepare(document_id)
         question_plan = self._question_plan(document_id, str(extraction["id"]), question, plan, follow_up)
         self._require_question_cost_within_limit(question_plan)
@@ -492,7 +500,7 @@ class AIAnalysisService:
             if not citations:
                 raise AIAnalysisError("AI_ANSWER_EVIDENCE_UNSUPPORTED", "The answer did not include supported local evidence.")
             actual_cost = (
-                self._cost_controls.estimate_cost(result.input_tokens, result.output_tokens)
+                self._estimate_cost(result.input_tokens, result.output_tokens)
                 if result.input_tokens is not None and result.output_tokens is not None else None
             )
             with self._question_lock:
@@ -524,6 +532,8 @@ class AIAnalysisService:
     def _new_provider(self, max_output_tokens: int):
         if self._provider_factory is not None:
             return self._provider_factory()
+        if self._configuration.provider == "codex" and self._codex_manager is not None:
+            return CodexProvider(self._codex_manager, self._configuration.model)
         return OpenAIProvider(
             model=self._configuration.model or OPENAI_DEFAULT_MODEL,
             max_output_tokens=max_output_tokens,
@@ -571,7 +581,7 @@ class AIAnalysisService:
                 completed += 1
                 self._update_coverage(job_id, plan, completed, discarded, validation)
             actual_cost = (
-                self._cost_controls.estimate_cost(input_tokens, output_tokens)
+                self._estimate_cost(input_tokens, output_tokens)
                 if usage_complete
                 else None
             )
@@ -759,7 +769,7 @@ class AIAnalysisService:
                 return (f"page {int(block.group(1))} block {int(block.group(2))}", str(row["text"]))
         canonical_reference: str | None = None
         row = connection.execute(
-            "SELECT source_reference, COALESCE(value_text, '') || '\\n' || COALESCE(formula_text, '') AS text "
+            "SELECT source_reference, COALESCE(value_text, '') || char(10) || COALESCE(formula_text, '') AS text "
             "FROM extracted_content WHERE extraction_id = ? AND source_reference = ? COLLATE NOCASE LIMIT 1",
             (extraction_id, source_reference),
         ).fetchone()
@@ -771,7 +781,7 @@ class AIAnalysisService:
                 for letter in csv_reference.group(1).upper():
                     column = column * 26 + ord(letter) - ord("A") + 1
                 row = connection.execute(
-                    "SELECT source_reference, COALESCE(value_text, '') || '\\n' || COALESCE(formula_text, '') AS text "
+                    "SELECT source_reference, COALESCE(value_text, '') || char(10) || COALESCE(formula_text, '') AS text "
                     "FROM extracted_content WHERE extraction_id = ? AND content_kind = 'csv_cell' "
                     "AND row_number = ? AND column_number = ? LIMIT 1",
                     (extraction_id, int(csv_reference.group(2)), column),
@@ -893,7 +903,7 @@ class AIAnalysisService:
             for chunk in chunks
         )
         estimated_output_tokens = self._cost_controls.max_output_tokens * len(chunks)
-        estimated_cost = self._cost_controls.estimate_cost(
+        estimated_cost = self._estimate_cost(
             estimated_input_tokens, estimated_output_tokens
         )
         return AnalysisPlan(
@@ -1018,7 +1028,7 @@ class AIAnalysisService:
         prompt = self._question_prompt(question, citation_key_context, finding_context, source_context, follow_up)
         input_tokens = self._cost_controls.estimate_tokens(len(prompt))
         max_output_tokens = min(MAX_CHAT_OUTPUT_TOKENS, self._cost_controls.max_output_tokens)
-        estimated_cost = self._cost_controls.estimate_cost(input_tokens, max_output_tokens)
+        estimated_cost = self._estimate_cost(input_tokens, max_output_tokens)
         return QuestionPlan(
             context=context,
             citation_keys=tuple(citation_sources),
@@ -1461,6 +1471,15 @@ class AIAnalysisService:
         }
 
     def _question_cost_preview(self, plan: QuestionPlan) -> dict[str, object]:
+        if self._configuration.provider == "codex":
+            return {
+                "estimatedInputTokens": plan.estimated_input_tokens,
+                "maxOutputTokens": 0,
+                "estimatedCostUsd": None,
+                "limitUsd": None,
+                "withinLimit": True,
+                "maxRequestAttempts": 1,
+            }
         within_limit = (
             plan.estimated_cost_usd is not None
             and Decimal(plan.estimated_cost_usd) <= self._cost_controls.max_estimated_cost_usd
@@ -1475,6 +1494,8 @@ class AIAnalysisService:
         }
 
     def _require_question_cost_within_limit(self, plan: QuestionPlan) -> None:
+        if self._configuration.provider == "codex":
+            return
         if plan.estimated_cost_usd is None:
             raise AIAnalysisError("AI_PRICING_UNAVAILABLE", "No pricing profile is configured for the selected AI model.")
         if Decimal(plan.estimated_cost_usd) > self._cost_controls.max_estimated_cost_usd:
@@ -1524,9 +1545,9 @@ class AIAnalysisService:
     def _global_authorized(self) -> bool:
         with self._database.connection() as connection:
             row = connection.execute(
-                "SELECT authorized FROM ai_authorizations ORDER BY occurred_at DESC LIMIT 1"
+                "SELECT authorized, provider FROM ai_authorizations ORDER BY occurred_at DESC LIMIT 1"
             ).fetchone()
-        return row is not None and bool(row["authorized"])
+        return row is not None and row["provider"] == self._configuration.provider and bool(row["authorized"])
 
     @staticmethod
     def _question_params(
@@ -1580,6 +1601,17 @@ class AIAnalysisService:
         return str(params["questionId"])
 
     def _cost_preview(self, plan: AnalysisPlan) -> dict[str, object]:
+        if self._configuration.provider == "codex":
+            return {
+                "estimateMethod": "Codex uses the connected ChatGPT plan; no USD API estimate or output-token cap is available. Input scope remains bounded.",
+                "estimatedInputTokens": plan.estimated_input_tokens,
+                "maxOutputTokens": 0,
+                "estimatedCostUsd": None,
+                "limitUsd": None,
+                "withinLimit": True,
+                "maxRequests": self._cost_controls.max_chunks,
+                "maxRequestAttempts": 1,
+            }
         estimated_cost = plan.estimated_cost_usd
         within_limit = (
             estimated_cost is not None
@@ -1598,6 +1630,8 @@ class AIAnalysisService:
         }
 
     def _require_cost_within_limit(self, plan: AnalysisPlan) -> None:
+        if self._configuration.provider == "codex":
+            return
         estimated = plan.estimated_cost_usd
         if estimated is None:
             raise AIAnalysisError(
@@ -1616,6 +1650,11 @@ class AIAnalysisService:
             return None
         return format(value.quantize(Decimal("0.000001")), "f")
 
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> Decimal | None:
+        if self._configuration.provider == "codex":
+            return None
+        return self._cost_controls.estimate_cost(input_tokens, output_tokens)
+
     def _latest_job(self, document_id: str) -> Mapping[str, object] | None:
         with self._database.connection() as connection:
             row = connection.execute(
@@ -1625,8 +1664,8 @@ class AIAnalysisService:
             ).fetchone()
         return self.job_status({"jobId": str(row["id"])}) if row is not None else None
 
-    @staticmethod
     def _coverage(
+        self,
         plan: AnalysisPlan,
         completed: int,
         discarded: int,
@@ -1644,7 +1683,7 @@ class AIAnalysisService:
             "includedCharacters": plan.included_characters,
             "excludedCharacters": plan.excluded_characters,
             "estimatedInputTokens": plan.estimated_input_tokens,
-            "maxOutputTokens": plan.estimated_output_tokens,
+            "maxOutputTokens": 0 if self._configuration.provider == "codex" else plan.estimated_output_tokens,
             "truncated": plan.truncated,
             "discardedUnsupportedEvidence": discarded,
             "providerRequestStatus": request_status,
@@ -1680,7 +1719,7 @@ class AIAnalysisService:
         validation: ProposalValidationSummary,
     ) -> None:
         actual_cost = (
-            self._cost_controls.estimate_cost(input_tokens, output_tokens)
+            self._estimate_cost(input_tokens, output_tokens)
             if usage_complete and completed > 0
             else None
         )

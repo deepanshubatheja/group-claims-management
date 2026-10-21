@@ -11,6 +11,7 @@ from .services.health import get_health_status
 from .services.document_import import DocumentImportError, DocumentImportService
 from .services.ai import AIService, AIServiceError
 from .services.ai_analysis import AIAnalysisError, AIAnalysisService
+from .services.codex import CodexManager
 from .services.matter_review import MatterReviewError, MatterReviewService
 from .storage.service import StorageService
 
@@ -43,8 +44,9 @@ def main(
         return wrapped
     try:
         documents = DocumentImportService(storage)
-        ai = AIService(storage)
-        analysis = AIAnalysisService(storage)
+        codex = CodexManager(storage.paths.root) if storage.paths is not None else None
+        ai = AIService(storage, codex_manager=codex)
+        analysis = AIAnalysisService(storage, codex_manager=codex)
         matter_review = MatterReviewService(storage, analysis)
         commands = {
             "health.check": no_params(get_health_status), "storage.status": no_params(storage.status),
@@ -61,6 +63,8 @@ def main(
             # The connection-check service validates the empty mapping itself;
             # unlike status(), it intentionally accepts the protocol params.
             "ai.check_connection": ai.check_connection,
+            "ai.codex_connect": ai.codex_connect,
+            "ai.codex_disconnect": ai.codex_disconnect,
             "ai.set_authorization": ai.set_authorization,
             "ai.analysis_preview": analysis.preview,
             "ai.analyze_document": analysis.start,
@@ -83,8 +87,12 @@ def main(
     server = ProtocolServer(
         commands
     )
-    server.serve(
-        stdin if stdin is not None else sys.stdin.buffer,
-        stdout if stdout is not None else sys.stdout.buffer,
-    )
+    try:
+        server.serve(
+            stdin if stdin is not None else sys.stdin.buffer,
+            stdout if stdout is not None else sys.stdout.buffer,
+        )
+    finally:
+        if "codex" in locals() and codex is not None:
+            codex.close()
     return 0

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .document_search import DocumentSearchIndex
 from ..storage.documents import DocumentMetadataRepository, DocumentRecord
 from ..storage.service import StorageService
 from ..storage.vault import VaultImportError, VaultStorageError
@@ -242,11 +243,11 @@ class DeterministicDocumentParser:
         a page-level fallback, never a replacement for usable native text.
         """
         try:
-            import fitz
+            import pymupdf
         except ImportError:
             self._require("PyMuPDF")
         try:
-            document = fitz.open(path)
+            document = pymupdf.open(path)
         except Exception as error:
             raise DocumentImportError("INVALID_PDF", "The PDF could not be read.") from error
         try:
@@ -354,7 +355,9 @@ class DeterministicDocumentParser:
             return PdfPageExtraction(page_number, "unavailable", None, None,
                 "Neither English nor German Tesseract language data is available.", None, version, None, ())
         try:
-            matrix = __import__("fitz").Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
+            from pymupdf import Matrix
+
+            matrix = Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)  # type: ignore[attr-defined]
             if pixmap.width * pixmap.height > MAX_OCR_PIXELS:
                 raise DocumentImportError("OCR_PAGE_TOO_LARGE", "A PDF page exceeds the safe OCR rendering limit.")
@@ -509,6 +512,9 @@ class DocumentImportService:
                 (document.id,),
             )
             connection.execute("DELETE FROM ai_processing_jobs WHERE source_document_id = ?", (document.id,))
+            # The search index holds a derived copy of extracted text; remove
+            # it with the extraction rows so no removed content stays searchable.
+            DocumentSearchIndex.remove_document(connection, document.id)
             connection.execute(
                 "DELETE FROM pdf_text_blocks WHERE pdf_page_extraction_id IN ("
                 "SELECT p.id FROM pdf_page_extractions p JOIN document_extractions e ON e.id = p.extraction_id "

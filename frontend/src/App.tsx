@@ -12,6 +12,7 @@ function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [activePage, setActivePage] = useState<WorkspacePage>("Dashboard");
   const [requestedDocumentId, setRequestedDocumentId] = useState<string | null>(null);
+  const [requestedSource, setRequestedSource] = useState<{ documentId: string; sourceReference: string } | null>(null);
 
   useEffect(() => {
     let isCurrent = true;
@@ -27,6 +28,12 @@ function App() {
 
   const openDocument = (documentId: string) => {
     setRequestedDocumentId(documentId);
+    setRequestedSource(null);
+    setActivePage("Documents");
+  };
+  const openSource = (documentId: string, sourceReference: string) => {
+    setRequestedDocumentId(documentId);
+    setRequestedSource({ documentId, sourceReference });
     setActivePage("Documents");
   };
   const openDocuments = () => {
@@ -49,8 +56,8 @@ function App() {
     </aside>
     <main className="main-content">
       {activePage === "Dashboard" && <DashboardScreen onOpenDocument={openDocument} onViewDocuments={openDocuments} />}
-      {activePage === "Documents" && <DocumentsScreen requestedDocumentId={requestedDocumentId} onRequestedDocumentHandled={() => setRequestedDocumentId(null)} />}
-      <div hidden={activePage !== "Matter Review"}><MatterReviewScreen isActive={activePage === "Matter Review"} /></div>
+      {activePage === "Documents" && <DocumentsScreen requestedDocumentId={requestedDocumentId} onRequestedDocumentHandled={() => setRequestedDocumentId(null)} citedSource={requestedSource} onCloseCitedSource={() => setRequestedSource(null)} />}
+      <div hidden={activePage !== "Matter Review"}><MatterReviewScreen isActive={activePage === "Matter Review"} onOpenSource={openSource} /></div>
       {activePage === "Settings" && <SettingsScreen appInfo={appInfo} desktopState={connectionState} />}
     </main>
   </div>;

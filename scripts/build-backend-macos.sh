@@ -23,6 +23,10 @@ if [[ ! -x "$PYTHON" ]]; then
   print -u2 "Missing backend virtual environment: $PYTHON"
   exit 1
 fi
+if ! "$PYTHON" -c 'import openai_codex, codex_cli_bin' >/dev/null 2>&1; then
+  print -u2 "Missing Codex backend runtime. Install the declared backend dependencies before packaging."
+  exit 1
+fi
 if ! command -v tesseract >/dev/null 2>&1; then
   print -u2 "Tesseract is required on the release-builder Mac to bundle local OCR."
   exit 1
@@ -36,6 +40,7 @@ fi
   --specpath "$BACKEND_ROOT/build" --collect-all group_claims_backend \
   --collect-all fitz --collect-all PIL --collect-all openpyxl --collect-all xlrd \
   --collect-all pypdf --collect-all pytesseract --collect-all openai \
+  --collect-all openai_codex --collect-all codex_cli_bin \
   "$BACKEND_ROOT/claimflow_backend_entry.py"
 
 TESSERACT_BIN="$(command -v tesseract)"

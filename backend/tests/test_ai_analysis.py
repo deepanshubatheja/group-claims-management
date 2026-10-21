@@ -569,6 +569,15 @@ class AIAnalysisServiceTests(unittest.TestCase):
             service.start({"documentId": self.document_id, "acknowledged": True})
         self.assertEqual(self.provider.calls, [])
 
+    def test_selected_provider_must_match_cloud_authorization(self):
+        self.authorize()
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "codex"
+        service = self.service([self.proposal()])
+        self.assertFalse(service.preview({"documentId": self.document_id})["globalAuthorization"])
+        with self.assertRaisesRegex(AIAnalysisError, "Enable cloud-processing"):
+            service.start({"documentId": self.document_id, "acknowledged": True})
+        self.assertEqual(self.provider.calls, [])
+
     def test_authorized_analysis_persists_only_evidence_validated_proposals(self):
         self.authorize()
         service = self.service([self.proposal()])
@@ -869,6 +878,39 @@ class AIAnalysisServiceTests(unittest.TestCase):
         )
         self.assertEqual(len(plan.chunks), 8)
         self.assertFalse(plan.truncated)
+
+    def test_codex_preview_and_job_keep_consent_and_do_not_claim_usd_pricing(self):
+        class ConnectedCodex:
+            def connected(self):
+                return True
+
+        os.environ["GROUP_CLAIMS_AI_PROVIDER"] = "codex"
+        os.environ.pop("OPENAI_API_KEY", None)
+        self.provider = SyntheticProvider([])
+        service = AIAnalysisService(
+            self.storage,
+            provider_factory=lambda: self.provider,
+            codex_manager=ConnectedCodex(),
+        )
+        preview = service.preview({"documentId": self.document_id})
+        self.assertEqual(preview["provider"], "codex")
+        self.assertTrue(preview["configured"])
+        self.assertIsNone(preview["cost"]["estimatedCostUsd"])
+        self.assertIsNone(preview["cost"]["limitUsd"])
+        with self.assertRaises(AIAnalysisError):
+            service.start({"documentId": self.document_id, "acknowledged": True})
+        AIService(self.storage, codex_manager=ConnectedCodex()).set_authorization(
+            {"authorized": True, "acknowledged": True}
+        )
+        with self.assertRaises(AIAnalysisError):
+            service.start({"documentId": self.document_id})
+        job = service.start({"documentId": self.document_id, "acknowledged": True})
+        self.assertEqual(job["provider"], "codex")
+        self.assertIsNone(job["usage"]["estimatedCostUsd"])
+        worker = service._threads.get(job["jobId"])
+        if worker is not None:
+            worker.join(timeout=2)
+        self.assertEqual(len(self.provider.calls), 1)
 
 
 class CsvProvenanceTests(unittest.TestCase):

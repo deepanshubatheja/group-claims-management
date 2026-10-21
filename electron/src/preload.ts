@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionFollowUp, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIProviderSelectionResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionRequest, MatterQuestionSubmission, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
@@ -7,10 +7,28 @@ const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
 const GET_AI_STATUS_CHANNEL = "app:get-ai-status" as const;
+const SET_AI_PROVIDER_CHANNEL = "app:set-ai-provider" as const;
 const CHECK_AI_CONNECTION_CHANNEL = "app:check-ai-connection" as const;
 const SET_AI_AUTHORIZATION_CHANNEL = "app:set-ai-authorization" as const;
 const SAVE_AI_API_KEY_CHANNEL = "app:save-ai-api-key" as const;
 const REMOVE_AI_API_KEY_CHANNEL = "app:remove-ai-api-key" as const;
+const CONNECT_CODEX_CHANNEL = "app:connect-codex" as const;
+const DISCONNECT_CODEX_CHANNEL = "app:disconnect-codex" as const;
+
+/** Copy only the scoped request fields; Electron main and Python validate them again. */
+function matterQuestionPayload(request: MatterQuestionRequest): MatterQuestionRequest {
+  const scope = request.scope;
+  const question = request.question.trim();
+  if (!/^[a-z0-9-]{1,64}$/.test(request.matterId) || !question || question.length > 600) throw new Error("Invalid matter question.");
+  if (scope.mode === "selected" && (!Array.isArray(scope.documentIds) || scope.documentIds.length < 1 || scope.documentIds.length > 20 || !scope.documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)))) throw new Error("Select between one and 20 valid documents.");
+  if (request.followUpQuestionId !== undefined && !/^[a-f0-9-]{36}$/i.test(request.followUpQuestionId)) throw new Error("Invalid follow-up reference.");
+  return {
+    matterId: request.matterId,
+    scope: scope.mode === "all" ? { mode: "all" } : { mode: "selected", documentIds: [...scope.documentIds] },
+    question,
+    ...(request.followUpQuestionId !== undefined ? { followUpQuestionId: request.followUpQuestionId } : {}),
+  };
+}
 
 function documentQuestionFollowUpPayload(followUp: DocumentQuestionFollowUp): DocumentQuestionFollowUp {
   return Object.freeze({
@@ -182,6 +200,12 @@ const desktopApi = Object.freeze({
     return Object.freeze(response);
   },
   async getAIStatus(): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(GET_AI_STATUS_CHANNEL) as AIStatusResponse); },
+  async setAIProvider(provider: "codex" | "openai"): Promise<AIProviderSelectionResponse> {
+    if (provider !== "codex" && provider !== "openai") throw new Error("Invalid AI provider.");
+    return Object.freeze(await ipcRenderer.invoke(SET_AI_PROVIDER_CHANNEL, { provider }) as AIProviderSelectionResponse);
+  },
+  async connectCodex() { return Object.freeze(await ipcRenderer.invoke(CONNECT_CODEX_CHANNEL)); },
+  async disconnectCodex() { return Object.freeze(await ipcRenderer.invoke(DISCONNECT_CODEX_CHANNEL)); },
   async checkAIConnection(): Promise<AIConnectionCheckResponse> { return Object.freeze(await ipcRenderer.invoke(CHECK_AI_CONNECTION_CHANNEL) as AIConnectionCheckResponse); },
   async setAIAuthorization(authorized: boolean): Promise<AIStatusResponse> { return Object.freeze(await ipcRenderer.invoke(SET_AI_AUTHORIZATION_CHANNEL, { authorized }) as AIStatusResponse); },
   async saveAIApiKey(apiKey: string): Promise<AICredentialResponse> {
@@ -244,15 +268,15 @@ const desktopApi = Object.freeze({
     if (!/^[a-f0-9-]{36}$/i.test(batchId)) throw new Error("Invalid batch analysis reference.");
     return Object.freeze(await ipcRenderer.invoke(GET_MATTER_ANALYSIS_BATCH_STATUS_CHANNEL, { batchId }) as MatterAnalysisBatchResponse);
   },
-  async previewMatterQuestion(documentIds: string[], question: string, followUp?: MatterQuestionFollowUp): Promise<MatterQuestionPreviewResponse> {
-    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)) || !question.trim() || question.length > 600) throw new Error("Select up to 20 valid documents for a consolidated question.");
-    if (followUp && (!followUp.question.trim() || followUp.question.length > 600 || !followUp.answer.trim() || followUp.answer.length > 1200)) throw new Error("The earlier answer is not available for a follow-up.");
-    return Object.freeze(await ipcRenderer.invoke(PREVIEW_MATTER_QUESTION_CHANNEL, { documentIds: [...documentIds], question: question.trim(), ...(followUp ? { followUp: { question: followUp.question.trim(), answer: followUp.answer.trim() } } : {}) }) as MatterQuestionPreviewResponse);
+  async previewMatterQuestion(request: MatterQuestionRequest): Promise<MatterQuestionPreviewResponse> {
+    return Object.freeze(await ipcRenderer.invoke(PREVIEW_MATTER_QUESTION_CHANNEL, matterQuestionPayload(request)) as MatterQuestionPreviewResponse);
   },
-  async askMatterQuestion(documentIds: string[], question: string, followUp?: MatterQuestionFollowUp): Promise<MatterQuestionResponse> {
-    if (!Array.isArray(documentIds) || documentIds.length < 1 || documentIds.length > 20 || !documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)) || !question.trim() || question.length > 600) throw new Error("Select up to 20 valid documents for a consolidated question.");
-    if (followUp && (!followUp.question.trim() || followUp.question.length > 600 || !followUp.answer.trim() || followUp.answer.length > 1200)) throw new Error("The earlier answer is not available for a follow-up.");
-    return Object.freeze(await ipcRenderer.invoke(ASK_MATTER_QUESTION_CHANNEL, { documentIds: [...documentIds], question: question.trim(), acknowledged: true, ...(followUp ? { followUp: { question: followUp.question.trim(), answer: followUp.answer.trim() } } : {}) }) as MatterQuestionResponse);
+  async askMatterQuestion(submission: MatterQuestionSubmission): Promise<MatterQuestionResponse> {
+    const consented = submission.consentedDocumentIds;
+    if (!Array.isArray(consented) || consented.length > 10_000 || !consented.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Invalid document consent list.");
+    return Object.freeze(await ipcRenderer.invoke(ASK_MATTER_QUESTION_CHANNEL, {
+      ...matterQuestionPayload(submission), acknowledged: true, consentedDocumentIds: [...consented],
+    }) as MatterQuestionResponse);
   },
   async getMatterQuestionStatus(questionId: string): Promise<MatterQuestionResponse> {
     if (!/^[a-f0-9-]{36}$/i.test(questionId)) throw new Error("Invalid consolidated question reference.");

@@ -74,6 +74,24 @@ Set-Location backend
 
 ## Phase 6.2 OpenAI provider and document-analysis setup
 
+For the current desktop build, the default provider is Codex. Settings lets you
+switch between **Codex (ChatGPT sign-in)** and **OpenAI API key**. The choice is
+saved as `ai-provider.json` in the per-user ClaimFlow app-data directory; it
+takes precedence over `GROUP_CLAIMS_AI_PROVIDER`, which remains a development
+fallback when no choice has been saved. Switching providers turns Cloud AI
+authorization off, so enable it again for the newly selected provider. Each
+document analysis or question still requires its own explicit action and sends
+bounded extracted text, never the original file. The Codex route uses the
+pinned `openai-codex` SDK and the OS keyring; no OpenAI API key is
+needed for this route. Your ChatGPT plan's Codex usage limits apply. No USD
+API cost estimate or output-token cap is available for Codex. Browser login
+requires a working localhost callback and may be restricted by your account
+or workspace policy.
+
+This login method is for local single-user/internal use only. A commercial or
+hosted distribution needs the official Sign in with ChatGPT flow instead of
+app-server managed authentication.
+
 The OpenAI provider is installed only in the backend virtual environment and is
 never called during backend startup. Install declared dependencies from the
 repository root:
@@ -82,9 +100,9 @@ repository root:
 backend/.venv/bin/python -m pip install -e backend
 ```
 
-For a local development session, supply credentials through the process
-environment (or an OS secret manager that exports it), never source code,
-SQLite, or Electron configuration:
+For a local development session without a saved Settings choice, supply
+credentials through the process environment (or an OS secret manager that
+exports it), never source code, SQLite, or Electron configuration:
 
 ```sh
 export OPENAI_API_KEY="your-key"
