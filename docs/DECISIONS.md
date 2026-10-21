@@ -331,3 +331,199 @@ small per-user app-data file. A saved choice overrides the development
 cloud-processing authorization is withdrawn before the new provider is used;
 the user must enable it again for the selected provider. Credentials remain in
 their existing OS-protected stores and are never copied into this settings file.
+
+## 2026-10-21 — Explicitly scoped Matter Review questions
+
+ClaimFlow has no separate matter table: the single-user local workspace is one
+implicit matter with the fixed identifier `workspace`. Every Matter Review
+question now names that matter and an explicit scope: **all documents in this
+matter** (the default, requiring no selection) or **selected documents only**.
+Python validates the matter, resolves all-document scope from `source_documents`
+itself, rejects any selected ID that is not a matter document, and never widens
+an empty selection to all documents. Scope is resolved before any retrieval,
+context preparation, or provider request. A real matters model, if approved,
+would replace only this resolution step.
+
+Retrieval no longer depends on a completed per-document AI review or on the
+first 2,400 extracted rows. A derived SQLite FTS5 index (trigram tokenizer, so
+existing case-insensitive substring rules and German compounds still match)
+covers each document's current parsed extraction: spreadsheet/CSV cells and
+PDF text blocks (page-level rows only for legacy page-only PDFs). It is built
+lazily on the first scoped question, pruned when a document is reparsed, and
+deleted with the document. It stores a copy of extracted text in the local
+database, like the extraction tables it derives from; it is never evidence by
+itself. Hits are interleaved across documents, capped (40 per document, 400
+total), filtered by the unchanged relevance rules, and every candidate is
+re-resolved against `extracted_content`/`pdf_text_blocks` before it can be
+sent or cited. Short cells and blocks carry bounded neighbouring row/block
+context. Existing input-character, token, cost, one-request, and zero-retry
+limits are unchanged; partial coverage, unsearchable documents (not parsed,
+failed, unsupported, no text), and incomplete OCR pages are reported rather
+than implied to have been examined. Earlier AI review summaries/findings are
+used only when produced from the document's current extraction.
+
+Consent is document-specific. The local preview lists every document whose
+excerpts would be transmitted and whether it was already authorized for the
+current provider since cloud processing was last enabled (a prior document
+analysis or matter question). New documents require an explicit checkbox; the
+ask request must name all transmitted documents, and Python rejects it if the
+evidence set changed. Each consent is audited per document without content.
+Follow-ups reference an earlier backend-held turn by ID; React can no longer
+supply previous question/answer text. A follow-up is refused when that turn's
+source documents fall outside the new scope, so narrowing the scope cannot
+carry excerpts from excluded documents into a new request. Questions and
+answers remain in memory only. Answers carry their scope label, citations are
+grouped by document and open the cited cell or PDF block in the Documents
+viewer, and the prompt asks the model to surface disagreements between
+documents with one citation from each rather than choosing a source. The
+provider contract still allows at most two citations per answer.
+
+## 2026-10-21 — Question intent routing and local entity inventories
+
+A listing question such as "list all investors, investment vehicles, and
+subfunds" was answered from at most ~3 excerpts: the fixed instructions use
+about 2,800 of the 4,000-character development request ceiling. The word
+"across" also routed it as a comparison, so its incomplete coverage replaced
+the provider answer with a generic cited fallback. The general term extractor
+kept filler words ("documents", "uploaded") and plural forms that do not
+match singular labels.
+
+Matter Review now classifies each question deterministically (calculation,
+status/change, comparison, inventory, specific lookup, general) to choose a
+retrieval strategy only. Inventory questions (a listing cue and a role noun)
+are answered locally without a provider request or cost: every eligible
+in-scope document's indexed extraction is examined for explicit role
+evidence — spreadsheet column headings, "Role: name" labels, "X, a sub-fund of
+Y" wording — plus earlier evidence-validated AI review names, which keep
+their broader provisional type. Names merge only when identical apart from
+case, spacing, and surrounding punctuation. Same-row values are shown as an
+association, never as ownership, legal personality, claimant status, or an
+invoicing relationship. Conflicting role evidence stays unresolved. Unlabelled
+organisation names are not classified. Local scan limits (hits, table rows,
+cells, listed entities) are reported as partial coverage. Specific lookups
+search their literal identifiers; comparisons take one excerpt per document
+first. The general path drops filler words and plural suffixes. Paid-request
+limits are unchanged.
+
+Extraction-cell evidence text previously ended with a literal "\n" because
+SQLite does not interpret that escape; it now uses a real newline, so cited
+spreadsheet snippets display the stored value exactly.
+
+## 2026-10-21 — Explicit document constraints, relationships, and dated holdings comparisons
+
+Two live questions naming the March 28 and April 30 holdings workbooks were
+answered from an unrelated email and a PDF address block. Both were routed as
+"status/change" because the change keyword list matches "holdings" (and
+"difference"); that path replaced the question's own terms with ~55 generic
+change words, ignored the named files and funds, and had no relevance check,
+so high-overlap PDFs filled the bounded prompt.
+
+Questions that name documents by exact file name, or by a date together with a
+document word ("spreadsheets dated March 28"), now resolve those documents from
+the matter's stored file names and formats only; dates are not inferred from
+content. The references only narrow the authorized scope; an excluded, missing,
+or ambiguous reference produces a local clarification and nothing is sent.
+
+Intent precedence is: pro-rata calculation, legal claim status, dated holdings
+comparison, entity relationship mapping, inventory, change/transfer analysis,
+comparison, exact identifier lookup, general. Relationship questions are
+answered locally: each pairing shows the exact cells of both names and is
+labelled as an explicit statement, an explicit relationship heading (e.g.
+"Umbrella fund"), or a same-row association that documents no legal
+relationship. Dated holdings comparisons are calculated locally with `Decimal`
+from header-identified ISIN/quantity/unit/account columns of exactly two
+spreadsheets ordered by file-name date. Rows match only on identical entity,
+account and ISIN; duplicates are not summed; formula cells (stored without a
+calculated value), ambiguous number formats, ambiguous quantity headings, and
+unit mismatches are reported with their cells instead of calculated. A quantity
+difference is never presented as a trade, transfer, or change in claim rights.
+
+On the provider path, capitalised names and identifiers in the question must
+appear in each excerpt, its spreadsheet row, or a heading row above it before
+it can be sent; names absent from the scope produce a targeted local answer. A
+follow-up borrows the earlier question's wording for retrieval only when it
+names no documents, entities or identifiers of its own, and an earlier answer
+is dropped as context when it relied on documents outside those the new
+question names.
+
+## 2026-10-22 — Primary operation routing, holdings control totals and separate legal caveats
+
+Legal-status and billing keyword rules are evaluated on the question without
+its caveat requests and negative instructions ("include legal-transfer
+caveats", "must not be treated as an assignment of legal claim rights"), so
+wording that only qualifies the answer no longer selects the route. An
+explicit quantitative holdings comparison (compare / differences / quantities
+on both dates) is the primary operation even when the question also asks a
+legal question; that part is declined in a separate caveat instead of being
+answered from the comparison. Affirmative legal questions still route to legal
+claim status.
+
+The dated holdings comparison reads complete rows under their header (cell
+references for every column), recognises an "Eligible nominal amount"-style
+quantity heading, a separate currency column, a sheet-level "Investor / legal
+entity" label and an "As of date" label (a disagreement with the file-name
+date is reported, not resolved). A control-total row is checked against the
+exact `Decimal` total of the table's own record rows; a `=SUM(...)` formula
+without a stored result is reported as covering exactly those rows only when
+its range equals them. Column totals are shown only for one ISIN, currency and
+unit. Legal wording elsewhere in the sheet is returned only as a cited caveat,
+never as a holding value. A question that names documents still only narrows
+the authorized scope, and the answer's scope label now says so.
+
+## 2026-10-22 — Answer-first Matter Review presentation
+
+Matter Review answers render from the typed payloads Python already returns,
+through one presentation model (`answer-presentation.ts`) and one card
+(`MatterAnswer.tsx`): conclusion → structured result (holdings metrics and
+table, entity or relationship table) → material warnings → short legal
+limitations (with any caveat the source itself states) → collapsible
+supporting evidence grouped by document and row/page → collapsible technical
+details (ranges, formulas, date bases, scope mechanics, plain-text summary).
+Nothing is parsed out of answer prose; for structured answers the backend's
+narrative is kept only in technical details so values are not shown twice.
+Quantities are display-formatted from the exact decimal strings (grouping,
+padding to one precision, true minus sign) and never rounded; values the
+backend could not use are shown verbatim. Differences are styled neutrally and
+no currency symbol is added to nominal amounts. Model and document text is
+rendered as React text; no Markdown or HTML rendering was added. A holdings
+answer states directly that the compared spreadsheets do not establish legal
+claim status instead of telling the user to ask again.
+
+## 2026-10-22 — Section-level investor associations and grounded legal-rights answers
+
+A spreadsheet label cell whose row holds only that label and one value
+(e.g. "Investor / legal entity" | "Northstar Investors LP") is read as a
+labelled value. When an investor label directly precedes a table of subfund
+rows (no other table header in between, no investor column of its own), each
+subfund is paired with that investor as a "document_section" association,
+citing both cells. It is presented as a documented association in the source
+layout, never as ownership, separate legal personality, claimant status or
+invoicing responsibility.
+
+Earlier AI review summaries and findings now pass the named-entity relevance
+gate only on the source text they cite, so a summary that names a fund but
+cites an unrelated cell (a sheet title) is no longer sent or cited. A
+legal-status question that refers to recorded holding movements, with exactly
+two holdings spreadsheets in scope, gets the dated quantity rows from a local
+`Decimal` comparison as primary evidence and the spreadsheets' own caveat as
+supporting context. If those are the only documents in scope and they contain
+no other rights-related wording, the answer is local; otherwise the holdings
+record is pinned first in the provider context (other evidence, such as an
+assignment notice, follows), and the dated cells are cited with the answer.
+
+## 2026-10-22 — Requested entities and control-total reconciliation in holdings comparisons
+
+A holdings comparison now takes its requested entities from the names actually
+present in the scoped spreadsheets that appear in the question; capitalised
+question text is used only for the remainder. A full stop ends an extracted
+name (except after a title such as "No." or "St."). Shorthand such as "Fund A"
+resolves only to the single name ending with those words (preferring names the
+question already gave); otherwise it is reported as ambiguous or, when it reads
+like an entity name, as missing, and the comparison is marked incomplete.
+Every requested entity is listed with how it matched and its position count.
+
+Comparison totals are labelled as full holdings totals only when the compared
+rows are every record row of both tables. A source control total is shown as
+reconciling the comparison only when it covers exactly the compared rows and
+its record total equals their exact `Decimal` total; otherwise it is reported
+as checking its own rows only, or as failed.

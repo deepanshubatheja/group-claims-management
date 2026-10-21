@@ -35,11 +35,12 @@ import {
   type DocumentQuestionPreviewResponse, type DocumentQuestionStartResponse, type DocumentQuestionStatusResponse,
   type DocumentQuestionPreview, type DocumentQuestionStatus, type DocumentQuestionFollowUp,
   type MatterReviewResponse, type MatterAnalysisBatchPreviewResponse, type MatterAnalysisBatchResponse,
-  type MatterQuestionPreviewResponse, type MatterQuestionResponse, type MatterQuestionFollowUp,
+  type MatterQuestionPreviewResponse, type MatterQuestionResponse,
   type BillingPreviewResponse, type MatterReviewResult, type MatterAnalysisBatchPreview, type MatterAnalysisBatch, type MatterQuestionPreview, type MatterQuestionStatus, type BillingPreviewResult,
   type DocumentImportResponse, type DocumentRemoveResponse,
 } from "./ipc-contract";
 import { discoverDroppedImportableFiles, discoverImportableFiles, type AuthorizedFolderFile, type FolderDiscovery } from "./folder-import";
+import { isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "./matter-question";
 
 const MAX_IMPORT_FILE_BYTES = 50 * 1024 * 1024;
 const supportedExtensions = new Set([".xlsx", ".xls", ".csv", ".pdf"]);
@@ -351,12 +352,15 @@ function isMatterQuestionPreview(value: unknown): value is MatterQuestionPreview
   return isRecord(value) && (typeof value.provider === "string" || value.provider === null)
     && (typeof value.model === "string" || value.model === null)
     && typeof value.globalAuthorization === "boolean" && typeof value.configured === "boolean"
-    && typeof value.localOnly === "boolean"
-    && isQuestionScope(value.scope) && isQuestionCost(value.cost);
+    && typeof value.localOnly === "boolean" && isMatterQuestionIntent(value.intent)
+    && isQuestionScope(value.scope) && isMatterDocumentScope(value.documentScope) && isQuestionCost(value.cost);
 }
 
 function isMatterQuestionStatus(value: unknown): value is MatterQuestionStatus {
-  return isRecord(value) && typeof value.questionId === "string"
+  return isRecord(value) && typeof value.questionId === "string" && typeof value.matterId === "string"
+    && isMatterDocumentScope(value.documentScope) && isMatterQuestionIntent(value.intent)
+    && (value.inventory === null || isMatterEntityInventory(value.inventory))
+    && (value.holdingsComparison === null || isMatterHoldingsComparison(value.holdingsComparison))
     && ["queued", "running", "completed", "failed"].includes(String(value.status))
     && (typeof value.answer === "string" || value.answer === null) && typeof value.unknown === "boolean"
     && Array.isArray(value.citations) && value.citations.every((citation) => isRecord(citation)
@@ -726,21 +730,6 @@ app.whenReady().then(() => {
     if (ids.length < 1 || ids.length > 20 || !ids.every((id) => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id)) || new Set(ids).size !== ids.length) return undefined;
     return [...ids];
   };
-  const matterQuestionRequest = (payload: unknown, acknowledgement: boolean): { documentIds: string[]; question: string; followUp?: MatterQuestionFollowUp } | undefined => {
-    if (!isRecord(payload) || !Array.isArray(payload.documentIds) || typeof payload.question !== "string" || !payload.question.trim() || payload.question.length > 600) return undefined;
-    const allowedKeys = acknowledgement ? new Set(["documentIds", "question", "acknowledged", "followUp"]) : new Set(["documentIds", "question", "followUp"]);
-    if (Object.keys(payload).some((key) => !allowedKeys.has(key))) return undefined;
-    if (acknowledgement && payload.acknowledged !== true) return undefined;
-    const ids = payload.documentIds;
-    if (ids.length < 1 || ids.length > 20 || !ids.every((id) => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id)) || new Set(ids).size !== ids.length) return undefined;
-    const documentIds = [...ids];
-    const followUp = payload.followUp;
-    if (followUp !== undefined && (!isRecord(followUp) || Object.keys(followUp).length !== 2 || typeof followUp.question !== "string" || typeof followUp.answer !== "string" || !followUp.question.trim() || followUp.question.length > 600 || !followUp.answer.trim() || followUp.answer.length > 1200)) return undefined;
-    const validatedFollowUp = followUp === undefined ? undefined : {
-      question: (followUp.question as string).trim(), answer: (followUp.answer as string).trim(),
-    };
-    return { documentIds, question: payload.question.trim(), ...(validatedFollowUp ? { followUp: validatedFollowUp } : {}) };
-  };
   const billingPreviewRequest = (payload: unknown): { feePool: string; currency: string; rows: Array<{ id: string; label: string; eligibleAmount: string }> } | undefined => {
     if (!isRecord(payload) || Object.keys(payload).length !== 3 || typeof payload.feePool !== "string" || typeof payload.currency !== "string" || !Array.isArray(payload.rows)) return undefined;
     if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$/.test(payload.feePool) || !/^[A-Z]{3}$/.test(payload.currency) || payload.rows.length < 1 || payload.rows.length > 50) return undefined;
@@ -798,7 +787,7 @@ app.whenReady().then(() => {
     try {
       const backend = await ensureBackend();
       if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
-      const preview = await backend.requestDocumentOperation("matter.question_preview", request);
+      const preview = await backend.requestDocumentOperation("matter.question_preview", { ...request });
       if (!isMatterQuestionPreview(preview)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid consolidated question data.");
       return { ok: true, preview };
     } catch (error) { return documentFailure(error); }

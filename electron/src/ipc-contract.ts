@@ -144,13 +144,55 @@ export interface MatterAnalysisBatch { batchId: string; createdAt: string; statu
 export type MatterAnalysisBatchPreviewResponse = { ok: true; preview: MatterAnalysisBatchPreview } | DocumentOperationFailure;
 export type MatterAnalysisBatchResponse = { ok: true; batch: MatterAnalysisBatch } | DocumentOperationFailure;
 export interface MatterQuestionCitation { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; }
+/** ClaimFlow's single local workspace is one implicit matter. */
+export const WORKSPACE_MATTER_ID = "workspace" as const;
+/** Every matter question names its scope explicitly; selected mode never widens to all documents. */
+export type MatterQuestionScopeRequest = { mode: "all" } | { mode: "selected"; documentIds: string[] };
 /**
- * Previous turn supplied only for an explicitly-authorized follow-up.  It is
- * transient request context, not a stored chat history or a source citation.
+ * A follow-up names an earlier backend-held turn.  The renderer never supplies
+ * the previous question or answer text; Python checks that turn's source
+ * documents remain inside the new scope before reusing it as context.
  */
-export interface MatterQuestionFollowUp { question: string; answer: string; }
-export interface MatterQuestionPreview { provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; cost: DocumentQuestionCost; }
-export interface MatterQuestionStatus { questionId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; scope: DocumentQuestionScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
+export interface MatterQuestionRequest { matterId: string; scope: MatterQuestionScopeRequest; question: string; followUpQuestionId?: string; }
+/** The documents the user agreed may have bounded excerpts sent for this question. */
+export interface MatterQuestionSubmission extends MatterQuestionRequest { consentedDocumentIds: string[]; }
+export type MatterUnavailableReason = "not_parsed" | "extraction_failed" | "unsupported" | "extraction_unavailable" | "no_searchable_text";
+export interface MatterDocumentScope {
+  matterId: string;
+  mode: "all" | "selected";
+  documentsInScope: number;
+  searchableDocuments: number;
+  unavailableDocuments: Array<{ documentId: string; filename: string; reason: MatterUnavailableReason }>;
+  incompleteDocuments: Array<{ documentId: string; filename: string }>;
+  documentsWithEvidence: number;
+  transmittedDocuments: Array<{ documentId: string; filename: string; previouslyAuthorized: boolean }>;
+  searchTruncated: boolean;
+  /** Documents the question itself named (by file name or file-name date); they only narrow the scope. */
+  resolvedDocuments: Array<{ documentId: string; filename: string; matchedBy: string }>;
+  notes: string[];
+}
+export type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "change" | "legal_status" | "comparison" | "calculation" | "general";
+export interface MatterRelationship { documentId: string; filename: string; subject: string; subjectRole: string; subjectReference: string; related: string; relatedRole: string; relatedReference: string; kind: "explicit_statement" | "explicit_heading" | "document_section" | "same_row"; basis: string; }
+export interface MatterHoldingSide { documentId: string; filename: string; sheet: string; row: number; rowReference: string | null; quantity: string | null; quantityReference: string | null; isinReference: string | null; accountReference: string | null; entityReferences: string[]; unit: string | null; unitReference: string | null; currency: string | null; currencyReference: string | null; rowDate: string | null; rowDateReference: string | null; cells: Array<{ heading: string; value: string; reference: string }>; }
+export interface MatterHoldingRow { entities: Array<{ kind: string; name: string }>; account: string | null; isin: string | null; currency: string | null; earlier: MatterHoldingSide | null; later: MatterHoldingSide | null; difference: string | null; status: "compared" | "only_earlier" | "only_later" | "duplicate_rows" | "unusable_quantity" | "unit_mismatch" | "currency_mismatch"; note: string | null; }
+/** One holdings table: header, records, investor label, stated date and control total, by cell. */
+export interface MatterHoldingsTable { sheet: string; headerReference: string; recordReference: string | null; quantityHeading: string; quantityHeadingReference: string; quantityReference: string | null; investor: { name: string; reference: string; label: string; labelReference: string } | null; statedDate: { date: string | null; text: string; reference: string; labelReference: string } | null; controlTotal: { reference: string; label: string; labelReference: string; value: string | null; formula: string | null; recordsTotal: string | null; status: "formula_covers_records" | "matches" | "differs" | "not_verified"; note: string; recordRows?: number; comparisonRows?: number; comparisonTotal?: string | null; reconciled?: boolean } | null; }
+/** An entity the question named, and how it was matched to a name in the spreadsheets. */
+export interface MatterRequestedEntity { text: string; name: string | null; match: "exact" | "alias" | "ambiguous" | "not_found"; candidates: string[]; positions: number; }
+/** A local, exact (Decimal) comparison of two dated holdings spreadsheets. */
+export interface MatterHoldingsComparison { documents: Array<{ documentId: string; filename: string; date: string | null; dateBasis: string | null; tables: MatterHoldingsTable[] }>; orderBasis: string; rows: MatterHoldingRow[]; totals: { earlier: string | null; later: string | null; difference: string | null; currency: string | null; coverage?: "all_records" | "selected_rows"; note: string | null }; requestedEntities?: MatterRequestedEntity[]; issues: string[]; caveats: Array<{ text: string; sources: Array<{ documentId: string; filename: string; reference: string }> }>; legalQuestionNotAnswered: boolean; }
+export interface MatterInventoryEvidence { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; role: string; basis: string; status: "document_label" | "provisional_ai_finding"; }
+export interface MatterInventoryEntity { name: string; roles: string[]; related: Array<{ name: string; role: string }>; evidence: MatterInventoryEvidence[]; documentCount: number; mentionCount: number; uncertainty: string | null; }
+/** A locally built, evidence-linked list of explicitly labelled entities; roles remain provisional. */
+export interface MatterEntityInventory {
+  requestedRoles: string[];
+  entities: MatterInventoryEntity[];
+  otherRoleCounts: Record<string, number>;
+  coverage: { eligibleDocuments: number; searchedDocuments: number; documentsWithRoleLabels: number; documentsWithListedEntities: number; partial: boolean; partialDocuments: Array<{ documentId: string; filename: string }>; entitiesOmitted: number; };
+  relationships: MatterRelationship[];
+}
+export interface MatterQuestionPreview { intent: MatterQuestionIntent; provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; cost: DocumentQuestionCost; }
+export interface MatterQuestionStatus { questionId: string; matterId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; intent: MatterQuestionIntent; inventory: MatterEntityInventory | null; holdingsComparison: MatterHoldingsComparison | null; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
 export type MatterQuestionPreviewResponse = { ok: true; preview: MatterQuestionPreview } | DocumentOperationFailure;
 export type MatterQuestionResponse = { ok: true; question: MatterQuestionStatus } | DocumentOperationFailure;
 export interface BillingPreviewRow { id: string; label: string; eligibleAmount: string; }

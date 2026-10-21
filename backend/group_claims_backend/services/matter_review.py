@@ -16,14 +16,66 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Mapping, Sequence
 
 from .ai import AIServiceError
 from .ai_analysis import AIAnalysisError, AIAnalysisService
+from .document_search import DocumentSearchIndex, SearchHit
+from .document_references import CandidateDocument, DocumentConstraint, resolve_document_references
+from .entity_inventory import EntityInventoryBuilder, InventoryDocument
+from .holdings_comparison import HoldingsComparison, HoldingsDocument, HoldingsResult, grouped_quantity
+from .question_intent import (
+    INTENT_CALCULATION, INTENT_COMPARISON, INTENT_HOLDINGS_COMPARISON, INTENT_INVENTORY, INTENT_LEGAL_STATUS, INTENT_RELATIONSHIP,
+    ROLE_INVESTOR, ROLE_INVESTOR_OR_ENTITY, ROLE_SUBFUND, ROLE_VEHICLE, ROLE_VEHICLE_OR_SUBFUND,
+    QuestionIntent, classify_question, lookup_identifiers, primary_request_text, question_entity_names,
+)
 from ..storage.service import StorageService
 
+# ClaimFlow is a single-user local workspace without a separate matter table.
+# The workspace is therefore one implicit matter.  Every scoped chat request
+# still names it explicitly so the backend boundary is already matter-aware.
+WORKSPACE_MATTER_ID = "workspace"
 MAX_DOCUMENTS = 20
+# All-document questions search every eligible document locally, but only a
+# bounded, interleaved set of matching sources is considered for the prompt.
+MAX_SEARCH_HITS_PER_DOCUMENT = 40
+MAX_SEARCH_HITS = 400
+MAX_SNAPSHOT_ROW_EXPANSIONS = 60
+MAX_NEIGHBOUR_CONTEXT_CHARACTERS = 160
+SHORT_EXCERPT_CHARACTERS = 80
+_SCOPE_MODES = frozenset({"all", "selected"})
+_MATTER_ID = re.compile(r"^[a-z0-9-]{1,64}$")
+_DOCUMENT_CONSENT_EVENT = "ai_matter_question_document_authorized"
+_UNKNOWN_FOLLOW_UP_ANSWER = "The selected evidence does not establish an answer to this question."
+# Question filler words that otherwise match unrelated text in every document.
+_GENERIC_QUESTION_WORDS = frozenset({
+    "which", "where", "there", "their", "these", "those", "about", "across", "mention", "mentioned", "mentions",
+    "upload", "uploaded", "document", "documents", "files", "record", "records", "recorded", "please", "could",
+    "would", "should", "every", "other", "named", "listed", "contain", "contains", "include", "includes",
+    "provide", "information", "details", "anything",
+})
+_SPREADSHEET_EXTENSIONS = frozenset({"xlsx", "xls", "csv"})
+# A legal-status question that refers to recorded holding movements.  Bare
+# years are not a cue; grouped amounts such as "400,000" are.
+_HOLDINGS_MOVEMENT_CUE = re.compile(
+    r"\b(?:holdings?|positions?|quantit(?:y|ies)|nominal|increas\w*|decreas\w*|reduc\w*|rose|fell|movements?|bestand)\b"
+    r"|\b\d{1,3}(?:[,.' ]\d{3})+\b"
+)
+# Rights-related wording that, outside a document's own caveat, would need
+# interpretation rather than a local statement.
+_LEGAL_EVENT_TERMS = ("assign", "abtret", "claim right", "legal right", "litigation", "withdraw", "settle", "anspruch")
+_UNAVAILABLE_REASONS = {
+    "imported": "not_parsed",
+    "failed": "extraction_failed",
+    "unsupported": "unsupported",
+}
+_SNAPSHOT_HEADING_TERMS = frozenset({
+    "subfund", "sub-fund", "fund", "account", "holder", "investor", "security", "isin",
+    "holding", "position", "quantity", "shares", "units", "date", "transaction", "trade",
+    "konto", "bestand", "menge", "wertpapier", "datum", "teilfonds", "teil-fonds", "fonds", "depot",
+})
 MAX_FINDINGS = 60
 MAX_QUESTION_SOURCE_ITEMS = 20
 # The strict answer schema needs an opaque key for every citable source.  Too
@@ -32,7 +84,6 @@ MAX_QUESTION_SOURCE_ITEMS = 20
 # key has room for its literal local excerpt.
 MAX_QUESTION_CITATION_SOURCES = 12
 MAX_RECONCILIATION_EXCERPTS = 20
-MAX_RECONCILIATION_SOURCE_SCAN = 2400
 MAX_ALLOCATION_ROWS = 50
 # A batch is an explicit, paid action.  Keep it deliberately small for the
 # development workflow rather than turning a folder import into an automatic
@@ -91,12 +142,89 @@ class AnalysisBatch:
     created_at: str
 
 
+@dataclass(frozen=True)
+class ScopedDocument:
+    """One matter document and whether its current extraction can be searched."""
+
+    document_id: str
+    filename: str
+    extraction_id: str | None
+    unavailable_reason: str | None
+    incomplete: bool = False
+    previously_authorized: bool = False
+
+
+@dataclass(frozen=True)
+class DocumentScope:
+    """A backend-resolved, explicit question scope within one matter."""
+
+    matter_id: str
+    mode: str
+    documents: tuple[ScopedDocument, ...]
+
+    @property
+    def searchable(self) -> tuple[ScopedDocument, ...]:
+        return tuple(document for document in self.documents if document.unavailable_reason is None)
+
+    @property
+    def document_ids(self) -> frozenset[str]:
+        return frozenset(document.document_id for document in self.documents)
+
+
+@dataclass(frozen=True)
+class MatterQuestionRequest:
+    matter_id: str
+    mode: str
+    selected_document_ids: tuple[str, ...]
+    question: str
+    follow_up_question_id: str | None
+    consented_document_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
+class LegalHoldingsEvidence:
+    """Dated holding records behind a legal-status question about holding movements."""
+
+    payload: Mapping[str, object]
+    citations: tuple[tuple[str, str, str, str], ...]
+    # One compact, document-backed excerpt pinned first on the provider path.
+    candidate: tuple[str, str, str, str, str]
+    # Set when the scope holds only the two workbooks and they contain no
+    # rights-related wording beyond their own caveat: answered locally.
+    local_answer: "LocalAnswer | None"
+
+
+@dataclass(frozen=True)
+class LocalAnswer:
+    """An answer produced entirely from local records; nothing is transmitted."""
+
+    intent: str
+    answer: str
+    citations: tuple[tuple[str, str, str, str], ...]
+    model: str
+    evidence_document_ids: frozenset[str] = frozenset()
+    partial: bool = False
+    inventory: Mapping[str, object] | None = None
+    holdings: Mapping[str, object] | None = None
+
+
 @dataclass
 class MatterQuestion:
     id: str
     document_ids: tuple[str, ...]
     status: str
     scope: Mapping[str, object]
+    matter_id: str = WORKSPACE_MATTER_ID
+    question: str = ""
+    document_scope: Mapping[str, object] | None = None
+    # Documents whose content shaped this answer.  A follow-up may reuse the
+    # answer as context only when all of them remain in the new scope.
+    context_document_ids: frozenset[str] = frozenset()
+    intent: str = "general"
+    # A locally built entity inventory (listing and relationship questions).
+    inventory: Mapping[str, object] | None = None
+    # A locally calculated dated holdings comparison.
+    holdings: Mapping[str, object] | None = None
     answer: str | None = None
     unknown: bool = False
     citations: tuple[Mapping[str, str], ...] = ()
@@ -255,7 +383,7 @@ class MatterReviewService:
         }
 
     def _document_billing_answer(
-        self, documents: Sequence[sqlite3.Row], question: str,
+        self, documents: Sequence[ScopedDocument], question: str,
     ) -> DocumentBillingAnswer | None:
         """Calculate only from an expressly approved local billing instruction.
 
@@ -267,21 +395,31 @@ class MatterReviewService:
         """
         if not self._is_document_billing_question(question):
             return None
-        document_ids = [str(document["id"]) for document in documents]
-        placeholders = ",".join("?" for _ in document_ids)
+        extraction_documents = {
+            str(document.extraction_id): document.document_id
+            for document in documents if document.extraction_id is not None
+        }
         with self._database.connection() as connection:
+            # Use the local index to find only documents that mention the
+            # instruction's required inputs, rather than reading every PDF
+            # block in a large all-document scope.
+            matches = DocumentSearchIndex.search(
+                connection, list(extraction_documents), ("fee pool", "allocation rule"),
+                per_document_limit=1, total_limit=len(extraction_documents),
+            )
+            extraction_ids = sorted({hit.extraction_id for hit in matches.hits})
+            if not extraction_ids:
+                return None
+            placeholders = ",".join("?" for _ in extraction_ids)
             sources = connection.execute(
                 f"SELECT d.id AS document_id, d.original_filename, e.id AS extraction_id, p.page_number, "
                 f"'page ' || p.page_number || ' block ' || b.block_index AS source_reference, b.text "
                 f"FROM source_documents d JOIN document_extractions e ON e.source_document_id = d.id "
                 f"JOIN pdf_page_extractions p ON p.extraction_id = e.id "
                 f"JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
-                f"WHERE d.id IN ({placeholders}) AND e.status = 'parsed' AND b.text <> '' "
-                f"AND e.id = (SELECT latest.id FROM document_extractions latest "
-                f"WHERE latest.source_document_id = d.id AND latest.status = 'parsed' "
-                f"ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1) "
+                f"WHERE e.id IN ({placeholders}) AND e.status = 'parsed' AND b.text <> '' "
                 f"ORDER BY d.id, p.page_number, b.block_index",
-                document_ids,
+                extraction_ids,
             ).fetchall()
 
         pages: dict[tuple[str, str, str, int], list[sqlite3.Row]] = {}
@@ -596,20 +734,77 @@ class MatterReviewService:
             return self._batch_result(batch)
 
     def question_preview(self, params: object) -> Mapping[str, object]:
-        """Plan a bounded cross-document question without a provider request."""
-        document_ids, question, follow_up = self._matter_question_params(params, acknowledged=False)
-        plan = self._matter_question_plan(document_ids, question, follow_up)
+        """Plan a bounded, explicitly scoped matter question without a provider request."""
+        request = self._matter_question_params(params, acknowledged=False)
+        scope, plan, _follow_up_document_ids = self._prepare_question(request)
+        return self._question_preview_payload(scope, plan)
+
+    def _prepare_question(self, request: MatterQuestionRequest) -> tuple[DocumentScope, dict[str, object], frozenset[str]]:
+        """Resolve scope, question-level document constraints, follow-up context, then plan.
+
+        Every answer is planned from its own retrieval: an earlier answer is
+        at most non-evidence context, and only when its source documents lie
+        within the documents this question may use.
+        """
+        scope = self._resolve_scope(request)
+        follow_up, follow_up_document_ids = self._follow_up_context(request.follow_up_question_id, scope)
+        constraint = self._document_constraint(request.question, scope)
+        notes: list[str] = []
+        working = scope
+        if constraint.requested:
+            if constraint.problems:
+                resolved = "; ".join(f"“{item.filename}”" for item in constraint.resolved)
+                answer = LocalAnswer(
+                    self._question_intent(request.question).kind,
+                    "The documents named in this question could not be resolved unambiguously, so nothing was searched "
+                    "or sent. " + " ".join(constraint.problems)
+                    + (f" Resolved so far: {resolved}." if resolved else ""),
+                    (), "local-document-resolution",
+                )
+                plan = self._local_plan(answer, 0)
+                plan["documentConstraint"] = constraint
+                return scope, plan, frozenset()
+            resolved_ids = {item.document_id for item in constraint.resolved}
+            # Question-level references only narrow the authorized scope.
+            working = DocumentScope(
+                scope.matter_id, scope.mode, tuple(document for document in scope.documents if document.document_id in resolved_ids),
+            )
+            if follow_up_document_ids and not follow_up_document_ids <= resolved_ids:
+                follow_up, follow_up_document_ids = None, frozenset()
+                notes.append(
+                    "The earlier answer was not reused as context because it relied on documents other than those named in this question."
+                )
+        plan = dict(self._matter_question_plan(
+            working, request.question, follow_up, follow_up_document_ids, constrained=constraint.requested,
+        ))
+        plan["documentConstraint"] = constraint
+        plan["notes"] = [*notes, *plan.get("notes", [])]  # type: ignore[misc]
+        return scope, plan, follow_up_document_ids
+
+    def _document_constraint(self, question: str, scope: DocumentScope) -> DocumentConstraint:
+        """Match file names/dates against every matter document, marking scope membership."""
+        with self._database.connection() as connection:
+            rows = connection.execute("SELECT id, original_filename, file_format FROM source_documents").fetchall()
+        return resolve_document_references(question, [
+            CandidateDocument(str(row["id"]), str(row["original_filename"]), str(row["file_format"] or ""), str(row["id"]) in scope.document_ids)
+            for row in rows
+        ])
+
+    def _question_preview_payload(self, scope: DocumentScope, plan: Mapping[str, object]) -> Mapping[str, object]:
         self._analysis._refresh_configuration()
         configuration = self._analysis._configuration
         controls = self._analysis._cost_controls
-        if isinstance(plan.get("documentBilling"), DocumentBillingAnswer):
+        document_scope = self._document_scope_payload(scope, plan)
+        if isinstance(plan.get("documentBilling"), DocumentBillingAnswer) or isinstance(plan.get("localAnswer"), LocalAnswer):
             return {
+                "intent": plan.get("intent"),
                 "provider": None,
                 "model": None,
                 "globalAuthorization": self._analysis._global_authorized(),
                 "configured": configuration.state() == "configured_not_live_tested",
                 "localOnly": True,
                 "scope": plan["scope"],
+                "documentScope": document_scope,
                 "cost": {
                     "estimatedInputTokens": 0,
                     "maxOutputTokens": 0,
@@ -624,12 +819,14 @@ class MatterReviewService:
         codex_plan = configuration.provider == "codex"
         within_limit = codex_plan or (estimate is not None and estimate <= controls.max_estimated_cost_usd)
         return {
+            "intent": plan.get("intent"),
             "provider": configuration.provider,
             "model": configuration.model,
             "globalAuthorization": self._analysis._global_authorized(),
             "configured": configuration.state() == "configured_not_live_tested",
             "localOnly": False,
             "scope": plan["scope"],
+            "documentScope": document_scope,
             "cost": {
                 "estimatedInputTokens": plan["inputTokens"],
                 "maxOutputTokens": 0 if codex_plan else plan["maxOutputTokens"],
@@ -645,25 +842,44 @@ class MatterReviewService:
 
         Unlike document analysis, this never writes a proposed domain record;
         question text and answer remain in memory for the current backend run.
+        The scope is resolved again here rather than trusted from a preview,
+        and every document whose excerpt would be transmitted must be named
+        in this request's explicit consent list.
         """
-        document_ids, question, follow_up = self._matter_question_params(params, acknowledged=True)
-        plan = self._matter_question_plan(document_ids, question, follow_up)
+        request = self._matter_question_params(params, acknowledged=True)
+        scope, plan, follow_up_document_ids = self._prepare_question(request)
+        document_scope = self._document_scope_payload(scope, plan)
+        searchable_ids = tuple(document.document_id for document in scope.searchable)
+        local_answer = plan.get("localAnswer")
+        if isinstance(local_answer, LocalAnswer):
+            # Built locally from stored extractions; nothing is transmitted.
+            citations = self._validate_direct_matter_citations(local_answer.citations)
+            job = MatterQuestion(
+                id=str(uuid.uuid4()), document_ids=searchable_ids, status="completed", scope=plan["scope"],
+                answer=local_answer.answer, citations=tuple(citations), model=local_answer.model,
+                matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
+                context_document_ids=frozenset(citation["documentId"] for citation in citations) | follow_up_document_ids,
+                intent=local_answer.intent, inventory=local_answer.inventory, holdings=local_answer.holdings,
+            )
+            with self._question_lock:
+                self._questions[job.id] = job
+            return self.question_status({"questionId": job.id})
         document_billing = plan.get("documentBilling")
         if isinstance(document_billing, DocumentBillingAnswer):
             citations = self._validate_direct_matter_citations(document_billing.citations)
             if not citations:
                 raise MatterReviewError("The approved billing instruction could not be revalidated locally.")
             job = MatterQuestion(
-                id=str(uuid.uuid4()), document_ids=tuple(document_ids), status="completed", scope=plan["scope"],
+                id=str(uuid.uuid4()), document_ids=searchable_ids, status="completed", scope=plan["scope"],
                 answer=document_billing.answer, citations=tuple(citations), model="local-document-calculation",
+                matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
+                context_document_ids=frozenset(citation["documentId"] for citation in citations) | follow_up_document_ids,
+                intent=INTENT_CALCULATION,
             )
             with self._question_lock:
                 self._questions[job.id] = job
             return self.question_status({"questionId": job.id})
-        preview_params: dict[str, object] = {"documentIds": document_ids, "question": question}
-        if follow_up is not None:
-            preview_params["followUp"] = follow_up
-        preview = self.question_preview(preview_params)
+        preview = self._question_preview_payload(scope, plan)
         if not preview["globalAuthorization"]:
             raise MatterReviewError("Enable cloud-processing authorization in Settings before asking a consolidated question.")
         if not preview["configured"]:
@@ -671,16 +887,34 @@ class MatterReviewService:
         cost = preview["cost"]
         if not isinstance(cost, dict) or not cost["withinLimit"]:
             raise MatterReviewError("This question exceeds the current development safety limit.")
+        transmitted = frozenset(str(value) for value in plan["transmittedDocumentIds"])  # type: ignore[union-attr]
+        if not request.consented_document_ids <= scope.document_ids:
+            raise MatterReviewError("Consent can only cover documents in the current question scope.")
+        if not transmitted <= request.consented_document_ids:
+            raise MatterReviewError(
+                "The documents whose excerpts would be sent changed after you reviewed this question. "
+                "Review the documents listed for this question and confirm again."
+            )
         with self._question_lock:
             if any(job.status in {"queued", "running"} for job in self._questions.values()):
                 raise MatterReviewError("Another consolidated question is already being answered.")
             job = MatterQuestion(
-                id=str(uuid.uuid4()), document_ids=tuple(document_ids), status="queued", scope=plan["scope"]
+                id=str(uuid.uuid4()), document_ids=searchable_ids, status="queued", scope=plan["scope"],
+                matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
+                context_document_ids=transmitted, intent=str(plan.get("intent") or "general"),
+                holdings=plan.get("holdingsEvidence") if isinstance(plan.get("holdingsEvidence"), Mapping) else None,
             )
             self._questions[job.id] = job
+        try:
+            self._record_question_consent(job.id, scope, transmitted, str(preview["provider"]))
+        except BaseException:
+            # Never leave an unsent question queued: it would block later questions.
+            with self._question_lock:
+                self._questions.pop(job.id, None)
+            raise
         worker = threading.Thread(
             target=self._run_matter_question,
-            args=(job.id, question, plan), daemon=True, name=f"group-claims-matter-question-{job.id[:8]}"
+            args=(job.id, request.question, plan), daemon=True, name=f"group-claims-matter-question-{job.id[:8]}"
         )
         worker.start()
         return self.question_status({"questionId": job.id})
@@ -694,13 +928,18 @@ class MatterReviewService:
                 raise MatterReviewError("The consolidated question is unavailable after a backend restart.")
             return {
                 "questionId": job.id,
+                "matterId": job.matter_id,
                 "status": job.status,
                 "answer": job.answer,
                 "unknown": job.unknown,
                 "citations": list(job.citations),
                 "errorCode": job.error_code,
                 "model": job.model,
+                "intent": job.intent,
+                "inventory": dict(job.inventory) if job.inventory is not None else None,
+                "holdingsComparison": dict(job.holdings) if job.holdings is not None else None,
                 "scope": dict(job.scope),
+                "documentScope": dict(job.document_scope or {}),
                 "usage": {
                     "inputTokens": job.input_tokens,
                     "outputTokens": job.output_tokens,
@@ -708,6 +947,177 @@ class MatterReviewService:
                     "actualCostEstimateUsd": job.actual_cost_estimate_usd,
                 },
             }
+
+    def _resolve_scope(self, request: MatterQuestionRequest) -> DocumentScope:
+        """Resolve the permitted documents from SQLite before any retrieval.
+
+        Renderer-supplied identifiers are only a request: each selected ID
+        must belong to the named matter, and all-document scope is derived
+        from the matter's own document records rather than from the client.
+        """
+        if request.matter_id != WORKSPACE_MATTER_ID:
+            raise MatterReviewError("The requested matter is unavailable. Reopen the matter and try again.")
+        self._analysis._refresh_configuration()
+        provider = self._analysis._configuration.provider
+        latest_extraction = (
+            "(SELECT e.id FROM document_extractions e WHERE e.source_document_id = d.id AND e.status = 'parsed' "
+            "ORDER BY e.started_at DESC, e.id DESC LIMIT 1)"
+        )
+        with self._database.transaction() as connection:
+            if request.mode == "selected":
+                placeholders = ",".join("?" for _ in request.selected_document_ids)
+                rows = connection.execute(
+                    f"SELECT d.id, d.original_filename, d.processing_status, {latest_extraction} AS extraction_id "
+                    f"FROM source_documents d WHERE d.id IN ({placeholders})",
+                    list(request.selected_document_ids),
+                ).fetchall()
+                if len(rows) != len(request.selected_document_ids):
+                    raise MatterReviewError("One or more selected documents do not belong to this matter.")
+                by_id = {str(row["id"]): row for row in rows}
+                rows = [by_id[document_id] for document_id in request.selected_document_ids]
+            else:
+                rows = connection.execute(
+                    f"SELECT d.id, d.original_filename, d.processing_status, {latest_extraction} AS extraction_id "
+                    f"FROM source_documents d ORDER BY d.imported_at DESC, d.id DESC"
+                ).fetchall()
+            parsed = {
+                str(row["extraction_id"]): str(row["id"])
+                for row in rows
+                if row["processing_status"] == "parsed" and isinstance(row["extraction_id"], str)
+            }
+            index_states = DocumentSearchIndex.ensure_indexed(connection, parsed)
+            authorized: set[str] = set()
+            if rows and provider:
+                document_ids = [str(row["id"]) for row in rows]
+                placeholders = ",".join("?" for _ in document_ids)
+                # Earlier consent is honoured only for the same provider and
+                # only since cloud processing was most recently enabled.
+                authorized = {
+                    str(row["target_id"]) for row in connection.execute(
+                        f"SELECT DISTINCT target_id FROM audit_events WHERE target_type = 'source_document' "
+                        f"AND event_type IN ('ai_document_analysis_authorized', ?) AND target_id IN ({placeholders}) "
+                        f"AND json_extract(details_json, '$.provider') = ? AND occurred_at >= COALESCE(("
+                        f"SELECT occurred_at FROM ai_authorizations WHERE authorized = 1 "
+                        f"ORDER BY occurred_at DESC LIMIT 1), '9999')",
+                        [_DOCUMENT_CONSENT_EVENT, *document_ids, provider],
+                    ).fetchall()
+                }
+        documents: list[ScopedDocument] = []
+        for row in rows:
+            document_id = str(row["id"])
+            extraction_id = row["extraction_id"] if isinstance(row["extraction_id"], str) else None
+            state = index_states.get(extraction_id) if extraction_id is not None else None
+            if row["processing_status"] != "parsed":
+                reason: str | None = _UNAVAILABLE_REASONS.get(str(row["processing_status"]), "extraction_unavailable")
+            elif state is None:
+                reason = "extraction_unavailable"
+            elif state.item_count == 0:
+                reason = "no_searchable_text"
+            else:
+                reason = None
+            documents.append(ScopedDocument(
+                document_id=document_id,
+                filename=str(row["original_filename"]),
+                extraction_id=extraction_id if reason is None else None,
+                unavailable_reason=reason,
+                incomplete=bool(state and state.unavailable_page_count > 0),
+                previously_authorized=document_id in authorized,
+            ))
+        return DocumentScope(request.matter_id, request.mode, tuple(documents))
+
+    def _follow_up_context(
+        self, question_id: str | None, scope: DocumentScope,
+    ) -> tuple[Mapping[str, str] | None, frozenset[str]]:
+        """Reuse an earlier turn only when its source documents remain in scope.
+
+        The renderer names the earlier turn; it cannot supply the prior
+        question or answer text.  A follow-up after narrowing the scope would
+        otherwise transmit an answer derived from now-excluded documents.
+        """
+        if question_id is None:
+            return None, frozenset()
+        with self._question_lock:
+            job = self._questions.get(question_id)
+            if job is None or job.status != "completed":
+                raise MatterReviewError("The earlier answer is unavailable. Ask this as a new question.")
+            parent_question, parent_answer = job.question, job.answer
+            parent_unknown, parent_documents, parent_matter = job.unknown, job.context_document_ids, job.matter_id
+        if parent_matter != scope.matter_id:
+            raise MatterReviewError("The earlier answer belongs to another matter. Ask this as a new question.")
+        if not parent_documents <= scope.document_ids:
+            raise MatterReviewError(
+                "This follow-up would reuse an answer based on documents outside the current scope. "
+                "Ask it as a new question in this scope instead."
+            )
+        answer = parent_answer if parent_answer and not parent_unknown else _UNKNOWN_FOLLOW_UP_ANSWER
+        return {"question": parent_question[:600], "answer": answer[:1200]}, parent_documents
+
+    def _record_question_consent(
+        self, question_id: str, scope: DocumentScope, transmitted: frozenset[str], provider: str,
+    ) -> None:
+        """Audit the explicit document-level consent without storing content or the question."""
+        # Same ISO format as ``ai_authorizations`` so the "since cloud
+        # processing was last enabled" comparison is a valid string order.
+        now = datetime.now(UTC).isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO audit_events (id, event_type, target_type, target_id, actor_type, occurred_at, details_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()), "ai_matter_question_authorized", "matter", scope.matter_id, "user", now,
+                    json.dumps({
+                        "provider": provider, "scope_mode": scope.mode, "document_count": len(transmitted),
+                        "question_reference": question_id, "payload_logged": False,
+                    }),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO audit_events (id, event_type, target_type, target_id, actor_type, occurred_at, details_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(uuid.uuid4()), _DOCUMENT_CONSENT_EVENT, "source_document", document_id, "user", now,
+                        json.dumps({"provider": provider, "scope_mode": scope.mode, "payload_logged": False}),
+                    )
+                    for document_id in sorted(transmitted)
+                ],
+            )
+
+    @staticmethod
+    def _document_scope_payload(scope: DocumentScope, plan: Mapping[str, object]) -> Mapping[str, object]:
+        constraint = plan.get("documentConstraint")
+        transmitted = set(str(value) for value in plan.get("transmittedDocumentIds", ()))  # type: ignore[union-attr]
+        evidence = set(str(value) for value in plan.get("evidenceDocumentIds", ()))  # type: ignore[union-attr]
+        return {
+            "matterId": scope.matter_id,
+            "mode": scope.mode,
+            "documentsInScope": len(scope.documents),
+            "searchableDocuments": len(scope.searchable),
+            "unavailableDocuments": [
+                {"documentId": document.document_id, "filename": document.filename, "reason": document.unavailable_reason}
+                for document in scope.documents if document.unavailable_reason is not None
+            ],
+            "incompleteDocuments": [
+                {"documentId": document.document_id, "filename": document.filename}
+                for document in scope.searchable if document.incomplete
+            ],
+            "documentsWithEvidence": len(evidence),
+            "transmittedDocuments": [
+                {
+                    "documentId": document.document_id,
+                    "filename": document.filename,
+                    "previouslyAuthorized": document.previously_authorized,
+                }
+                for document in scope.documents if document.document_id in transmitted
+            ],
+            "searchTruncated": bool(plan.get("searchTruncated", False)),
+            # Documents a question named explicitly (by file name or date).
+            "resolvedDocuments": [
+                {"documentId": item.document_id, "filename": item.filename, "matchedBy": item.matched_by}
+                for item in (constraint.resolved if isinstance(constraint, DocumentConstraint) else ())
+            ],
+            "notes": [str(note) for note in plan.get("notes", ())],  # type: ignore[union-attr]
+        }
 
     def _run_matter_question(self, question_id: str, question: str, plan: Mapping[str, object]) -> None:
         with self._question_lock:
@@ -742,6 +1152,13 @@ class MatterReviewService:
             citations = self._validate_matter_citations(result.citations, plan["citationTargets"])
             if not citations:
                 raise AIAnalysisError("AI_ANSWER_EVIDENCE_UNSUPPORTED", "The answer did not include supported local evidence.")
+            # Dated holding cells behind a legal-status answer are cited too,
+            # re-resolved locally, whichever excerpt the model chose.
+            cited = {(citation["documentId"], citation["sourceReference"]) for citation in citations}
+            for citation in self._validate_direct_matter_citations(plan.get("holdingsCitations", ())):  # type: ignore[arg-type]
+                if (citation["documentId"], citation["sourceReference"]) not in cited:
+                    citations.append(citation)
+                    cited.add((citation["documentId"], citation["sourceReference"]))
             controls = self._analysis._cost_controls
             actual_cost = self._analysis._estimate_cost(result.input_tokens, result.output_tokens) if result.input_tokens is not None and result.output_tokens is not None else None
             with self._question_lock:
@@ -772,12 +1189,52 @@ class MatterReviewService:
 
     def _matter_question_plan(
         self,
-        document_ids: Sequence[str],
+        scope: DocumentScope,
         question: str,
         follow_up: Mapping[str, str] | None = None,
+        follow_up_document_ids: frozenset[str] = frozenset(),
+        *,
+        constrained: bool = False,
     ) -> Mapping[str, object]:
-        documents = self._source_documents(document_ids)
-        names = {str(row["id"]): str(row["original_filename"]) for row in documents}
+        """Build a bounded prompt context from the resolved scope only.
+
+        Every query below is restricted to the current extraction of a
+        document already validated by ``_resolve_scope``; there is no
+        unscoped document query on this path.
+        """
+        documents = scope.searchable
+        if not documents:
+            raise MatterReviewError(
+                "No document in this scope has searchable extracted content. "
+                "Parse or reprocess the documents listed as unavailable, or change the scope."
+            )
+        document_ids = [document.document_id for document in documents]
+        names = {document.document_id: document.filename for document in documents}
+        current_extractions = {str(document.extraction_id): document.document_id for document in documents}
+        extraction_ids = list(current_extractions)
+        intent = self._question_intent(question)
+        if intent.kind in {INTENT_INVENTORY, INTENT_RELATIONSHIP}:
+            return self._inventory_plan(documents, intent)
+        if intent.kind == INTENT_HOLDINGS_COMPARISON:
+            return self._holdings_plan(documents, intent, question, constrained=constrained)
+        legal_holdings = (
+            self._legal_holdings_evidence(documents, question)
+            if intent.kind == INTENT_LEGAL_STATUS and _HOLDINGS_MOVEMENT_CUE.search(question.casefold()) else None
+        )
+        if legal_holdings is not None and legal_holdings.local_answer is not None:
+            return self._local_plan(legal_holdings.local_answer, len(documents))
+        with self._database.connection() as connection:
+            present_names, missing_names = self._named_entities(connection, extraction_ids, question)
+        required_terms = sorted({*(identifier.casefold() for identifier in intent.identifiers), *(name.casefold() for name in present_names)})
+        notes = [f"Not found in the documents used: “{name}”." for name in missing_names]
+        if missing_names and not required_terms:
+            return self._local_plan(LocalAnswer(
+                intent.kind,
+                "None of the names in this question appear in the searchable documents used ("
+                + ", ".join(f"“{name}”" for name in missing_names)
+                + "). Nothing was sent. Check the spelling, name the relevant document, or change the scope.",
+                (), "local-relevance-check",
+            ), len(documents), notes=notes)
         billing_instruction = self._document_billing_answer(documents, question)
         # The deterministic calculator owns only an explicit allocation
         # request. Every other billing conversation goes through the
@@ -788,24 +1245,30 @@ class MatterReviewService:
             else None
         )
         placeholders = ",".join("?" for _ in document_ids)
+        extraction_placeholders = ",".join("?" for _ in extraction_ids)
+        search_truncated = False
+        # Earlier AI review output is used only when it was produced from the
+        # document's current extraction, so evidence versions stay consistent.
+        latest_current_job = (
+            "j.id = (SELECT newer.id FROM ai_processing_jobs newer WHERE newer.source_document_id = j.source_document_id "
+            "AND newer.extraction_id = j.extraction_id AND newer.status = 'completed' "
+            "ORDER BY newer.created_at DESC, newer.id DESC LIMIT 1)"
+        )
         with self._database.connection() as connection:
             summary_rows = connection.execute(
                 f"SELECT j.source_document_id, j.extraction_id, j.summary_text, j.summary_unknown, j.summary_citations_json "
-                f"FROM ai_processing_jobs j WHERE j.status = 'completed' "
-                f"AND j.id = (SELECT newer.id FROM ai_processing_jobs newer "
-                f"WHERE newer.source_document_id = j.source_document_id AND newer.status = 'completed' "
-                f"ORDER BY newer.created_at DESC, newer.id DESC LIMIT 1) "
-                f"AND j.source_document_id IN ({placeholders}) ORDER BY j.source_document_id",
-                list(document_ids),
+                f"FROM ai_processing_jobs j WHERE j.status = 'completed' AND {latest_current_job} "
+                f"AND j.source_document_id IN ({placeholders}) AND j.extraction_id IN ({extraction_placeholders}) "
+                f"ORDER BY j.source_document_id",
+                [*document_ids, *extraction_ids],
             ).fetchall()
             rows = connection.execute(
                 f"SELECT p.source_reference, p.evidence_snippet, p.proposal_type, p.field_name, p.value_json, p.is_unknown, "
                 f"j.source_document_id, j.extraction_id FROM ai_proposals p JOIN ai_processing_jobs j ON j.id = p.job_id "
-                f"WHERE p.validation_status = 'validated' AND j.status = 'completed' "
-                f"AND j.id = (SELECT newer.id FROM ai_processing_jobs newer WHERE newer.source_document_id = j.source_document_id "
-                f"AND newer.status = 'completed' ORDER BY newer.created_at DESC, newer.id DESC LIMIT 1) "
-                f"AND j.source_document_id IN ({placeholders}) ORDER BY j.source_document_id, p.created_at, p.id LIMIT 41",
-                list(document_ids),
+                f"WHERE p.validation_status = 'validated' AND j.status = 'completed' AND {latest_current_job} "
+                f"AND j.source_document_id IN ({placeholders}) AND j.extraction_id IN ({extraction_placeholders}) "
+                f"ORDER BY j.source_document_id, p.created_at, p.id LIMIT 41",
+                [*document_ids, *extraction_ids],
             ).fetchall()
 
             # A completed document analysis can contain a useful short
@@ -817,11 +1280,15 @@ class MatterReviewService:
             candidates: list[tuple[str, str, str, str, str]] = []
             reconciliation_candidates: list[tuple[str, str, str, str, str]] = []
             seen_sources: set[tuple[str, str]] = set()
+            seen_excerpts: set[tuple[str, str]] = set()
+            neighbour_context: dict[tuple[str, str], str] = {}
 
             def add_candidate(
                 document_id: str, extraction_id: str, reference: str, description: str,
-                *, prioritize_for_question: bool = False,
+                *, prioritize_for_question: bool = False, source: Mapping[str, object] | None = None,
             ) -> None:
+                if current_extractions.get(extraction_id) != document_id:
+                    return
                 evidence = self._analysis._source_evidence(connection, extraction_id, reference)
                 if evidence is None:
                     return
@@ -832,7 +1299,19 @@ class MatterReviewService:
                 excerpt = self._analysis._evidence_excerpt(source_text)
                 if not excerpt:
                     return
+                # Repeated identical text in one document (for example a
+                # header repeated on each worksheet) adds no new evidence.
+                # Identical text in two documents is kept: that can be
+                # corroboration or a conflict the reviewer must see.
+                excerpt_identity = (document_id, excerpt.casefold())
+                if excerpt_identity in seen_excerpts:
+                    return
                 seen_sources.add(identity)
+                seen_excerpts.add(excerpt_identity)
+                if source is not None and len(excerpt) < SHORT_EXCERPT_CHARACTERS:
+                    context = self._neighbour_context(connection, source)
+                    if context:
+                        neighbour_context[identity] = context
                 target = reconciliation_candidates if prioritize_for_question else candidates
                 target.append((document_id, extraction_id, canonical_reference, names[document_id],
                                f"{description}; EVIDENCE: {excerpt}"))
@@ -863,92 +1342,139 @@ class MatterReviewService:
                     f"FINDING: {row['proposal_type']}.{row['field_name']} = {value if value is not None else 'Unknown'}",
                 )
 
-            # A prior preliminary analysis may have concentrated on holdings
-            # details.  Add a small set of deterministic source excerpts for
-            # questions about explicit legal events *or* factual changes in
-            # subfund/account/position snapshots.  The latter must not be
-            # misclassified as a litigation-status question merely because it
-            # contains the word "subfund".  This is still bounded and each
-            # excerpt is independently re-resolved before display.
-            extraction_documents = {
-                str(row["extraction_id"]): str(row["source_document_id"])
-                for row in summary_rows
-            }
-            if extraction_documents:
-                extraction_ids = list(extraction_documents)
-                extraction_placeholders = ",".join("?" for _ in extraction_ids)
-                raw_sources = connection.execute(
-                    f"SELECT extraction_id, source_reference, content_kind, sheet_name, row_number, "
-                    f"COALESCE(value_text, '') || ' ' || "
-                    f"COALESCE(formula_text, '') AS text FROM extracted_content "
-                    f"WHERE extraction_id IN ({extraction_placeholders}) AND is_empty = 0 "
-                    f"ORDER BY extraction_id, worksheet_index, sheet_name, row_number, column_number LIMIT ?",
-                    [*extraction_ids, MAX_RECONCILIATION_SOURCE_SCAN],
-                ).fetchall()
-                raw_sources = [*raw_sources, *connection.execute(
-                    f"SELECT p.extraction_id, 'page ' || p.page_number || ' block ' || b.block_index AS source_reference, "
-                    f"'pdf_text_block' AS content_kind, NULL AS sheet_name, NULL AS row_number, b.text "
-                    f"FROM pdf_page_extractions p JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
-                    f"WHERE p.extraction_id IN ({extraction_placeholders}) AND b.text <> '' "
-                    f"ORDER BY p.extraction_id, p.page_number, b.block_index LIMIT ?",
-                    [*extraction_ids, MAX_RECONCILIATION_SOURCE_SCAN],
-                ).fetchall()]
-                # A follow-up may say "those" or "that holding".  The prior
-                # user question improves source selection; the prior answer is
-                # never treated as evidence.
-                retrieval_question = question if follow_up is None else f"{follow_up['question']}\n{question}"
-                change_question = (
-                    self._is_change_question(retrieval_question)
-                    and not self._is_legal_status_question(retrieval_question)
-                )
-                snapshot_rows: set[tuple[str, str, int]] = set()
-                if change_question:
-                    # Spreadsheet values are stored one cell at a time.  If a
-                    # heading or an event-bearing cell is relevant, include
-                    # that row and the next two rows so the model sees the
-                    # associated account, quantity, date, or identifier.  It
-                    # still receives and cites individual stored cells only.
-                    for source in raw_sources:
-                        row_number = source["row_number"]
-                        sheet_name = source["sheet_name"]
-                        source_text = str(source["text"] or "")
-                        if (
-                            isinstance(row_number, int)
-                            and isinstance(sheet_name, str)
-                            and (
-                                self._is_snapshot_heading(source_text)
-                                or self._is_question_relevant_source(retrieval_question, source_text)
-                            )
-                        ):
-                            extraction_id = str(source["extraction_id"])
-                            for offset in range(3):
-                                snapshot_rows.add((extraction_id, sheet_name, row_number + offset))
-
+            # Search every searchable document in scope, whether or not it has
+            # an earlier AI review, using the local full-text index.  Only a
+            # bounded, per-document-interleaved set of matching sources is
+            # considered; each is re-resolved against the extraction tables.
+            # Questions about explicit legal events *or* factual changes in
+            # subfund/account/position snapshots get related excerpts.  The
+            # latter must not be misclassified as a litigation-status question
+            # merely because it contains the word "subfund".
+            #
+            # A follow-up may say "those" or "that holding".  The prior user
+            # question improves source selection; the prior answer is never
+            # treated as evidence.
+            # An explicit follow-up ("what about those?") borrows the earlier
+            # question's wording; one that names its own documents, entities
+            # or identifiers is retrieved from its own terms only.
+            explicit = constrained or bool(required_terms)
+            retrieval_question = question if follow_up is None or explicit else f"{follow_up['question']}\n{question}"
+            change_question = (
+                self._is_change_question(retrieval_question)
+                and not self._is_legal_status_question(retrieval_question)
+            )
+            terms = set(self._question_terms(retrieval_question))
+            # A specific lookup searches for its literal identifiers (ISIN,
+            # account number, quoted name) as well as its other terms.
+            terms |= {identifier.casefold() for identifier in intent.identifiers}
+            terms |= set(required_terms)
+            if change_question:
+                terms |= _SNAPSHOT_HEADING_TERMS
+            search = DocumentSearchIndex.search(
+                connection, extraction_ids, terms,
+                per_document_limit=MAX_SEARCH_HITS_PER_DOCUMENT, total_limit=MAX_SEARCH_HITS,
+            )
+            search_truncated = search.truncated
+            raw_sources = self._ordered_sources(
+                connection, search.hits, retrieval_question, expand_snapshots=change_question,
+            )
+            snapshot_rows: set[tuple[str, str, int]] = set()
+            if change_question:
+                # Spreadsheet values are stored one cell at a time.  If a
+                # heading or an event-bearing cell is relevant, include that
+                # row and the next two rows so the model sees the associated
+                # account, quantity, date, or identifier.  It still receives
+                # and cites individual stored cells only.
                 for source in raw_sources:
-                    if len(reconciliation_candidates) >= MAX_RECONCILIATION_EXCERPTS:
-                        break
-                    source_text = str(source["text"] or "")
                     row_number = source["row_number"]
                     sheet_name = source["sheet_name"]
-                    in_snapshot_context = (
-                        change_question
-                        and isinstance(row_number, int)
+                    source_text = str(source["text"] or "")
+                    if (
+                        isinstance(row_number, int)
                         and isinstance(sheet_name, str)
-                        and (str(source["extraction_id"]), sheet_name, row_number) in snapshot_rows
-                    )
-                    if not in_snapshot_context and not self._is_question_relevant_source(retrieval_question, source_text):
-                        continue
-                    extraction_id = str(source["extraction_id"])
-                    add_candidate(
-                        extraction_documents[extraction_id], extraction_id, str(source["source_reference"]),
-                        (
-                            "QUESTION-RELEVANT CHANGE/SNAPSHOT EXCERPT"
-                            if in_snapshot_context else "QUESTION-RELEVANT SOURCE EXCERPT"
-                        ),
-                        prioritize_for_question=True,
-                    )
+                        and (
+                            self._is_snapshot_heading(source_text)
+                            or self._is_question_relevant_source(retrieval_question, source_text)
+                        )
+                    ):
+                        extraction_id = str(source["extraction_id"])
+                        for offset in range(3):
+                            snapshot_rows.add((extraction_id, sheet_name, row_number + offset))
 
+            # Relevance gate, applied before the excerpt cap: when the question
+            # names entities or identifiers, keep only text that mentions one,
+            # cells in a row that does, and the heading rows above such rows.
+            required_rows: set[tuple[str, object, object]] = set()
+            required_sheets: dict[tuple[str, object], int] = {}
+            for source in raw_sources:
+                if required_terms and isinstance(source["row_number"], int) and any(
+                    term in str(source["text"] or "").casefold() for term in required_terms
+                ):
+                    sheet_key = (str(source["extraction_id"]), source["sheet_name"])
+                    required_rows.add((*sheet_key, source["row_number"]))
+                    required_sheets[sheet_key] = max(required_sheets.get(sheet_key, 0), int(source["row_number"]))
+
+            def passes_gate(source: Mapping[str, object]) -> bool:
+                if not required_terms:
+                    return True
+                text = str(source["text"] or "").casefold()
+                if any(term in text for term in required_terms):
+                    return True
+                sheet_key = (str(source["extraction_id"]), source["sheet_name"])
+                row_number = source["row_number"]
+                if (*sheet_key, row_number) in required_rows:
+                    return True
+                return (
+                    isinstance(row_number, int) and row_number < required_sheets.get(sheet_key, 0)
+                    and self._is_snapshot_heading(text)
+                )
+
+            for source in raw_sources:
+                if len(reconciliation_candidates) >= MAX_RECONCILIATION_EXCERPTS:
+                    break
+                if not passes_gate(source):
+                    continue
+                source_text = str(source["text"] or "")
+                row_number = source["row_number"]
+                sheet_name = source["sheet_name"]
+                in_snapshot_context = (
+                    change_question
+                    and isinstance(row_number, int)
+                    and isinstance(sheet_name, str)
+                    and (str(source["extraction_id"]), sheet_name, row_number) in snapshot_rows
+                )
+                if not in_snapshot_context and not self._is_question_relevant_source(retrieval_question, source_text):
+                    continue
+                extraction_id = str(source["extraction_id"])
+                add_candidate(
+                    current_extractions[extraction_id], extraction_id, str(source["source_reference"]),
+                    (
+                        "QUESTION-RELEVANT CHANGE/SNAPSHOT EXCERPT"
+                        if in_snapshot_context else "QUESTION-RELEVANT SOURCE EXCERPT"
+                    ),
+                    prioritize_for_question=True,
+                    source=None if in_snapshot_context else source,
+                )
+
+            if required_terms:
+                # Earlier AI-review summaries and findings pass the same gate:
+                # their cell row or text block must mention a named entity or
+                # identifier. (Source excerpts were gated above.)
+                candidates = [
+                    candidate for candidate in candidates
+                    if self._mentions_required_term(connection, candidate, required_terms, neighbour_context)
+                ]
             candidates = reconciliation_candidates + candidates
+            if required_terms:
+                if not candidates and billing_instruction is None and legal_holdings is None:
+                    return self._local_plan(LocalAnswer(
+                        intent.kind,
+                        "The searchable documents used mention "
+                        + ", ".join(f"“{term}”" for term in [*present_names, *intent.identifiers])
+                        + " only in passages that could not be retrieved as citable evidence for this question. "
+                        "Nothing was sent. Ask about a specific document or a narrower point.",
+                        (), "local-relevance-check",
+                    ), len(documents), notes=notes)
             if billing_instruction is not None:
                 # The parser has already validated the exact instruction
                 # inputs. Provide them to the AI as evidence rather than
@@ -974,9 +1500,18 @@ class MatterReviewService:
                         ),
                     )
 
+            if legal_holdings is not None:
+                # The dated holding records come first; other excerpts (for
+                # example an assignment notice) follow within the budget.
+                pinned = legal_holdings.candidate
+                candidates = [pinned, *(candidate for candidate in candidates if (candidate[0], candidate[2]) != (pinned[0], pinned[2]))]
+
         total = len(candidates)
         if not candidates and document_billing is None:
-            raise MatterReviewError("Complete AI analysis for at least one selected document before asking a consolidated question.")
+            raise MatterReviewError(
+                "No relevant extracted evidence was found in the searchable documents in this scope. "
+                "Rephrase the question with terms used in the documents, or change the scope."
+            )
 
         if document_billing is not None:
             self._analysis._refresh_configuration()
@@ -988,8 +1523,13 @@ class MatterReviewService:
                 "documentBilling": document_billing,
                 "localFallback": None,
                 "comparisonCoverageComplete": True,
+                "intent": INTENT_CALCULATION,
                 "inputTokens": 0,
                 "maxOutputTokens": 0,
+                # A local calculation transmits nothing to a provider.
+                "transmittedDocumentIds": (),
+                "evidenceDocumentIds": tuple(sorted({citation[0] for citation in document_billing.citations})),
+                "searchTruncated": search_truncated,
                 "scope": {
                     "sourceItems": len(document_billing.citations),
                     "totalSourceItems": len(document_billing.citations),
@@ -1011,7 +1551,8 @@ class MatterReviewService:
         # This ordering is retrieval only: it does not merge or equate
         # records from different documents.  The provider still sees the
         # individual source and must cite its opaque E-key.
-        if self._is_overview_question(question):
+        # Comparisons also need breadth: one excerpt per document first.
+        if self._is_overview_question(question) or intent.kind == INTENT_COMPARISON:
             first_by_document: list[tuple[str, str, str, str, str]] = []
             remainder: list[tuple[str, str, str, str, str]] = []
             represented: set[str] = set()
@@ -1033,6 +1574,11 @@ class MatterReviewService:
                 f"Previous provisional answer: {follow_up['answer']}\n\n"
             )
 
+        scope_label = (
+            f"all {len(document_ids)} searchable documents in this matter"
+            if scope.mode == "all" else f"only the {len(document_ids)} searchable documents the user selected"
+        )
+
         def material_for(
             selected_candidates: Sequence[tuple[str, str, str, str, str]],
         ) -> tuple[dict[str, tuple[str, str, str, str]], list[str], str, str]:
@@ -1047,7 +1593,7 @@ class MatterReviewService:
                 compact_filename = self._bounded_text(filename, 96) or "selected document"
                 evidence_marker = "; EVIDENCE:"
                 marker_index = description.find(evidence_marker)
-                if description.startswith("DOCUMENT-BACKED BILLING INSTRUCTION;"):
+                if description.startswith(("DOCUMENT-BACKED BILLING INSTRUCTION;", "DOCUMENT-BACKED HOLDINGS RECORD;")):
                     # This is a compact, deterministic transcription of a
                     # single cited instruction. Keep all of its inputs so a
                     # conversational answer is not based on a clipped fee
@@ -1063,13 +1609,22 @@ class MatterReviewService:
                     compact_description = f"{prefix}{evidence_marker} {evidence}"
                 else:
                     compact_description = self._bounded_text(description, 500) or "Evidence excerpt"
-                lines.append(
-                    f"[{key}] DOCUMENT: {compact_filename}; SOURCE: {reference}; {compact_description}"
-                )
+                line = f"[{key}] DOCUMENT: {compact_filename}; SOURCE: {reference}; {compact_description}"
+                nearby = neighbour_context.get((source_document_id, reference))
+                if nearby:
+                    # Neighbouring cells/blocks help interpret a short value
+                    # (for example a bare quantity).  They are labelled so
+                    # the key still identifies the one cited source.
+                    line += f"\n  NEARBY CONTEXT FOR [{key}] (same source location; not separately citable): {nearby}"
+                lines.append(line)
             evidence_document_ids = {target[0] for target in targets.values()}
             coverage_context = (
-                f"QUESTION COVERAGE: Evidence excerpts represent {len(evidence_document_ids)} of {len(document_ids)} selected documents. "
-                "Do not describe the result as a complete cross-document comparison unless all selected documents are represented."
+                f"DOCUMENT SCOPE: {scope_label}. Use only the excerpts below. If the question needs information "
+                "from a document outside this scope, say that the current scope does not establish it.\n"
+                f"QUESTION COVERAGE: Evidence excerpts represent {len(evidence_document_ids)} of {len(document_ids)} searchable documents in scope. "
+                "Do not describe the result as a complete cross-document comparison unless all of them are represented.\n"
+                "CONFLICTS: Excerpts from different documents are separate records. If they disagree, say so and cite "
+                "one excerpt from each document instead of choosing between them."
             )
             # E-keys are intentionally opaque; every key's document/source
             # detail is already displayed immediately beside its literal
@@ -1116,6 +1671,17 @@ class MatterReviewService:
                 selected_document_count=len(document_ids), evidence_document_count=len(evidence_document_ids),
             ),
             "comparisonCoverageComplete": comparison_coverage_complete,
+            "intent": intent.kind,
+            "notes": notes,
+            # Locally calculated holding records shown and cited with the answer.
+            "holdingsEvidence": legal_holdings.payload if legal_holdings is not None else None,
+            "holdingsCitations": legal_holdings.citations if legal_holdings is not None else (),
+            "evidenceDocumentIds": tuple(sorted(evidence_document_ids)),
+            # Every document whose content can reach the provider in this
+            # request: cited excerpts plus any earlier answer reused as
+            # follow-up context.  Consent must cover all of them.
+            "transmittedDocumentIds": tuple(sorted(evidence_document_ids | follow_up_document_ids)),
+            "searchTruncated": search_truncated,
             "inputTokens": controls.estimate_tokens(len(prompt)),
             "maxOutputTokens": min(800, controls.max_output_tokens),
             "scope": {
@@ -1128,6 +1694,234 @@ class MatterReviewService:
                 "comparisonCoverageComplete": comparison_coverage_complete,
             },
         }
+
+    @classmethod
+    def _question_intent(cls, question: str) -> QuestionIntent:
+        return classify_question(
+            question,
+            calculation=cls._is_document_billing_question(question),
+            legal_status=cls._is_legal_status_question(question),
+            change=cls._is_change_question(question),
+        )
+
+    def _inventory_plan(self, documents: Sequence[ScopedDocument], intent: QuestionIntent) -> Mapping[str, object]:
+        """Answer a listing or relationship question from every eligible document, locally.
+
+        No top-K excerpt selection and no provider request: the inventory
+        builder examines each in-scope document's indexed extraction within
+        bounded local limits and reports any partial coverage.
+        """
+        relationships = intent.kind == INTENT_RELATIONSHIP
+        roles = intent.roles | (
+            frozenset({ROLE_INVESTOR, ROLE_INVESTOR_OR_ENTITY, ROLE_SUBFUND, ROLE_VEHICLE, ROLE_VEHICLE_OR_SUBFUND})
+            if relationships else frozenset()
+        )
+        with self._database.connection() as connection:
+            inventory = EntityInventoryBuilder(connection, [
+                InventoryDocument(document.document_id, document.filename, str(document.extraction_id))
+                for document in documents
+            ]).build(roles, relationships=relationships)
+        return self._local_plan(LocalAnswer(
+            intent.kind, inventory.answer, inventory.citations,
+            "local-relationship-mapping" if relationships else "local-entity-inventory",
+            inventory.evidence_document_ids, inventory.partial, inventory=inventory.payload,
+        ), len(documents))
+
+    def _holdings_plan(
+        self, documents: Sequence[ScopedDocument], intent: QuestionIntent, question: str, *, constrained: bool,
+    ) -> Mapping[str, object]:
+        """Compare dated holdings in exactly two spreadsheets, locally and exactly."""
+        spreadsheets = [
+            document for document in documents
+            if document.filename.rsplit(".", 1)[-1].casefold() in _SPREADSHEET_EXTENSIONS
+        ]
+        if len(spreadsheets) != 2:
+            listed = ", ".join(f"“{document.filename}”" for document in spreadsheets[:10]) or "none"
+            return self._local_plan(LocalAnswer(
+                intent.kind,
+                f"A dated holdings comparison needs exactly two holdings spreadsheets, but {len(spreadsheets)} "
+                f"{'were named' if constrained else 'are in the current scope'} ({listed}). Name the two files, for example "
+                "by the dates in their file names, or select exactly two spreadsheets. Nothing was compared or sent.",
+                (), "local-holdings-comparison",
+            ), len(documents))
+        with self._database.connection() as connection:
+            result = HoldingsComparison(connection, [
+                HoldingsDocument(document.document_id, document.filename, str(document.extraction_id))
+                for document in spreadsheets
+            ]).compare(question, legal_question=intent.legal_question)
+        return self._local_plan(LocalAnswer(
+            intent.kind, result.answer, result.citations, "local-holdings-comparison",
+            result.evidence_document_ids, not result.complete, holdings=result.payload,
+        ), len(documents))
+
+    def _legal_holdings_evidence(self, documents: Sequence[ScopedDocument], question: str) -> LegalHoldingsEvidence | None:
+        """Retrieve the factual holding records a legal-rights question refers to.
+
+        The two dated spreadsheets are compared locally (``Decimal``).  The
+        observed quantity changes become the primary evidence and their
+        document caveat supporting context; neither is a legal conclusion.
+        """
+        spreadsheets = [
+            document for document in documents
+            if document.filename.rsplit(".", 1)[-1].casefold() in _SPREADSHEET_EXTENSIONS
+        ]
+        if len(spreadsheets) != 2:
+            return None
+        extraction_of = {document.document_id: str(document.extraction_id) for document in spreadsheets}
+        with self._database.connection() as connection:
+            result = HoldingsComparison(connection, [
+                HoldingsDocument(document.document_id, document.filename, extraction_of[document.document_id])
+                for document in spreadsheets
+            ]).compare(question, legal_question=True)
+            rows = [row for row in result.payload["rows"] if row["status"] == "compared"]  # type: ignore[index, union-attr]
+            if not rows:
+                return None
+            caveat_references = {
+                (str(source["documentId"]), str(source["reference"]))
+                for caveat in result.payload["caveats"] for source in caveat["sources"]  # type: ignore[index, union-attr]
+            }
+            legal_hits = DocumentSearchIndex.search(
+                connection, list(extraction_of.values()), _LEGAL_EVENT_TERMS, per_document_limit=10, total_limit=20,
+            ).hits
+        other_legal_wording = any((hit.document_id, hit.source_reference) not in caveat_references for hit in legal_hits)
+        changed = [row for row in rows if Decimal(str(row["difference"])) != 0]
+        relevant = changed or rows
+        documents_payload = result.payload["documents"]  # type: ignore[index]
+        dates = [str(document["date"] or document["filename"]) for document in documents_payload]  # type: ignore[index]
+
+        citations: list[tuple[str, str, str, str]] = []
+
+        def cite(side: Mapping[str, object] | None, references: Sequence[object]) -> None:
+            if not side:
+                return
+            for reference in references:
+                citation = (str(side["documentId"]), extraction_of[str(side["documentId"])], str(reference), str(side["filename"]))
+                if reference and citation not in citations:
+                    citations.append(citation)
+
+        lines: list[str] = []
+        for row in relevant:
+            earlier, later = row["earlier"], row["later"]
+            for side in (earlier, later):
+                cite(side, [*side["entityReferences"], side["accountReference"], side["quantityReference"]])  # type: ignore[index]
+            label = " / ".join(
+                [str(entity["name"]) for entity in row["entities"] if entity["kind"] != "investor"]  # type: ignore[union-attr]
+                + ([str(row["account"])] if row["account"] else [])
+            )
+            lines.append(
+                f"{label}: {grouped_quantity(Decimal(str(earlier['quantity'])))} → "  # type: ignore[index]
+                f"{grouped_quantity(Decimal(str(later['quantity'])))} "  # type: ignore[index]
+                f"(change {grouped_quantity(Decimal(str(row['difference'])), signed=True)})"
+            )
+        caveats = result.payload["caveats"]  # type: ignore[index]
+        for caveat in caveats:  # type: ignore[union-attr]
+            for source in caveat["sources"]:
+                citations.append((str(source["documentId"]), extraction_of[str(source["documentId"])], str(source["reference"]), str(source["filename"])))
+        payload = dict(result.payload)
+        quantity_heading = next((
+            str(table["quantityHeading"]) for document in documents_payload for table in document["tables"]  # type: ignore[index, union-attr]
+        ), "quantity")
+        later_side = relevant[0]["later"]
+        candidate = (
+            str(later_side["documentId"]), extraction_of[str(later_side["documentId"])], str(later_side["quantityReference"]),  # type: ignore[index]
+            str(later_side["filename"]),  # type: ignore[index]
+            f"DOCUMENT-BACKED HOLDINGS RECORD; EVIDENCE: Recorded {quantity_heading.casefold()}, {dates[0]} → {dates[1]} "
+            f"(compared locally from both dated spreadsheets): " + "; ".join(lines)
+            + ". A recorded holding change is not itself evidence of a legal claim assignment.",
+        )
+        local_answer = None
+        if {document.document_id for document in documents} == set(extraction_of) and not other_legal_wording:
+            stated = ""
+            if caveats:
+                first = caveats[0]  # type: ignore[index]
+                where = ", ".join(f"{source['filename']} {source['reference']}" for source in first["sources"])  # type: ignore[index]
+                stated = f" The spreadsheets themselves state ({where}): “{first['text']}”"  # type: ignore[index]
+            issues = " ".join(str(issue) for issue in result.payload["issues"])  # type: ignore[union-attr]
+            answer = (
+                f"The holdings spreadsheets dated {dates[0]} and {dates[1]} record: " + "; ".join(lines) + ". "
+                "These are recorded holding quantities. Neither spreadsheet records an assignment or transfer of legal "
+                f"claim rights.{stated} A change in recorded holdings does not by itself prove a securities transfer between "
+                "these accounts or an assignment of legal claim rights; that would need explicit evidence, such as an "
+                "assignment agreement or notice, and no such document is among the documents used."
+                + (f" {issues}" if issues else "")
+            )
+            local_answer = LocalAnswer(
+                INTENT_LEGAL_STATUS, answer, tuple(citations), "local-legal-status-holdings",
+                frozenset(citation[0] for citation in citations), False, holdings=payload,
+            )
+        return LegalHoldingsEvidence(payload, tuple(citations), candidate, local_answer)
+
+    @staticmethod
+    def _local_plan(answer: LocalAnswer, documents_selected: int, *, notes: Sequence[str] = ()) -> dict[str, object]:
+        return {
+            "intent": answer.intent,
+            "localAnswer": answer,
+            "context": "",
+            "citationKeys": (),
+            "citationTargets": {},
+            "localFallback": None,
+            "comparisonCoverageComplete": not answer.partial,
+            "inputTokens": 0,
+            "maxOutputTokens": 0,
+            "transmittedDocumentIds": (),
+            "evidenceDocumentIds": tuple(sorted(answer.evidence_document_ids)),
+            "searchTruncated": answer.partial,
+            "notes": list(notes),
+            "scope": {
+                "sourceItems": len(answer.citations),
+                "totalSourceItems": len(answer.citations),
+                "excludedSourceItems": 0,
+                "truncated": answer.partial,
+                "documentsSelected": documents_selected,
+                "documentsWithEvidence": len(answer.evidence_document_ids),
+                "comparisonCoverageComplete": not answer.partial,
+            },
+        }
+
+    @staticmethod
+    def _named_entities(
+        connection: sqlite3.Connection, extraction_ids: Sequence[str], question: str,
+    ) -> tuple[list[str], list[str]]:
+        """Split capitalised name phrases into those present in scope and those absent."""
+        present: list[str] = []
+        missing: list[str] = []
+        for variants in question_entity_names(question):
+            found = next((
+                variant for variant in variants
+                if DocumentSearchIndex.search(connection, extraction_ids, (variant.casefold(),), per_document_limit=1, total_limit=1).hits
+            ), None)
+            if found is None:
+                missing.append(variants[0])
+            elif found.casefold() not in {name.casefold() for name in present}:
+                present.append(found)
+        return present, missing
+
+    @staticmethod
+    def _mentions_required_term(
+        connection: sqlite3.Connection, candidate: tuple[str, str, str, str, str], terms: Sequence[str],
+        neighbour_context: Mapping[tuple[str, str], str],
+    ) -> bool:
+        document_id, extraction_id, reference, _filename, description = candidate
+        # Only the cited source counts: an earlier summary may name the
+        # entity while citing an unrelated cell (for example a sheet title).
+        evidence = description.split("; EVIDENCE:", 1)[-1]
+        text = f"{evidence} {neighbour_context.get((document_id, reference), '')}".casefold()
+        if any(term in text for term in terms):
+            return True
+        # A spreadsheet cell qualifies when its row names the entity/identifier.
+        cell = connection.execute(
+            "SELECT content_kind, worksheet_index, sheet_name, row_number FROM extracted_content "
+            "WHERE extraction_id = ? AND source_reference = ? LIMIT 1",
+            (extraction_id, reference),
+        ).fetchone()
+        if cell is None or cell["row_number"] is None:
+            return False
+        row_text = " ".join(str(row["value_text"] or "") for row in connection.execute(
+            "SELECT value_text FROM extracted_content WHERE extraction_id = ? AND content_kind = ? AND worksheet_index IS ? "
+            "AND sheet_name IS ? AND row_number = ? AND is_empty = 0",
+            (extraction_id, cell["content_kind"], cell["worksheet_index"], cell["sheet_name"], cell["row_number"]),
+        ).fetchall()).casefold()
+        return any(term in row_text for term in terms)
 
     def _local_matter_question_fallback(
         self,
@@ -1146,7 +1940,9 @@ class MatterReviewService:
         """
         evidence: list[tuple[str, str]] = []
         for line in lines:
-            match = re.match(r"^\[([^\]]+)\].*?EVIDENCE:\s*(.*)$", line)
+            # Only the first line holds the cited excerpt; an indented nearby
+            # context line is interpretation aid, never quotable evidence.
+            match = re.match(r"^\[([^\]]+)\].*?EVIDENCE:\s*(.*)$", line.split("\n", 1)[0])
             if match is None:
                 continue
             key, text = match.group(1), " ".join(match.group(2).split())
@@ -1233,7 +2029,7 @@ class MatterReviewService:
     def _is_comparison_question(question: str) -> bool:
         query = question.casefold()
         return any(term in query for term in (
-            "compare", "comparison", "across", "each isin", "for each isin", "each available date",
+            "compare", "comparison", "each isin", "for each isin", "each available date",
             "quantities differ", "which quantities differ", "differences between", "difference between",
         ))
 
@@ -1318,10 +2114,46 @@ class MatterReviewService:
 
     @staticmethod
     def _is_document_billing_question(question: str) -> bool:
-        query = question.casefold()
+        query = primary_request_text(question)
         return any(term in query for term in (
             "pro rata", "pro-rata", "allocation", "allocate", "billing", "invoice", "fee pool",
         ))
+
+    @staticmethod
+    def _question_terms(question: str) -> frozenset[str]:
+        """Return the lower-case substrings that make a source relevant.
+
+        The same terms drive the local index query and the final in-memory
+        check, so indexing never changes which sources count as relevant.
+        """
+        query = question.casefold()
+        if MatterReviewService._is_document_billing_question(question):
+            return frozenset({
+                "billing", "pro-rata", "pro rata", "fee pool", "allocation", "eligible", "nominal",
+                "invoice", "currency", "withdraw", "excluded",
+            })
+        if MatterReviewService._is_legal_status_question(question):
+            return frozenset({
+                "litig", "claim", "right", "assign", "transfer", "withdraw", "settle", "mandate", "participat",
+                "entitle", "abtret", "übertrag", "uebertrag", "klage", "anspruch", "verfahren", "vergleich",
+                "austritt", "beteilig", "beend", "kündig", "kuendig",
+            })
+        if MatterReviewService._is_change_question(question):
+            return frozenset({
+                "change", "changed", "transfer", "trade", "transaction", "movement", "purchase", "sale",
+                "sell", "redeem", "redemption", "liquidat", "merge", "split", "delete", "remov", "close",
+                "subfund", "sub-fund", "fund", "account", "holding", "position", "quantity", "share",
+                "unit", "isin", "date", "übertrag", "uebertrag", "änder", "aender", "bestand", "konto",
+                "verkauf", "kauf", "tilgung", "liquid", "teilfonds", "teil-fonds", "fonds", "depot",
+                "anteil", "anteile", "wertpapier", "zuteil", "transaktion", "rückzahlung", "rueckzahlung",
+                "abschreib", "herabsetz", "umtausch", "kündigung", "kuendigung",
+            })
+        terms = {
+            # A trailing plural "s" would stop "investors" matching "Investor".
+            token[:-1] if len(token) > 5 and token.endswith("s") and not token.endswith("ss") else token
+            for token in re.findall(r"[a-z0-9]{5,}", query) if token not in _GENERIC_QUESTION_WORDS
+        }
+        return frozenset(terms | {identifier.casefold() for identifier in lookup_identifiers(question)})
 
     @staticmethod
     def _is_question_relevant_source(question: str, source_text: str) -> bool:
@@ -1330,37 +2162,141 @@ class MatterReviewService:
         This is retrieval, not a legal conclusion.  The provider must still
         cite the exact local excerpt and the response remains provisional.
         """
-        query = question.casefold()
+        terms = MatterReviewService._question_terms(question)
         text = source_text.casefold()
-        legal_status_question = MatterReviewService._is_legal_status_question(question)
-        if MatterReviewService._is_document_billing_question(question):
-            terms = {
-                "billing", "pro-rata", "pro rata", "fee pool", "allocation", "eligible", "nominal",
-                "invoice", "currency", "withdraw", "excluded",
-            }
-        elif legal_status_question:
-            terms = {
-                "litig", "claim", "right", "assign", "transfer", "withdraw", "settle", "mandate", "participat",
-                "entitle", "abtret", "übertrag", "uebertrag", "klage", "anspruch", "verfahren", "vergleich",
-                "austritt", "beteilig", "beend", "kündig", "kuendig",
-            }
-        elif MatterReviewService._is_change_question(question):
-            terms = {
-                "change", "changed", "transfer", "trade", "transaction", "movement", "purchase", "sale",
-                "sell", "redeem", "redemption", "liquidat", "merge", "split", "delete", "remov", "close",
-                "subfund", "sub-fund", "fund", "account", "holding", "position", "quantity", "share",
-                "unit", "isin", "date", "übertrag", "uebertrag", "änder", "aender", "bestand", "konto",
-                "verkauf", "kauf", "tilgung", "liquid", "teilfonds", "teil-fonds", "fonds", "depot",
-                "anteil", "anteile", "wertpapier", "zuteil", "transaktion", "rückzahlung", "rueckzahlung",
-                "abschreib", "herabsetz", "umtausch", "kündigung", "kuendigung",
-            }
-        else:
-            terms = {token for token in re.findall(r"[a-z0-9]{5,}", query)}
         return bool(terms) and any(term in text for term in terms)
+
+    def _ordered_sources(
+        self,
+        connection: sqlite3.Connection,
+        hits: Sequence[SearchHit],
+        question: str,
+        *,
+        expand_snapshots: bool,
+    ) -> list[dict[str, object]]:
+        """Order index hits for bounded selection, adding snapshot rows if needed.
+
+        Within a document, sources keep their reading order (sheet, row,
+        column or page, block).  Documents are then interleaved, in order of
+        their best match, so a multi-document question is not answered from
+        whichever file happens to sort first.
+        """
+        sources: dict[tuple[str, str], dict[str, object]] = {}
+        document_order: list[str] = []
+        for hit in hits:
+            if hit.document_id not in document_order:
+                document_order.append(hit.document_id)
+            sources[(hit.extraction_id, hit.source_reference)] = {
+                "document_id": hit.document_id, "extraction_id": hit.extraction_id,
+                "content_kind": hit.source_kind, "source_reference": hit.source_reference, "text": hit.text,
+                "sheet_name": hit.sheet_name, "worksheet_index": hit.worksheet_index,
+                "row_number": hit.row_number, "column_number": hit.column_number,
+                "page_number": hit.page_number, "block_index": hit.block_index,
+            }
+        if expand_snapshots:
+            expansions: list[tuple[str, str, str, str, int | None, int]] = []
+            seen_rows: set[tuple[str, str, int]] = set()
+            for hit in hits:
+                if (
+                    hit.sheet_name is None or hit.row_number is None
+                    or not (self._is_snapshot_heading(hit.text) or self._is_question_relevant_source(question, hit.text))
+                ):
+                    continue
+                row_identity = (hit.extraction_id, hit.sheet_name, hit.row_number)
+                if row_identity in seen_rows:
+                    continue
+                seen_rows.add(row_identity)
+                expansions.append((
+                    hit.document_id, hit.extraction_id, hit.source_kind, hit.sheet_name, hit.worksheet_index, hit.row_number,
+                ))
+                if len(expansions) >= MAX_SNAPSHOT_ROW_EXPANSIONS:
+                    break
+            for document_id, extraction_id, content_kind, sheet_name, worksheet_index, row_number in expansions:
+                for row in connection.execute(
+                    "SELECT source_reference, content_kind, sheet_name, worksheet_index, row_number, column_number, "
+                    "COALESCE(value_text, '') || ' ' || COALESCE(formula_text, '') AS text FROM extracted_content "
+                    "WHERE extraction_id = ? AND content_kind = ? AND worksheet_index IS ? AND sheet_name = ? "
+                    "AND row_number BETWEEN ? AND ? AND is_empty = 0 ORDER BY row_number, column_number",
+                    (extraction_id, content_kind, worksheet_index, sheet_name, row_number, row_number + 2),
+                ).fetchall():
+                    sources.setdefault((extraction_id, str(row["source_reference"])), {
+                        "document_id": document_id, "extraction_id": extraction_id,
+                        "content_kind": row["content_kind"], "source_reference": str(row["source_reference"]),
+                        "text": str(row["text"] or ""), "sheet_name": row["sheet_name"],
+                        "worksheet_index": row["worksheet_index"], "row_number": row["row_number"],
+                        "column_number": row["column_number"], "page_number": None, "block_index": None,
+                    })
+
+        def reading_order(source: Mapping[str, object]) -> tuple[object, ...]:
+            def number(key: str) -> int:
+                value = source.get(key)
+                return value if isinstance(value, int) else 0
+            return (
+                number("worksheet_index"), str(source.get("sheet_name") or ""), number("row_number"),
+                number("column_number"), number("page_number"), number("block_index"), str(source["source_reference"]),
+            )
+
+        by_document: dict[str, list[dict[str, object]]] = {}
+        for source in sources.values():
+            by_document.setdefault(str(source["document_id"]), []).append(source)
+        queues = [sorted(by_document[document_id], key=reading_order) for document_id in document_order]
+        ordered: list[dict[str, object]] = []
+        while any(queues):
+            for queue in queues:
+                if queue:
+                    ordered.append(queue.pop(0))
+        return ordered
+
+    def _neighbour_context(self, connection: sqlite3.Connection, source: Mapping[str, object]) -> str | None:
+        """Describe adjacent stored text so a short cell or block can be read correctly."""
+        extraction_id = source.get("extraction_id")
+        reference = source.get("source_reference")
+        parts: list[str] = []
+        if source.get("content_kind") == "pdf_text_block":
+            page_number, block_index = source.get("page_number"), source.get("block_index")
+            if not isinstance(page_number, int) or not isinstance(block_index, int):
+                return None
+            for row in connection.execute(
+                "SELECT b.block_index, b.text FROM pdf_page_extractions p JOIN pdf_text_blocks b "
+                "ON b.pdf_page_extraction_id = p.id WHERE p.extraction_id = ? AND p.page_number = ? "
+                "AND b.block_index IN (?, ?) AND b.text <> '' ORDER BY b.block_index",
+                (extraction_id, page_number, block_index - 1, block_index + 1),
+            ).fetchall():
+                label = "PREVIOUS BLOCK" if int(row["block_index"]) < block_index else "NEXT BLOCK"
+                parts.append(f"{label}: {' '.join(str(row['text']).split())[:80]}")
+        else:
+            row_number, sheet_name = source.get("row_number"), source.get("sheet_name")
+            if not isinstance(row_number, int) or not isinstance(sheet_name, str):
+                return None
+            grid = (extraction_id, source.get("content_kind"), source.get("worksheet_index"), sheet_name)
+            grid_filter = "extraction_id = ? AND content_kind = ? AND worksheet_index IS ? AND sheet_name = ? AND is_empty = 0"
+
+            def row_text(number: int) -> str:
+                cells = connection.execute(
+                    f"SELECT source_reference, value_text FROM extracted_content WHERE {grid_filter} "
+                    f"AND row_number = ? AND source_reference <> ? ORDER BY column_number LIMIT 8",
+                    (*grid, number, reference),
+                ).fetchall()
+                return " | ".join(f"{cell['source_reference']}: {str(cell['value_text'] or '')[:40]}" for cell in cells)
+
+            same_row = row_text(row_number)
+            if same_row:
+                parts.append(f"SAME ROW: {same_row}")
+            first_row = connection.execute(
+                f"SELECT MIN(row_number) FROM extracted_content WHERE {grid_filter}", grid,
+            ).fetchone()[0]
+            if isinstance(first_row, int) and first_row < row_number:
+                first = row_text(first_row)
+                if first:
+                    parts.append(f"FIRST ROW OF SHEET: {first}")
+        context = "; ".join(parts)
+        return context[:MAX_NEIGHBOUR_CONTEXT_CHARACTERS] if context else None
 
     @staticmethod
     def _is_legal_status_question(question: str) -> bool:
-        query = question.casefold()
+        # Legal words inside a caveat request or negative instruction ("do
+        # not treat this as an assignment") do not make a legal question.
+        query = primary_request_text(question)
         return any(token in query for token in (
             "litigation", "participat", "claim", "right", "assign", "withdraw", "settle",
         ))
@@ -1378,43 +2314,60 @@ class MatterReviewService:
     @staticmethod
     def _is_snapshot_heading(source_text: str) -> bool:
         text = source_text.casefold().strip()
-        return any(term in text for term in (
-            "subfund", "sub-fund", "fund", "account", "holder", "investor", "security", "isin",
-            "holding", "position", "quantity", "shares", "units", "date", "transaction", "trade",
-            "konto", "bestand", "menge", "wertpapier", "datum", "teilfonds", "teil-fonds", "fonds", "depot",
-        ))
+        return any(term in text for term in _SNAPSHOT_HEADING_TERMS)
 
     @staticmethod
-    def _matter_question_params(
-        params: object, acknowledged: bool,
-    ) -> tuple[list[str], str, Mapping[str, str] | None]:
-        expected = {"documentIds", "question", "acknowledged"} if acknowledged else {"documentIds", "question"}
-        if not isinstance(params, dict) or not expected.issubset(params) or not set(params).issubset(expected | {"followUp"}):
+    def _matter_question_params(params: object, acknowledged: bool) -> MatterQuestionRequest:
+        """Validate an explicitly scoped question request.
+
+        A request must always name its matter and scope mode.  Selected mode
+        never falls back to all documents: an empty selection is rejected.
+        """
+        required = {"matterId", "scope", "question"}
+        if acknowledged:
+            required |= {"acknowledged", "consentedDocumentIds"}
+        if not isinstance(params, dict) or not required.issubset(params) or not set(params).issubset(required | {"followUpQuestionId"}):
             raise MatterReviewError("The consolidated question request is invalid.")
         if acknowledged and params.get("acknowledged") is not True:
             raise MatterReviewError("Confirm external processing before asking a consolidated question.")
+        matter_id = params.get("matterId")
+        if not isinstance(matter_id, str) or not _MATTER_ID.fullmatch(matter_id):
+            raise MatterReviewError("The requested matter is unavailable. Reopen the matter and try again.")
         question = params.get("question")
         if not isinstance(question, str) or not question.strip() or len(question) > 600:
             raise MatterReviewError("Enter a question of no more than 600 characters.")
-        follow_up = params.get("followUp")
-        if follow_up is not None:
-            if (
-                not isinstance(follow_up, Mapping)
-                or set(follow_up) != {"question", "answer"}
-                or not isinstance(follow_up.get("question"), str)
-                or not isinstance(follow_up.get("answer"), str)
-                or not follow_up["question"].strip()
-                or not follow_up["answer"].strip()
-                or len(follow_up["question"]) > 600
-                or len(follow_up["answer"]) > 1200
-            ):
-                raise MatterReviewError("The follow-up context is invalid.")
-            follow_up = {
-                "question": follow_up["question"].strip(),
-                "answer": follow_up["answer"].strip(),
-            }
-        document_ids = MatterReviewService._batch_document_ids({"documentIds": params.get("documentIds")}, require_acknowledgement=False)
-        return document_ids, question.strip(), follow_up
+        scope = params.get("scope")
+        mode = scope.get("mode") if isinstance(scope, dict) else None
+        if not isinstance(scope, dict) or mode not in _SCOPE_MODES:
+            raise MatterReviewError("Choose whether to ask about all documents or selected documents only.")
+        selected: tuple[str, ...] = ()
+        if mode == "all":
+            if set(scope) != {"mode"}:
+                raise MatterReviewError("An all-document question cannot also name selected documents.")
+        else:
+            if set(scope) != {"mode", "documentIds"} or not isinstance(scope.get("documentIds"), list):
+                raise MatterReviewError("Select documents for a selected-documents question.")
+            document_ids = scope["documentIds"]
+            if not document_ids:
+                raise MatterReviewError("Select at least one document, or choose all documents in this matter.")
+            if len(document_ids) > MAX_DOCUMENTS:
+                raise MatterReviewError(f"Select up to {MAX_DOCUMENTS} documents for one question.")
+            if not all(isinstance(value, str) and _UUID.fullmatch(value) for value in document_ids) or len(set(document_ids)) != len(document_ids):
+                raise MatterReviewError("Each selected document must have a unique valid reference.")
+            selected = tuple(document_ids)
+        follow_up_question_id = params.get("followUpQuestionId")
+        if follow_up_question_id is not None and (not isinstance(follow_up_question_id, str) or not _UUID.fullmatch(follow_up_question_id)):
+            raise MatterReviewError("The follow-up reference is invalid.")
+        consented: frozenset[str] = frozenset()
+        if acknowledged:
+            values = params.get("consentedDocumentIds")
+            if not isinstance(values, list) or len(values) > 10_000 or not all(isinstance(value, str) and _UUID.fullmatch(value) for value in values):
+                raise MatterReviewError("The document consent list is invalid.")
+            consented = frozenset(values)
+        return MatterQuestionRequest(
+            matter_id=matter_id, mode=str(mode), selected_document_ids=selected, question=question.strip(),
+            follow_up_question_id=follow_up_question_id, consented_document_ids=consented,
+        )
 
     def _run_batch(self, batch_id: str) -> None:
         with self._batch_lock:

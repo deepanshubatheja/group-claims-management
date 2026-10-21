@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .document_search import DocumentSearchIndex
 from ..storage.documents import DocumentMetadataRepository, DocumentRecord
 from ..storage.service import StorageService
 from ..storage.vault import VaultImportError, VaultStorageError
@@ -511,6 +512,9 @@ class DocumentImportService:
                 (document.id,),
             )
             connection.execute("DELETE FROM ai_processing_jobs WHERE source_document_id = ?", (document.id,))
+            # The search index holds a derived copy of extracted text; remove
+            # it with the extraction rows so no removed content stays searchable.
+            DocumentSearchIndex.remove_document(connection, document.id)
             connection.execute(
                 "DELETE FROM pdf_text_blocks WHERE pdf_page_extraction_id IN ("
                 "SELECT p.id FROM pdf_page_extractions p JOIN document_extractions e ON e.id = p.extraction_id "

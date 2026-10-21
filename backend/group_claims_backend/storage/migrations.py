@@ -405,6 +405,45 @@ def _migration_009_add_ai_analysis_summaries(connection: sqlite3.Connection) -> 
     )
 
 
+def _migration_010_add_document_search_index(connection: sqlite3.Connection) -> None:
+    """Add a derived, local full-text index over deterministic extraction output.
+
+    The index is rebuildable and never authoritative: every retrieved hit is
+    re-resolved against ``extracted_content`` or ``pdf_text_blocks`` before it
+    can be cited.  Extractions are indexed lazily when a scoped question first
+    needs them, so this migration does not rewrite or reparse existing data.
+    The trigram tokenizer preserves the case-insensitive substring semantics
+    of the earlier in-memory scan, including German compound words.
+    """
+
+    connection.executescript(
+        """
+        CREATE VIRTUAL TABLE document_search_fts USING fts5(
+            text,
+            source_document_id UNINDEXED,
+            extraction_id UNINDEXED,
+            source_kind UNINDEXED,
+            source_reference UNINDEXED,
+            sheet_name UNINDEXED,
+            worksheet_index UNINDEXED,
+            row_number UNINDEXED,
+            column_number UNINDEXED,
+            page_number UNINDEXED,
+            block_index UNINDEXED,
+            tokenize = 'trigram case_sensitive 0'
+        );
+        CREATE TABLE document_search_index (
+            extraction_id TEXT PRIMARY KEY,
+            source_document_id TEXT NOT NULL,
+            item_count INTEGER NOT NULL CHECK (item_count >= 0),
+            unavailable_page_count INTEGER NOT NULL DEFAULT 0 CHECK (unavailable_page_count >= 0),
+            indexed_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_document_search_index_document ON document_search_index(source_document_id);
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _migration_001_initial_schema),
     Migration(2, _migration_002_add_investment_vehicle_type),
@@ -415,6 +454,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(7, _migration_007_add_ai_job_coverage),
     Migration(8, _migration_008_add_ai_usage_cost_metadata),
     Migration(9, _migration_009_add_ai_analysis_summaries),
+    Migration(10, _migration_010_add_document_search_index),
 )
 
 

@@ -769,7 +769,7 @@ class AIAnalysisService:
                 return (f"page {int(block.group(1))} block {int(block.group(2))}", str(row["text"]))
         canonical_reference: str | None = None
         row = connection.execute(
-            "SELECT source_reference, COALESCE(value_text, '') || '\\n' || COALESCE(formula_text, '') AS text "
+            "SELECT source_reference, COALESCE(value_text, '') || char(10) || COALESCE(formula_text, '') AS text "
             "FROM extracted_content WHERE extraction_id = ? AND source_reference = ? COLLATE NOCASE LIMIT 1",
             (extraction_id, source_reference),
         ).fetchone()
@@ -781,7 +781,7 @@ class AIAnalysisService:
                 for letter in csv_reference.group(1).upper():
                     column = column * 26 + ord(letter) - ord("A") + 1
                 row = connection.execute(
-                    "SELECT source_reference, COALESCE(value_text, '') || '\\n' || COALESCE(formula_text, '') AS text "
+                    "SELECT source_reference, COALESCE(value_text, '') || char(10) || COALESCE(formula_text, '') AS text "
                     "FROM extracted_content WHERE extraction_id = ? AND content_kind = 'csv_cell' "
                     "AND row_number = ? AND column_number = ? LIMIT 1",
                     (extraction_id, int(csv_reference.group(2)), column),

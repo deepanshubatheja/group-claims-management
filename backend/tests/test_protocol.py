@@ -156,7 +156,7 @@ class ProtocolServerTests(unittest.TestCase):
             result = responses[0]["result"]
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["databaseStatus"], "connected")
-            self.assertEqual(result["schemaVersion"], 9)
+            self.assertEqual(result["schemaVersion"], 10)
             self.assertTrue(result["directoriesAvailable"])
             self.assertTrue((root / "database" / "claims.sqlite").is_file())
 
