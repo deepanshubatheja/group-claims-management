@@ -22,6 +22,11 @@ from typing import Mapping, Sequence
 
 from .ai import AIServiceError
 from .ai_analysis import AIAnalysisError, AIAnalysisService
+from .billing_allocation import (
+    InstructionBlock, Participant as BillingParticipant, ScopeDocument as BillingScopeDocument, allocation_payload,
+    comparison_date as billing_comparison_date, cross_check as billing_cross_check, exclusions as billing_exclusions,
+    instruction_isin, missing_inputs as billing_missing_inputs, split_label as split_participant_label,
+)
 from .document_search import DocumentSearchIndex, SearchHit
 from .document_references import CandidateDocument, DocumentConstraint, resolve_document_references
 from .entity_inventory import EntityInventoryBuilder, InventoryDocument
@@ -121,6 +126,8 @@ class DocumentBillingAnswer:
     answer: str
     citations: tuple[tuple[str, str, str, str], ...]
     instruction_context: str
+    # The structured allocation shown by the answer card (allocation requests only).
+    payload: Mapping[str, object] | None = None
 
 
 @dataclass
@@ -225,6 +232,8 @@ class MatterQuestion:
     inventory: Mapping[str, object] | None = None
     # A locally calculated dated holdings comparison.
     holdings: Mapping[str, object] | None = None
+    # A document-backed pro-rata allocation.
+    billing: Mapping[str, object] | None = None
     answer: str | None = None
     unknown: bool = False
     citations: tuple[Mapping[str, str], ...] = ()
@@ -430,17 +439,26 @@ class MatterReviewService:
             )
             pages.setdefault(page_identity, []).append(source)
         instructions: list[tuple[list[sqlite3.Row], str, Decimal, list[AllocationRow], str]] = []
+        incomplete_pages: list[list[sqlite3.Row]] = []
         for page_sources in pages.values():
             source_text = "\n".join(str(source["text"]) for source in page_sources)
             parsed = self._parse_document_billing_instruction(source_text)
             if parsed is None:
+                folded = " ".join(source_text.split()).casefold()
+                if "eligible participant" in folded and ("fee pool" in folded or "allocation rule" in folded):
+                    incomplete_pages.append(page_sources)
                 continue
             currency, fee_pool, rows, period = parsed
             instructions.append((page_sources, currency, fee_pool, rows, period))
+        intent = self._document_billing_intent(question)
         # Multiple valid instructions could represent conflicting billing
-        # agreements.  Refuse to choose between them automatically.
+        # agreements.  Refuse to choose between them automatically.  An
+        # allocation request says so locally, as it does for an instruction
+        # that lacks a required input, instead of letting a model calculate.
         if len(instructions) != 1:
-            return None
+            if intent != "allocation" or not (instructions or incomplete_pages):
+                return None
+            return self._incomplete_billing_answer(instructions, incomplete_pages)
         page_sources, currency, fee_pool, rows, period = instructions[0]
         source_text = "\n".join(str(source["text"]) for source in page_sources)
         allocations = self._allocate_pro_rata(fee_pool, rows)
@@ -449,29 +467,62 @@ class MatterReviewService:
             f"{row.label}: {currency} {fee:,.2f}"
             for row, fee in allocations
         )
-        excluded_match = re.search(
-            r"Excluded\s+participant\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([^\n]+)",
-            source_text, flags=re.IGNORECASE,
-        )
-        exclusion = ""
-        if excluded_match is not None:
-            exclusion = (
-                f" {excluded_match.group(1).strip()} ({excluded_match.group(2).strip()}) is excluded by the "
-                f"instruction because it is recorded as {excluded_match.group(3).strip()}."
+        excluded = billing_exclusions(source_text)
+        exclusion = "".join(f" {item.phrase}" for item in excluded)
+        blocks = [
+            InstructionBlock(
+                str(source["document_id"]), str(source["extraction_id"]), str(source["original_filename"]),
+                str(source["source_reference"]), str(source["text"]),
             )
+            for source in page_sources
+        ]
+        payload: dict[str, object] | None = None
+        cross_citations: list[tuple[str, str, str, str]] = []
+        if intent == "allocation":
+            on_date, date_basis = billing_comparison_date(source_text, period)
+            participants = [
+                BillingParticipant(*split_participant_label(row.label), "eligible", row.eligible_amount) for row in rows
+            ] + [BillingParticipant(item.name, item.identifier, "excluded") for item in excluded]
+            with self._database.connection() as connection:
+                checks = billing_cross_check(
+                    connection,
+                    [
+                        BillingScopeDocument(
+                            document.document_id, document.filename, str(document.extraction_id),
+                            document.filename.rsplit(".", 1)[-1].casefold() in _SPREADSHEET_EXTENSIONS,
+                        )
+                        for document in documents if document.extraction_id is not None
+                    ],
+                    blocks[0].document_id, participants, on_date, date_basis, instruction_isin(source_text),
+                )
+            payload = allocation_payload(
+                blocks, currency=currency, fee_pool=fee_pool, period=period,
+                allocations=[(row.label, row.eligible_amount, fee) for row, fee in allocations],
+                excluded=excluded, checks=checks,
+            )
+            cross_citations = [
+                *checks.citations,
+                *(
+                    (str(entry["source"]["documentId"]), str(entry["extractionId"]),  # type: ignore[index]
+                     str(entry["source"]["reference"]), str(entry["source"]["filename"]))  # type: ignore[index]
+                    for entry in checks.undetermined
+                ),
+            ]
+        # Cite the blocks that state the instruction's inputs; a parser may
+        # preserve an instruction as one large page block, which remains a
+        # valid precise citation when field-level blocks are not available.
+        cited_references = {
+            source["reference"] for source in self._payload_sources(payload) if source["documentId"] == blocks[0].document_id
+        } if payload is not None else set()
         citation_sources = [
             source for source in page_sources
-            if re.match(
+            if str(source["source_reference"]) in cited_references or re.match(
                 r"^\s*(Fee\s+pool|Allocation\s+rule|Eligible\s+participant|Excluded\s+participant)\b",
                 str(source["text"]), flags=re.IGNORECASE,
             )
         ]
-        # A parser may preserve an instruction as one large page block. That
-        # single block remains a valid precise citation when field-level
-        # layout blocks are not available.
         if not citation_sources:
             citation_sources = page_sources
-        intent = self._document_billing_intent(question)
         if intent == "verification":
             steps = "; ".join(
                 f"{row.label}: {self._document_decimal(row.eligible_amount)} / "
@@ -496,12 +547,31 @@ class MatterReviewService:
                 "This remains a local calculation preview, not an invoice or a legal-entitlement determination."
             )
         elif intent == "allocation":
+            undetermined = [
+                str(participant["name"]) for participant in payload["participants"]  # type: ignore[index, union-attr]
+                if participant["status"] == "undetermined"
+            ] if payload is not None else []
+            conflicts = [
+                check for check in payload["crossChecks"]  # type: ignore[index, union-attr]
+                if check["status"] == "conflict"
+            ] if payload is not None else []
             answer = (
                 f"Using the approved document-backed pro-rata instruction for {period}, the provisional allocation "
                 f"of {currency} {fee_pool:,.2f} is {allocations_text}. "
                 "The instruction applies eligible nominal amount divided by total eligible nominal amount, with "
-                f"currency rounding to reconcile to the fee pool.{exclusion} This is a local calculation preview, "
-                "not an invoice or a determination of legal entitlement."
+                f"currency rounding to reconcile to the fee pool.{exclusion}"
+                + (
+                    f" Not named in the instruction, so eligibility is undetermined: {', '.join(undetermined)}."
+                    if undetermined else ""
+                )
+                + "".join(
+                    f" Unresolved discrepancy: {check['source']['filename']} ({check['source']['reference']}) records "  # type: ignore[index]
+                    f"{self._document_decimal(Decimal(str(check['recordedAmount'])))} for {check['participant']} as of "
+                    f"{check['asOfDate']}, while the instruction uses {self._document_decimal(Decimal(str(check['instructionAmount'])))}; "
+                    "the instruction amount was used unchanged."
+                    for check in conflicts
+                )
+                + " This is a local calculation preview, not an invoice or a determination of legal entitlement."
             )
         else:
             participant_labels = ", ".join(row.label for row in rows)
@@ -533,9 +603,87 @@ class MatterReviewService:
                     str(source["source_reference"]), str(source["original_filename"]),
                 )
                 for source in citation_sources
-            ),
+            ) + tuple(dict.fromkeys(cross_citations)),
             instruction_context=instruction_context,
+            payload=payload,
         )
+
+    def _incomplete_billing_answer(
+        self,
+        instructions: Sequence[tuple[list[sqlite3.Row], str, Decimal, list[AllocationRow], str]],
+        incomplete_pages: Sequence[list[sqlite3.Row]],
+    ) -> DocumentBillingAnswer:
+        """Say why no allocation was calculated; never choose or complete an instruction."""
+        pages = [page for page, *_inputs in instructions] if instructions else list(incomplete_pages)
+        filenames = sorted({str(page[0]["original_filename"]) for page in pages})
+        missing: list[str] = []
+        issues: list[str] = []
+        if len(instructions) > 1:
+            issues.append(
+                f"{len(instructions)} approved billing instructions were found ({', '.join(filenames)}). "
+                "ClaimFlow does not choose between billing instructions."
+            )
+            answer = (
+                f"No allocation was calculated: {len(instructions)} approved billing instructions were found "
+                f"({', '.join(filenames)}), and ClaimFlow does not choose between them. Narrow the question to one "
+                "instruction document."
+            )
+        elif len(pages) == 1:
+            missing = billing_missing_inputs("\n".join(str(source["text"]) for source in pages[0])) or [
+                "inputs in a form that could be read exactly"
+            ]
+            answer = (
+                f"No allocation was calculated: the billing instruction in {filenames[0]} does not state "
+                + "; ".join(missing) + ". No amount was assumed for the missing inputs."
+            )
+        else:
+            issues.append(
+                f"{len(pages)} pages look like billing instructions ({', '.join(filenames)}), but none states every "
+                "input a document-backed allocation needs."
+            )
+            answer = (
+                f"No allocation was calculated: {len(pages)} pages look like billing instructions, but none states "
+                "every required input. No amount was assumed for the missing inputs."
+            )
+        sources = [source for page in pages for source in page]
+        blocks = [
+            InstructionBlock(
+                str(source["document_id"]), str(source["extraction_id"]), str(source["original_filename"]),
+                str(source["source_reference"]), str(source["text"]),
+            )
+            for source in pages[0]
+        ]
+        single = instructions[0] if len(instructions) == 1 else None
+        payload = allocation_payload(
+            blocks, currency=single[1] if single else None, fee_pool=single[2] if single else None,
+            period=single[4] if single else None, missing=missing, issues=issues,
+        )
+        cited = [
+            source for source in sources
+            if re.match(r"^\s*(Fee\s+pool|Allocation\s+rule|Eligible\s+participant|Billing\s+period)\b", str(source["text"]), flags=re.IGNORECASE)
+        ] or sources
+        return DocumentBillingAnswer(
+            answer=answer,
+            citations=tuple(
+                (
+                    str(source["document_id"]), str(source["extraction_id"]),
+                    str(source["source_reference"]), str(source["original_filename"]),
+                )
+                for source in cited
+            ),
+            instruction_context="",
+            payload=payload,
+        )
+
+    @staticmethod
+    def _payload_sources(payload: Mapping[str, object]) -> list[Mapping[str, str]]:
+        """Every instruction source a billing payload points to."""
+        sources: list[object] = [
+            (payload.get(key) or {}).get("source")  # type: ignore[union-attr]
+            for key in ("approvedBy", "investorGroup", "period", "feePool", "rule")
+        ]
+        sources += [participant.get("source") for participant in payload.get("participants", [])]  # type: ignore[union-attr]
+        return [source for source in sources if isinstance(source, Mapping)]
 
     @staticmethod
     def _document_billing_intent(question: str) -> str:
@@ -874,7 +1022,7 @@ class MatterReviewService:
                 answer=document_billing.answer, citations=tuple(citations), model="local-document-calculation",
                 matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
                 context_document_ids=frozenset(citation["documentId"] for citation in citations) | follow_up_document_ids,
-                intent=INTENT_CALCULATION,
+                intent=INTENT_CALCULATION, billing=document_billing.payload,
             )
             with self._question_lock:
                 self._questions[job.id] = job
@@ -938,6 +1086,7 @@ class MatterReviewService:
                 "intent": job.intent,
                 "inventory": dict(job.inventory) if job.inventory is not None else None,
                 "holdingsComparison": dict(job.holdings) if job.holdings is not None else None,
+                "billingAllocation": dict(job.billing) if job.billing is not None else None,
                 "scope": dict(job.scope),
                 "documentScope": dict(job.document_scope or {}),
                 "usage": {

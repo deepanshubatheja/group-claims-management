@@ -1,4 +1,5 @@
-import { buildAnswerView, type AnswerInput, type Notice, type SourceLink } from "./answer-presentation.js";
+import { useState } from "react";
+import { buildAnswerView, type AnswerInput, type BillingView, type Notice, type SourceLink } from "./answer-presentation.js";
 
 type OpenSource = (documentId: string, sourceReference: string) => void;
 
@@ -16,6 +17,58 @@ function Notices({ notices }: { notices: Notice[] }) {
   return <ul className="answer-notices" aria-label="Warnings and notes">
     {notices.map((notice) => <li key={notice.text} className={notice.tone === "warning" ? "warning" : "info"}>{notice.text}</li>)}
   </ul>;
+}
+
+/** A pro-rata allocation: summary figures, the allocation table, the formula, and unresolved discrepancies. */
+function BillingResult({ billing, onOpenSource }: { billing: BillingView; onOpenSource?: OpenSource }) {
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? billing.rows : billing.rows.slice(0, billing.pageSize);
+  return <>
+    {billing.metrics.length > 0 && <dl className="answer-metrics">
+      {billing.metrics.map((metric) => <div key={metric.label}><dt>{metric.label}</dt><dd>{metric.value}{metric.detail && <small>{metric.detail}</small>}
+        {metric.source && <SourceButton source={metric.source} text={metric.source.reference} onOpenSource={onOpenSource} />}</dd></div>)}
+    </dl>}
+    {billing.rows.length > 0 && <div className="answer-table" role="region" aria-label="Pro-rata billing allocation table" tabIndex={0}><table className="billing-table">
+      <thead><tr>
+        <th scope="col">Subfund</th><th scope="col">Eligibility</th><th scope="col" className="numeric">Eligible nominal amount</th>
+        <th scope="col" className="numeric">Allocation</th><th scope="col" className="numeric">Pro-rata billing amount</th><th scope="col">Evidence</th>
+      </tr></thead>
+      <tbody>{visible.map((row) => <tr key={row.key} className={`billing-row ${row.status}`}>
+        <th scope="row">{row.subfund}{row.identifier && <small>{row.identifier}</small>}</th>
+        <td><span className={`status-pill ${row.status}`}>{row.statusLabel}</span>{row.conflict && <span className="status-pill conflict">Discrepancy</span>}
+          {row.note && <small className="row-status">{row.note}</small>}</td>
+        <td className="numeric">{row.eligible}</td>
+        <td className="numeric">{row.share}</td>
+        <td className="numeric amount">{row.amount}{row.adjustment && <small>{row.adjustment}</small>}</td>
+        <td className="evidence-cell">{row.source && <SourceButton source={row.source} text={row.source.reference} onOpenSource={onOpenSource} />}</td>
+      </tr>)}</tbody>
+      {billing.totals && <tfoot><tr>
+        <th scope="row">Total</th><td></td><td className="numeric">{billing.totals.eligible}</td>
+        <td className="numeric">{billing.totals.share}</td><td className="numeric amount">{billing.totals.amount}</td><td></td>
+      </tr></tfoot>}
+    </table></div>}
+    {billing.rows.length > visible.length && <button type="button" className="secondary-button show-all" onClick={() => setShowAll(true)}>
+      Show all {billing.rows.length} subfunds
+    </button>}
+    {billing.formula && <p className="answer-formula">
+      Each eligible subfund receives {billing.formula}, rounded to the cent so the amounts add up exactly to the fee pool.
+      {billing.ruleText && <> The instruction states: “{billing.ruleText}”. </>}
+      {billing.ruleSource && <SourceButton source={billing.ruleSource} text={billing.ruleSource.reference} onOpenSource={onOpenSource} />}
+    </p>}
+    {billing.discrepancies.length > 0 && <section className="answer-discrepancies" aria-label="Unresolved discrepancies">
+      <p className="section-label">Unresolved discrepancy</p>
+      <ul>{billing.discrepancies.map((item) => <li key={item.key}>
+        <span>{item.text}</span>
+        <span className="caveat-sources">
+          {item.instructionSource && <SourceButton source={item.instructionSource} text={`Instruction · ${item.instructionSource.reference}`} onOpenSource={onOpenSource} />}
+          <SourceButton source={item.source} onOpenSource={onOpenSource} />
+        </span>
+        {item.corroborating.map((other) => <small key={`${other.source.documentId}:${other.source.reference}`}>
+          {other.text} <SourceButton source={other.source} text={other.source.reference.split("!").pop()} onOpenSource={onOpenSource} />
+        </small>)}
+      </li>)}</ul>
+    </section>}
+  </>;
 }
 
 /**
@@ -37,10 +90,12 @@ export function MatterAnswer({ input, onOpenSource }: { input: AnswerInput; onOp
           {holdings.investor && <> · Investor: {holdings.investor}</>}
           {holdings.isin && <> · ISIN {holdings.isin}</>}
         </p>}
+        {view.billing && view.billing.context.length > 0 && <p className="answer-subtitle">{view.billing.context.join(" · ")}</p>}
       </div>
       <span className="answer-badge">{view.method}</span>
     </header>
     <p className="answer-scope">{view.scopeLabel}</p>
+    {view.billing && <p className={`answer-status ${view.billing.complete ? "provisional" : "incomplete"}`}>{view.billing.statusLabel}</p>}
 
     {view.conclusion && <p className="answer-conclusion">{view.conclusion}</p>}
     {view.prose.map((block, index) => block.kind === "paragraph"
@@ -90,6 +145,8 @@ export function MatterAnswer({ input, onOpenSource }: { input: AnswerInput; onOp
         </li>)}
       </ul>}
     </>}
+
+    {view.billing && <BillingResult billing={view.billing} onOpenSource={onOpenSource} />}
 
     {view.entities.length > 0 && <div className="answer-table" role="region" aria-label="Entity listing" tabIndex={0}><table>
       <thead><tr><th scope="col">Entity</th><th scope="col">Role (provisional)</th><th scope="col">Associated in the same record</th><th scope="col">Evidence</th></tr></thead>

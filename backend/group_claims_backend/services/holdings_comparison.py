@@ -197,6 +197,20 @@ class _Table:
 
 
 @dataclass(frozen=True)
+class DatedRecord:
+    """One holdings record from one spreadsheet, read with the same header rules as a comparison."""
+
+    document: HoldingsDocument
+    entities: Mapping[str, tuple[str, str]]  # kind -> (name, reference)
+    isin: str | None
+    quantity: Decimal | None
+    quantity_text: str
+    quantity_reference: str
+    # The record's own row date, else its table's stated date, else the file-name date.
+    date: str | None
+
+
+@dataclass(frozen=True)
 class HoldingsResult:
     answer: str
     payload: Mapping[str, object]
@@ -362,6 +376,25 @@ class HoldingsComparison:
         )
 
     # -- dates -----------------------------------------------------------
+
+    def dated_records(self, document: HoldingsDocument) -> list[DatedRecord]:
+        """Every holdings record of one spreadsheet with a usable quantity cell and its date."""
+        self._rows(document)
+        file_date, _basis = self._date(document)
+        records: list[DatedRecord] = []
+        for table in self._tables.get(document.document_id, []):
+            stated = table.stated_date.get("date") if table.stated_date else None
+            for row in table.records:
+                if row.quantity is None:
+                    continue
+                quantity, _issue = parse_quantity(row.quantity[0], row.quantity[2])
+                row_date = _iso_date(row.date[0]) if row.date else None
+                records.append(DatedRecord(
+                    document, dict(row.entities),
+                    row.isin[0].upper() if row.isin else None, quantity, row.quantity[0], row.quantity[1],
+                    row_date or (str(stated) if stated else None) or file_date,
+                ))
+        return records
 
     def _date(self, document: HoldingsDocument) -> tuple[str | None, str | None]:
         """The document's date from its file name, else from a single "As of date" label cell."""

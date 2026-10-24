@@ -1080,6 +1080,23 @@ ul.answer-prose li + li { margin-top: 4px; }
 .answer-reconciliation li::before { content: "✓ "; color: #2f7a4f; }
 .answer-reconciliation li.attention::before { content: "! "; color: #785a18; }
 .answer-reconciliation li.source_only::before { content: "– "; color: #64798f; }
+.answer-status { justify-self: start; margin: 0; border-radius: 999px; padding: 2px 10px; font-size: .76rem; font-weight: 700; }
+.answer-status.provisional { border: 1px solid #c9dbea; background: #f2f7fc; color: #285b8c; }
+.answer-status.incomplete { border: 1px solid #ead9ad; background: #fff8e7; color: #785a18; }
+.billing-table .amount { color: #1b4264; font-weight: 700; }
+.billing-row.excluded th, .billing-row.excluded td, .billing-row.undetermined th, .billing-row.undetermined td { color: #64798f; }
+.status-pill { display: inline-block; margin: 0 4px 2px 0; border-radius: 999px; padding: 0 7px; font-size: .72rem; font-weight: 700; white-space: nowrap; }
+.status-pill.eligible { background: #e8f3ec; color: #2f7a4f; }
+.status-pill.excluded { background: #eef2f6; color: #536d83; }
+.status-pill.undetermined { background: #fff8e7; color: #785a18; }
+.status-pill.conflict { background: #fdecea; color: #a03a2c; }
+.show-all { justify-self: start; padding: 6px 12px; font-size: .82rem; }
+.answer-formula { margin: 0; color: #405e77; font-size: .84rem; line-height: 1.5; }
+.answer-discrepancies { border: 1px solid #f0c7c0; border-radius: 8px; padding: 8px 12px; background: #fdf4f2; color: #7a2e22; font-size: .84rem; line-height: 1.45; }
+.answer-discrepancies .section-label { margin-bottom: 4px; color: #a03a2c; }
+.answer-discrepancies ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.answer-discrepancies li { display: grid; gap: 4px; }
+.answer-discrepancies small { color: #536d83; }
 .answer-notices { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: .84rem; line-height: 1.45; }
 .answer-notices li { border-radius: 7px; padding: 7px 10px; }
 .answer-notices li.warning { border: 1px solid #ead9ad; background: #fff8e7; color: #785a18; }

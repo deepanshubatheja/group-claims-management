@@ -1,4 +1,4 @@
-import type { MatterDocumentScope, MatterEntityInventory, MatterHoldingsComparison, MatterQuestionRequest, MatterQuestionScopeRequest, MatterQuestionSubmission } from "./ipc-contract";
+import type { MatterBillingAllocation, MatterDocumentScope, MatterEntityInventory, MatterHoldingsComparison, MatterQuestionRequest, MatterQuestionScopeRequest, MatterQuestionSubmission } from "./ipc-contract";
 
 const DOCUMENT_ID = /^[a-f0-9-]{36}$/i;
 const MATTER_ID = /^[a-z0-9-]{1,64}$/;
@@ -143,4 +143,40 @@ export function isMatterHoldingsComparison(value: unknown): value is MatterHoldi
       && Array.isArray(row.entities) && row.entities.every((entity) => isRecord(entity) && typeof entity.kind === "string" && typeof entity.name === "string")
       && nullableString(row.account) && nullableString(row.isin) && nullableString(row.currency) && nullableString(row.difference) && nullableString(row.note)
       && isHoldingSide(row.earlier) && isHoldingSide(row.later));
+}
+
+const DECIMAL = /^-?\d+(?:\.\d+)?$/;
+const PARTICIPANT_STATUSES = new Set(["eligible", "excluded", "undetermined"]);
+const nullableDecimal = (value: unknown) => value === null || (typeof value === "string" && DECIMAL.test(value));
+const isBillingSource = (value: unknown) => stringFields(value, ["documentId", "filename", "reference"]);
+const nullableBillingSource = (value: unknown) => value === null || isBillingSource(value);
+const statedText = (value: unknown) => value === null || (stringFields(value, ["text"]) && isRecord(value) && nullableBillingSource(value.source));
+const stringList = (value: unknown) => Array.isArray(value) && value.every((item) => typeof item === "string");
+
+/** Guard a document-backed pro-rata allocation; every amount must be an exact decimal string. */
+export function isMatterBillingAllocation(value: unknown): value is MatterBillingAllocation {
+  if (!isRecord(value)) return false;
+  const { feePool, rule, totals, crossCheck } = value;
+  return (value.calculationStatus === "complete" || value.calculationStatus === "incomplete")
+    && value.resultType === "provisional_allocation" && value.invoiceStatus === "not_issued"
+    && typeof value.issuanceBlocked === "boolean" && typeof value.roundingPolicy === "string"
+    && (value.instruction === null || stringFields(value.instruction, ["documentId", "filename"]))
+    && statedText(value.approvedBy) && statedText(value.investorGroup) && statedText(value.period)
+    && nullableString(value.currency)
+    && (feePool === null || (isRecord(feePool) && typeof feePool.amount === "string" && DECIMAL.test(feePool.amount) && nullableBillingSource(feePool.source)))
+    && (rule === null || (stringFields(rule, ["text", "formula"]) && isRecord(rule) && nullableBillingSource(rule.source)))
+    && (totals === null || (isRecord(totals) && ["eligibleAmount", "allocatedAmount", "remainder", "sharePercent"].every((key) => typeof totals[key] === "string" && DECIMAL.test(totals[key] as string))))
+    && Array.isArray(value.participants) && value.participants.every((participant) => isRecord(participant)
+      && typeof participant.name === "string" && nullableString(participant.identifier) && PARTICIPANT_STATUSES.has(String(participant.status))
+      && ["eligibleAmount", "share", "sharePercent", "allocatedAmount", "unroundedAmount", "roundingAdjustment"].every((key) => nullableDecimal(participant[key]))
+      && nullableString(participant.reason) && nullableBillingSource(participant.source))
+    && Array.isArray(value.crossChecks) && value.crossChecks.every((check) => isRecord(check)
+      && typeof check.participant === "string" && nullableString(check.identifier)
+      && (check.status === "consistent" || check.status === "conflict")
+      && typeof check.instructionAmount === "string" && DECIMAL.test(check.instructionAmount)
+      && typeof check.recordedAmount === "string" && DECIMAL.test(check.recordedAmount)
+      && nullableString(check.asOfDate) && isBillingSource(check.source))
+    && isRecord(crossCheck) && nullableString(crossCheck.comparisonDate) && typeof crossCheck.dateBasis === "string"
+    && typeof crossCheck.documentsChecked === "number" && stringList(crossCheck.limitations)
+    && stringList(value.missing) && stringList(value.issues);
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "../src/matter-question";
+import { isMatterBillingAllocation, isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "../src/matter-question";
 
 const first = "11111111-1111-4111-8111-111111111111";
 const second = "22222222-2222-4222-8222-222222222222";
@@ -114,4 +114,34 @@ test("guards a dated holdings comparison", () => {
   assert.equal(isMatterHoldingsComparison({ ...comparison, documents: [{ ...comparison.documents[0], tables: [{ ...table, controlTotal: { ...table.controlTotal, status: "ok" } }] }] }), false);
   assert.equal(isMatterQuestionIntent("holdings_comparison"), true);
   assert.equal(isMatterQuestionIntent("status"), false);
+});
+
+test("guards a pro-rata billing allocation and its exact decimal amounts", () => {
+  const source = { documentId: first, filename: "instruction.pdf", reference: "page 1 block 2" };
+  const allocation = {
+    calculationStatus: "complete", resultType: "provisional_allocation", invoiceStatus: "not_issued", issuanceBlocked: false,
+    instruction: { documentId: first, filename: "instruction.pdf" }, approvedBy: null, investorGroup: null,
+    period: { text: "1 to 31 January", source }, currency: "USD", feePool: { amount: "100.00", source },
+    rule: { text: "eligible / total", formula: "eligible ÷ total × fee pool", source }, roundingPolicy: "Largest remainder.",
+    totals: { eligibleAmount: "3", allocatedAmount: "100.00", remainder: "0.00", sharePercent: "100.0000" },
+    participants: [
+      { name: "Fund A", identifier: "A", status: "eligible", eligibleAmount: "2", share: "0.6666666667", sharePercent: "66.6667", allocatedAmount: "66.67", unroundedAmount: "66.666667", roundingAdjustment: "0.01", reason: null, source },
+      { name: "Fund C", identifier: null, status: "excluded", eligibleAmount: null, share: "0", sharePercent: "0", allocatedAmount: "0.00", unroundedAmount: null, roundingAdjustment: null, reason: "withdrawn", source: null },
+      { name: "Fund D", identifier: null, status: "undetermined", eligibleAmount: null, share: null, sharePercent: null, allocatedAmount: null, unroundedAmount: null, roundingAdjustment: null, reason: "Not named.", source },
+    ],
+    crossChecks: [{ participant: "Fund A", identifier: "A", status: "conflict", instructionAmount: "2", recordedAmount: "1.5", asOfDate: "2025-01-31", source: { ...source, documentId: second } }],
+    crossCheck: { comparisonDate: "2025-01-31", dateBasis: "the billing-period end", documentsChecked: 1, limitations: [] },
+    missing: [], issues: [],
+  };
+  assert.equal(isMatterBillingAllocation(allocation), true);
+  assert.equal(isMatterBillingAllocation({ ...allocation, calculationStatus: "incomplete", totals: null, feePool: null, currency: null, participants: [], missing: ["the fee pool"] }), true);
+  // Money must stay an exact decimal string, never a number or formatted text.
+  assert.equal(isMatterBillingAllocation({ ...allocation, feePool: { amount: 100, source } }), false);
+  assert.equal(isMatterBillingAllocation({ ...allocation, totals: { ...allocation.totals, allocatedAmount: "USD 100.00" } }), false);
+  assert.equal(isMatterBillingAllocation({ ...allocation, participants: [{ ...allocation.participants[0], allocatedAmount: "66,67" }] }), false);
+  // Only a provisional, unissued allocation is accepted.
+  assert.equal(isMatterBillingAllocation({ ...allocation, invoiceStatus: "issued" }), false);
+  assert.equal(isMatterBillingAllocation({ ...allocation, participants: [{ ...allocation.participants[0], status: "assumed" }] }), false);
+  assert.equal(isMatterBillingAllocation({ ...allocation, crossChecks: [{ ...allocation.crossChecks[0], status: "resolved" }] }), false);
+  assert.equal(isMatterBillingAllocation({ ...allocation, crossCheck: undefined }), false);
 });

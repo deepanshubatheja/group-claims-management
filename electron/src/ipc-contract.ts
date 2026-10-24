@@ -181,6 +181,29 @@ export interface MatterHoldingsTable { sheet: string; headerReference: string; r
 export interface MatterRequestedEntity { text: string; name: string | null; match: "exact" | "alias" | "ambiguous" | "not_found"; candidates: string[]; positions: number; }
 /** A local, exact (Decimal) comparison of two dated holdings spreadsheets. */
 export interface MatterHoldingsComparison { documents: Array<{ documentId: string; filename: string; date: string | null; dateBasis: string | null; tables: MatterHoldingsTable[] }>; orderBasis: string; rows: MatterHoldingRow[]; totals: { earlier: string | null; later: string | null; difference: string | null; currency: string | null; coverage?: "all_records" | "selected_rows"; note: string | null }; requestedEntities?: MatterRequestedEntity[]; issues: string[]; caveats: Array<{ text: string; sources: Array<{ documentId: string; filename: string; reference: string }> }>; legalQuestionNotAnswered: boolean; }
+export interface MatterBillingSource { documentId: string; filename: string; reference: string; }
+export interface MatterBillingParticipant { name: string; identifier: string | null; status: "eligible" | "excluded" | "undetermined"; eligibleAmount: string | null; share: string | null; sharePercent: string | null; allocatedAmount: string | null; unroundedAmount: string | null; roundingAdjustment: string | null; reason: string | null; source: MatterBillingSource | null; }
+export interface MatterBillingCrossCheck { participant: string; identifier: string | null; status: "consistent" | "conflict"; instructionAmount: string; recordedAmount: string; asOfDate: string | null; source: MatterBillingSource; }
+export interface MatterBillingAllocation {
+  calculationStatus: "complete" | "incomplete";
+  resultType: "provisional_allocation";
+  invoiceStatus: "not_issued";
+  issuanceBlocked: boolean;
+  instruction: { documentId: string; filename: string } | null;
+  approvedBy: { text: string; source: MatterBillingSource | null } | null;
+  investorGroup: { text: string; source: MatterBillingSource | null } | null;
+  period: { text: string; source: MatterBillingSource | null } | null;
+  currency: string | null;
+  feePool: { amount: string; source: MatterBillingSource | null } | null;
+  rule: { text: string; formula: string; source: MatterBillingSource | null } | null;
+  roundingPolicy: string;
+  totals: { eligibleAmount: string; allocatedAmount: string; remainder: string; sharePercent: string } | null;
+  participants: MatterBillingParticipant[];
+  crossChecks: MatterBillingCrossCheck[];
+  crossCheck: { comparisonDate: string | null; dateBasis: string; documentsChecked: number; limitations: string[] };
+  missing: string[];
+  issues: string[];
+}
 export interface MatterInventoryEvidence { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; role: string; basis: string; status: "document_label" | "provisional_ai_finding"; }
 export interface MatterInventoryEntity { name: string; roles: string[]; related: Array<{ name: string; role: string }>; evidence: MatterInventoryEvidence[]; documentCount: number; mentionCount: number; uncertainty: string | null; }
 /** A locally built, evidence-linked list of explicitly labelled entities; roles remain provisional. */
@@ -192,7 +215,7 @@ export interface MatterEntityInventory {
   relationships: MatterRelationship[];
 }
 export interface MatterQuestionPreview { intent: MatterQuestionIntent; provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; cost: DocumentQuestionCost; }
-export interface MatterQuestionStatus { questionId: string; matterId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; intent: MatterQuestionIntent; inventory: MatterEntityInventory | null; holdingsComparison: MatterHoldingsComparison | null; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
+export interface MatterQuestionStatus { questionId: string; matterId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; intent: MatterQuestionIntent; inventory: MatterEntityInventory | null; holdingsComparison: MatterHoldingsComparison | null; billingAllocation?: MatterBillingAllocation | null; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; }
 export type MatterQuestionPreviewResponse = { ok: true; preview: MatterQuestionPreview } | DocumentOperationFailure;
 export type MatterQuestionResponse = { ok: true; question: MatterQuestionStatus } | DocumentOperationFailure;
 export interface BillingPreviewRow { id: string; label: string; eligibleAmount: string; }

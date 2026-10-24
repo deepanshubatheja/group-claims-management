@@ -527,3 +527,58 @@ rows are every record row of both tables. A source control total is shown as
 reconciling the comparison only when it covers exactly the compared rows and
 its record total equals their exact `Decimal` total; otherwise it is reported
 as checking its own rows only, or as failed.
+
+## 2026-10-22 — Structured pro-rata billing answers
+
+A document-backed allocation request now returns a typed `billingAllocation`
+payload alongside the plain-text answer. The allocation itself is unchanged.
+Python `Decimal` allocates cents using the largest-remainder method, and those
+cent amounts are the ones displayed. The payload carries the following:
+
+- the instruction's stated inputs, each with its block reference: fee pool,
+  currency, billing period, allocation rule and "Approved by";
+- the eligible participants, with eligible nominal amount, exact share,
+  display percentage, allocated amount, unrounded amount and rounding cent;
+- the expressly excluded participants, with the stated reason and a zero
+  allocation (a pro-rata pool shared among the eligible participants leaves an
+  excluded one with no part of it);
+- an investor group only when the instruction states one.
+
+Exclusions are recognised in both the listed form ("Excluded participant /
+Name (ID): …") and the sentence form ("Name (ID) is excluded because …").
+
+**Undetermined subfunds.** A subfund that the in-scope spreadsheets list but
+the instruction does not name is shown as "Undetermined". It never gets a
+zero bill.
+
+**Narrow cross-check, not reconciliation.** Each eligible amount is compared
+with holding records in scope that meet all of these conditions:
+
+- dated on the instruction's stated as-of date, or failing that the
+  billing-period end;
+- naming exactly one participant;
+- stating one nominal quantity;
+- for the instruction's ISIN, when the instruction names one.
+
+A differing record is reported as an unresolved discrepancy. The instruction
+amount is kept, and `issuanceBlocked` is set. Records on other dates, records
+naming several participants, and documents outside the authorized scope are
+not used.
+
+**Incomplete or conflicting instructions.** If an allocation request finds an
+instruction missing a required input, or finds two approved instructions, it
+gets a local "No allocation was calculated" answer that names what is missing.
+Nothing is assumed, and no model is asked to calculate.
+
+**Display.** The renderer shows the following in order:
+
+1. context and status;
+2. summary figures (the remainder only when it is not zero);
+3. the allocation table, paginated after 50 rows;
+4. the formula;
+5. visible discrepancies and warnings;
+6. legal limitations;
+7. collapsible evidence and technical details.
+
+Amounts carry the currency code and are padded to cents but never rounded.
+Nominal amounts carry no currency. ClaimFlow still issues no invoices.

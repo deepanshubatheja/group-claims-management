@@ -40,7 +40,7 @@ import {
   type DocumentImportResponse, type DocumentRemoveResponse,
 } from "./ipc-contract";
 import { discoverDroppedImportableFiles, discoverImportableFiles, type AuthorizedFolderFile, type FolderDiscovery } from "./folder-import";
-import { isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "./matter-question";
+import { isMatterBillingAllocation, isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "./matter-question";
 
 const MAX_IMPORT_FILE_BYTES = 50 * 1024 * 1024;
 const supportedExtensions = new Set([".xlsx", ".xls", ".csv", ".pdf"]);
@@ -361,6 +361,7 @@ function isMatterQuestionStatus(value: unknown): value is MatterQuestionStatus {
     && isMatterDocumentScope(value.documentScope) && isMatterQuestionIntent(value.intent)
     && (value.inventory === null || isMatterEntityInventory(value.inventory))
     && (value.holdingsComparison === null || isMatterHoldingsComparison(value.holdingsComparison))
+    && (value.billingAllocation === undefined || value.billingAllocation === null || isMatterBillingAllocation(value.billingAllocation))
     && ["queued", "running", "completed", "failed"].includes(String(value.status))
     && (typeof value.answer === "string" || value.answer === null) && typeof value.unknown === "boolean"
     && Array.isArray(value.citations) && value.citations.every((citation) => isRecord(citation)

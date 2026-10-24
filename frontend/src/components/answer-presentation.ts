@@ -19,10 +19,11 @@ export type AnswerInput = {
   intent: MatterQuestionIntent;
   inventory?: MatterEntityInventory | null;
   holdingsComparison?: MatterHoldingsComparison | null;
+  billingAllocation?: MatterBillingAllocation | null;
   model?: string | null;
 };
 
-export type AnswerLayout = "holdings" | "entities" | "relationships" | "prose";
+export type AnswerLayout = "holdings" | "billing" | "entities" | "relationships" | "prose";
 export type Notice = { tone: "warning" | "info"; text: string };
 export type SourceLink = { documentId: string; filename: string; reference: string; label: string };
 export type ProseBlock = { kind: "paragraph"; text: string } | { kind: "list"; items: string[] };
@@ -66,6 +67,37 @@ export type HoldingsView = {
    *  its own record rows but the comparison covers fewer; "attention": it does not agree or was not verified. */
   reconciliation: Array<{ text: string; state: "reconciled" | "source_only" | "attention"; source: SourceLink }>;
 };
+export type BillingRowView = {
+  key: string;
+  subfund: string;
+  identifier: string | null;
+  status: MatterBillingParticipant["status"];
+  statusLabel: string;
+  /** The stated exclusion reason, or why eligibility is undetermined. */
+  note: string | null;
+  eligible: string;
+  share: string;
+  amount: string;
+  /** "+0.01 rounding" when the participant received a reconciliation cent. */
+  adjustment: string | null;
+  conflict: boolean;
+  source: SourceLink | null;
+};
+export type BillingDiscrepancyView = { key: string; text: string; source: SourceLink; instructionSource: SourceLink | null; corroborating: Array<{ text: string; source: SourceLink }> };
+export type BillingView = {
+  complete: boolean;
+  context: string[];
+  statusLabel: string;
+  metrics: Array<{ label: string; value: string; detail?: string; source?: SourceLink | null }>;
+  rows: BillingRowView[];
+  totals: { eligible: string; share: string; amount: string } | null;
+  formula: string | null;
+  ruleText: string | null;
+  ruleSource: SourceLink | null;
+  discrepancies: BillingDiscrepancyView[];
+  /** Rows shown before "Show all" on very long allocations. */
+  pageSize: number;
+};
 export type EntityRowView = { key: string; name: string; detail: string | null; role: string; uncertainty: string | null; related: string; sources: SourceLink[] };
 export type RelationshipRowView = { key: string; subject: string; subjectRole: string; related: string; relatedRole: string; basis: string; documented: boolean; sources: SourceLink[] };
 
@@ -77,6 +109,7 @@ export type AnswerView = {
   conclusion: string | null;
   prose: ProseBlock[];
   holdings: HoldingsView | null;
+  billing: BillingView | null;
   entities: EntityRowView[];
   relationships: RelationshipRowView[];
   warnings: Notice[];
@@ -93,7 +126,7 @@ const TITLES: Record<MatterQuestionIntent, string> = {
   relationship: "Entity relationships",
   specific_lookup: "Account / ISIN lookup",
   legal_status: "Litigation and claim-right status",
-  calculation: "Billing calculation",
+  calculation: "Pro-rata billing allocation",
   change: "Changes and transfers",
   comparison: "Cross-document comparison",
   general: "Answer",
@@ -261,7 +294,10 @@ function methodLabel(input: AnswerInput): string {
   }
   if (input.holdingsComparison) return "Provisional · calculated locally from the spreadsheets";
   if (input.inventory) return "Provisional · built locally from the documents";
-  if (model === "local-document-calculation") return "Provisional · calculated locally from the cited instruction";
+  if (model === "local-document-calculation") {
+    return input.billingAllocation?.calculationStatus === "incomplete"
+      ? "Not calculated · inputs missing from the instruction" : "Provisional · calculated locally from the cited instruction";
+  }
   if (model.startsWith("local-")) return "Provisional · answered locally";
   return "Provisional · AI answer from cited excerpts";
 }
@@ -417,18 +453,165 @@ function holdingsView(comparison: MatterHoldingsComparison, labels: Map<string, 
 }
 
 /** Build the answer-first presentation for one completed question. */
+const BILLING_PAGE_SIZE = 50;
+const ZERO = /^[+-]?0*(?:\.0*)?$/;
+const PARTICIPANT_STATUS: Record<MatterBillingParticipant["status"], string> = { eligible: "Eligible", excluded: "Excluded", undetermined: "Undetermined" };
+
+/** Every source a billing allocation points to, for document labels. */
+function billingSources(billing: MatterBillingAllocation | null): MatterBillingSource[] {
+  if (!billing) return [];
+  return [
+    billing.approvedBy?.source, billing.investorGroup?.source, billing.period?.source, billing.feePool?.source, billing.rule?.source,
+    ...(billing.participants ?? []).map((participant) => participant.source),
+    ...(billing.crossChecks ?? []).map((check) => check.source),
+  ].filter((source): source is MatterBillingSource => Boolean(source));
+}
+
+function billingLink(source: MatterBillingSource | null | undefined, labels: Map<string, string>): SourceLink | null {
+  return source ? sourceLink(source.documentId, source.filename, source.reference, labels) : null;
+}
+
+/** "USD 34,285.71": the exact decimal string, grouped and padded to cents, never rounded. */
+export function formatMoney(value: string | null | undefined, currency: string | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  const amount = formatQuantity(value, Math.max(2, quantityPlaces([value])));
+  return currency ? `${currency} ${amount}` : amount;
+}
+
+/** "28.5714%" from the backend's display percentage; trailing zeros are dropped ("100%", "0%"). */
+export function formatPercent(value: string | null | undefined): string {
+  return value === null || value === undefined ? "—" : `${formatQuantity(value, quantityPlaces([value]))}%`;
+}
+
+function billingView(billing: MatterBillingAllocation, labels: Map<string, string>, view: AnswerView, technical: TechnicalDetail[]): BillingView {
+  const currency = billing.currency;
+  const complete = billing.calculationStatus === "complete";
+  const participants = billing.participants ?? [];
+  const checks = billing.crossChecks ?? [];
+  const conflicts = checks.filter((check) => check.status === "conflict");
+  const identity = (name: string, identifier: string | null) => `${name}\u0000${identifier ?? ""}`;
+  const conflicted = new Set(conflicts.map((check) => identity(check.participant, check.identifier)));
+  const nominalPlaces = quantityPlaces([...participants.map((participant) => participant.eligibleAmount), billing.totals?.eligibleAmount]);
+  const nominal = (value: string) => formatQuantity(value, quantityPlaces([value]));
+  const label = (filename: string) => labels.get(filename) ?? filename;
+  const named = (name: string, identifier: string | null) => identifier ? `${name} (${identifier})` : name;
+
+  const rows: BillingRowView[] = participants.map((participant, index) => ({
+    key: `${index}:${identity(participant.name, participant.identifier)}`,
+    subfund: participant.name,
+    identifier: participant.identifier,
+    status: participant.status,
+    statusLabel: PARTICIPANT_STATUS[participant.status] ?? participant.status,
+    note: participant.status === "excluded"
+      ? participant.reason ? `Stated reason: ${participant.reason}` : "Excluded by the instruction; no reason stated."
+      : participant.status === "undetermined" ? participant.reason : null,
+    eligible: participant.eligibleAmount === null ? "—" : formatQuantity(participant.eligibleAmount, nominalPlaces),
+    share: participant.status === "undetermined" ? "Undetermined" : formatPercent(participant.sharePercent),
+    amount: participant.status === "undetermined" ? "Undetermined" : formatMoney(participant.allocatedAmount, currency),
+    adjustment: participant.roundingAdjustment && !ZERO.test(participant.roundingAdjustment)
+      ? `${formatQuantity(participant.roundingAdjustment, 2, true)} rounding` : null,
+    conflict: conflicted.has(identity(participant.name, participant.identifier)),
+    source: billingLink(participant.source, labels),
+  }));
+
+  const totals = billing.totals;
+  const reconciled = totals !== null && ZERO.test(totals.remainder);
+  const metrics: BillingView["metrics"] = [];
+  if (billing.feePool) metrics.push({ label: "Fee pool", value: formatMoney(billing.feePool.amount, currency), source: billingLink(billing.feePool.source, labels) });
+  if (totals) {
+    metrics.push({ label: "Eligible nominal base", value: formatQuantity(totals.eligibleAmount, nominalPlaces), detail: "Nominal amount, not a fee" });
+    metrics.push({ label: "Total allocated", value: formatMoney(totals.allocatedAmount, currency), detail: reconciled ? "Reconciles to the fee pool" : undefined });
+    if (!reconciled) metrics.push({ label: "Unallocated remainder", value: formatMoney(totals.remainder, currency) });
+  }
+
+  const eligibleCount = participants.filter((participant) => participant.status === "eligible").length;
+  const excludedCount = participants.filter((participant) => participant.status === "excluded").length;
+  const undeterminedCount = participants.filter((participant) => participant.status === "undetermined").length;
+  if (complete && totals) {
+    view.conclusion = `${formatMoney(totals.allocatedAmount, currency)} was allocated across ${plural(eligibleCount, "eligible subfund")}.`
+      + (excludedCount ? ` ${plural(excludedCount, "further subfund was", "further subfunds were")} explicitly excluded by the instruction.` : "")
+      + (undeterminedCount ? ` The eligibility of ${plural(undeterminedCount, "other listed subfund")} is undetermined.` : "")
+      + (reconciled ? " The allocation reconciles to the fee pool" : ` ${formatMoney(totals.remainder, currency)} of the fee pool is unallocated`)
+      + (conflicts.length
+        ? `, but ${conflicts.length === 1 ? "an unresolved holdings discrepancy affects" : `${conflicts.length} unresolved holdings discrepancies affect`} the eligible amounts used.`
+        : ".");
+  } else {
+    view.conclusion = "No allocation was calculated.";
+  }
+
+  const warnings = view.warnings;
+  if (conflicts.length) warnings.push({ tone: "warning", text: "Do not issue invoices from this allocation until the discrepancy is resolved." });
+  for (const item of billing.missing ?? []) warnings.push({ tone: "warning", text: `Not stated in the instruction: ${item}.` });
+  for (const issue of billing.issues ?? []) warnings.push({ tone: "warning", text: issue });
+  for (const limitation of billing.crossCheck?.limitations ?? []) warnings.push({ tone: "info", text: limitation });
+
+  view.limitations.push("This allocates the fee pool under the cited instruction. It is not an invoice and does not establish legal claim entitlement, the legal claimant, or the invoice recipient.");
+  if (excludedCount || undeterminedCount) view.limitations.push("Eligibility follows the instruction only; holding a position does not by itself make a subfund eligible.");
+
+  const discrepancies: BillingDiscrepancyView[] = conflicts.map((check, index) => {
+    const participant = participants.find((item) => identity(item.name, item.identifier) === identity(check.participant, check.identifier));
+    return {
+      key: `${index}:${check.source.documentId}:${check.source.reference}`,
+      text: `${named(check.participant, check.identifier)}: the instruction's eligible amount is ${nominal(check.instructionAmount)}, but `
+        + `${label(check.source.filename)} records ${nominal(check.recordedAmount)}${check.asOfDate ? ` as of ${formatIsoDate(check.asOfDate)}` : ""}. `
+        + "The instruction amount was used unchanged; the difference is unresolved.",
+      source: billingLink(check.source, labels) as SourceLink,
+      instructionSource: billingLink(participant?.source, labels),
+      corroborating: checks
+        .filter((other) => other.status === "consistent" && identity(other.participant, other.identifier) === identity(check.participant, check.identifier))
+        .map((other) => ({ text: `${label(other.source.filename)} records ${nominal(other.recordedAmount)}, matching the instruction.`, source: billingLink(other.source, labels) as SourceLink })),
+    };
+  });
+
+  const context: string[] = [];
+  if (billing.period) context.push(`Billing period: ${billing.period.text}`);
+  if (billing.investorGroup) context.push(`Investor group: ${billing.investorGroup.text}`);
+  if (billing.approvedBy) context.push(`Approved by: ${billing.approvedBy.text}`);
+
+  technical.push({ label: "Result type", value: "Provisional allocation (no invoice issued)" });
+  if (billing.rule) technical.push({ label: "Formula", value: billing.rule.formula });
+  technical.push({ label: "Rounding policy", value: billing.roundingPolicy });
+  for (const participant of participants.filter((item) => item.status === "eligible")) {
+    technical.push({
+      label: `Unrounded · ${named(participant.name, participant.identifier)}`,
+      value: `${currency ?? ""} ${participant.unroundedAmount ?? "—"} (share ${participant.share ?? "—"})`.trim(),
+    });
+  }
+  const crossCheck = billing.crossCheck;
+  technical.push({
+    label: "Holdings cross-check",
+    value: crossCheck?.comparisonDate
+      ? `Records dated ${formatIsoDate(crossCheck.comparisonDate)}, ${crossCheck.dateBasis}; ${plural(crossCheck.documentsChecked, "document")} in scope checked`
+      : "Not performed",
+  });
+
+  return {
+    complete, context, metrics, rows,
+    statusLabel: complete ? "Provisional allocation · not an invoice" : "Incomplete · no allocation calculated",
+    totals: totals ? { eligible: formatQuantity(totals.eligibleAmount, nominalPlaces), share: formatPercent(totals.sharePercent), amount: formatMoney(totals.allocatedAmount, currency) } : null,
+    formula: billing.rule?.formula ?? null,
+    ruleText: billing.rule?.text ?? null,
+    ruleSource: billingLink(billing.rule?.source, labels),
+    discrepancies,
+    pageSize: BILLING_PAGE_SIZE,
+  };
+}
+
 export function buildAnswerView(input: AnswerInput): AnswerView {
   const comparison = input.holdingsComparison ?? null;
   const inventory = input.inventory ?? null;
+  const billing = input.billingAllocation ?? null;
   const layout: AnswerLayout = comparison ? "holdings"
-    : inventory && input.intent === "relationship" ? "relationships"
-      : inventory ? "entities" : "prose";
+    : billing ? "billing"
+      : inventory && input.intent === "relationship" ? "relationships"
+        : inventory ? "entities" : "prose";
   const allFilenames = [
     ...input.citations.map((citation) => citation.filename),
     ...(comparison?.documents ?? []).map((document) => document.filename),
     ...(comparison?.caveats ?? []).flatMap((caveat) => caveat.sources.map((source) => source.filename)),
     ...(inventory?.entities ?? []).flatMap((entity) => entity.evidence.map((item) => item.filename)),
     ...(inventory?.relationships ?? []).map((relation) => relation.filename),
+    ...billingSources(billing).map((source) => source.filename),
   ];
   const labels = documentLabels(allFilenames);
   const warnings: Notice[] = [];
@@ -436,7 +619,7 @@ export function buildAnswerView(input: AnswerInput): AnswerView {
   const technical = baseTechnical(input);
   const view: AnswerView = {
     layout, title: TITLES[input.intent] ?? "Answer", method: methodLabel(input), scopeLabel: answerScopeLabel(input.documentScope),
-    conclusion: null, prose: [], holdings: null, entities: [], relationships: [], warnings, limitations,
+    conclusion: null, prose: [], holdings: null, billing: null, entities: [], relationships: [], warnings, limitations,
     statedCaveats: [], evidence: groupEvidence(input.citations), technical,
   };
 
@@ -482,6 +665,9 @@ export function buildAnswerView(input: AnswerInput): AnswerView {
       text: caveat.text,
       sources: caveat.sources.map((source) => sourceLink(source.documentId, source.filename, source.reference, labels)).filter((link): link is SourceLink => link !== null),
     }));
+  } else if (billing) {
+    view.title = TITLES.calculation;
+    view.billing = billingView(billing, labels, view, technical);
   } else if (inventory) {
     const coverage = inventory.coverage;
     if (layout === "relationships") {

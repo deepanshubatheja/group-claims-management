@@ -36,6 +36,7 @@ type MatterQuestionTurn = {
   intent: MatterQuestionIntent;
   inventory: MatterEntityInventory | null;
   holdingsComparison: MatterHoldingsComparison | null;
+  billingAllocation: MatterBillingAllocation | null;
   model: string | null;
 };
 
@@ -237,7 +238,7 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
       id: questionJob.questionId, matterId: questionJob.matterId, question: questionPendingText, answer: questionJob.answer,
       unknown: questionJob.unknown, citations: questionJob.citations, parentId: questionPendingParentId,
       documentScope: questionJob.documentScope, intent: questionJob.intent, inventory: questionJob.inventory, holdingsComparison: questionJob.holdingsComparison,
-      model: questionJob.model,
+      billingAllocation: questionJob.billingAllocation ?? null, model: questionJob.model,
     }]);
     setQuestionFollowUp(null); setConsentChecked(false); setQuestionPreview(null); setQuestionPreviewText(""); setQuestionPreviewFollowUpId(null);
   }, [questionJob, questionPendingParentId, questionPendingText]);
