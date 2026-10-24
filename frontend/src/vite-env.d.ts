@@ -4,6 +4,16 @@ interface AppInfo {
   name: string;
   version: string;
   platform: string;
+  build: BuildMetadata;
+}
+
+interface BuildMetadata {
+  applicationVersion: string;
+  buildDate: string;
+  sourceRevision: string;
+  sourceRevisionShort: string;
+  sourceState: string;
+  buildId: string;
 }
 
 interface BackendHealth {
@@ -15,6 +25,7 @@ interface BackendHealth {
     release: string;
     machine: string;
   };
+  build: BuildMetadata;
 }
 
 type BackendHealthResponse =
@@ -65,13 +76,13 @@ type MatterAnalysisBatchPreview = { documents: Array<{ documentId: string; filen
 type MatterAnalysisBatch = { batchId: string; createdAt: string; status: "queued" | "running" | "completed" | "partial"; estimatedCostUsd: string | null; costLimitUsd: string | null; documents: Array<{ documentId: string; filename: string; status: "pending" | "running" | "completed" | "failed" | "blocked"; analysisJobId: string | null; errorCode: string | null; }>; summary: { total: number; completed: number; failed: number; pending: number; }; };
 type MatterAnalysisBatchPreviewResponse = { ok: true; preview: MatterAnalysisBatchPreview } | DocumentFailure;
 type MatterAnalysisBatchResponse = { ok: true; batch: MatterAnalysisBatch } | DocumentFailure;
-type MatterQuestionCitation = { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; };
+type MatterQuestionCitation = { documentId: string; filename: string; sourceReference: string; evidenceSnippet: string; origin?: "local_fallback"; };
 type MatterQuestionScopeRequest = { mode: "all" } | { mode: "selected"; documentIds: string[] };
 type MatterQuestionRequest = { matterId: string; scope: MatterQuestionScopeRequest; question: string; followUpQuestionId?: string; };
 type MatterQuestionSubmission = MatterQuestionRequest & { consentedDocumentIds: string[]; };
 type MatterUnavailableReason = "not_parsed" | "extraction_failed" | "unsupported" | "extraction_unavailable" | "no_searchable_text";
 type MatterDocumentScope = { matterId: string; mode: "all" | "selected"; documentsInScope: number; searchableDocuments: number; unavailableDocuments: Array<{ documentId: string; filename: string; reason: MatterUnavailableReason }>; incompleteDocuments: Array<{ documentId: string; filename: string }>; documentsWithEvidence: number; transmittedDocuments: Array<{ documentId: string; filename: string; previouslyAuthorized: boolean }>; searchTruncated: boolean; resolvedDocuments: Array<{ documentId: string; filename: string; matchedBy: string }>; notes: string[]; };
-type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "change" | "legal_status" | "comparison" | "calculation" | "general";
+type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "historical_reconstruction" | "change" | "legal_status" | "comparison" | "calculation" | "general";
 type MatterRelationship = { documentId: string; filename: string; subject: string; subjectRole: string; subjectReference: string; related: string; relatedRole: string; relatedReference: string; kind: "explicit_statement" | "explicit_heading" | "document_section" | "same_row"; basis: string; };
 type MatterHoldingSide = { documentId: string; filename: string; sheet: string; row: number; rowReference: string | null; quantity: string | null; quantityReference: string | null; isinReference: string | null; accountReference: string | null; entityReferences: string[]; unit: string | null; unitReference: string | null; currency: string | null; currencyReference: string | null; rowDate: string | null; rowDateReference: string | null; cells: Array<{ heading: string; value: string; reference: string }>; };
 type MatterHoldingRow = { entities: Array<{ kind: string; name: string }>; account: string | null; isin: string | null; currency: string | null; earlier: MatterHoldingSide | null; later: MatterHoldingSide | null; difference: string | null; status: "compared" | "only_earlier" | "only_later" | "duplicate_rows" | "unusable_quantity" | "unit_mismatch" | "currency_mismatch"; note: string | null; };
@@ -82,12 +93,20 @@ type MatterInventoryEvidence = { documentId: string; filename: string; sourceRef
 type MatterInventoryEntity = { name: string; roles: string[]; related: Array<{ name: string; role: string }>; evidence: MatterInventoryEvidence[]; documentCount: number; mentionCount: number; uncertainty: string | null; };
 type MatterEntityInventory = { requestedRoles: string[]; entities: MatterInventoryEntity[]; otherRoleCounts: Record<string, number>; coverage: { eligibleDocuments: number; searchedDocuments: number; documentsWithRoleLabels: number; documentsWithListedEntities: number; partial: boolean; partialDocuments: Array<{ documentId: string; filename: string }>; entitiesOmitted: number; }; relationships: MatterRelationship[]; };
 type MatterQuestionPreview = { intent: MatterQuestionIntent; provider: string | null; model: string | null; globalAuthorization: boolean; configured: boolean; localOnly: boolean; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; cost: DocumentQuestionCost; };
-type MatterQuestionStatus = { questionId: string; matterId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; intent: MatterQuestionIntent; inventory: MatterEntityInventory | null; holdingsComparison: MatterHoldingsComparison | null; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; };
+type MatterQuestionExecution = { timestamp: string; provider: string | null; model: string | null; providerCallAttempted: boolean; providerOutcome: "queued" | "attempting" | "completed" | "provider_failure" | "local_only"; fallbackUsed: boolean; fallbackReason: string | null; documentsSelected: string[]; documentsIncluded: string[]; documentsExcluded: string[]; evidenceTruncated: boolean; requirements: Record<string, boolean>; modelUnknown: boolean | null; responseStatus: "complete" | "partial" | "no_supported_findings" | "fallback" | "local" | null; validatedSectionKinds: string[]; validatedSectionCounts: Record<string, number>; validatedSectionStatusCounts: Record<string, number>; validatedCitationCount: number; evidenceItemCounts: Record<string, { available: number; included: number; excluded: number }>; };
+type MatterQuestionStatus = { questionId: string; matterId: string; status: "queued" | "running" | "completed" | "failed"; answer: string | null; unknown: boolean; citations: MatterQuestionCitation[]; errorCode: string | null; model: string | null; intent: MatterQuestionIntent; inventory: MatterEntityInventory | null; holdingsComparison: MatterHoldingsComparison | null; scope: DocumentQuestionScope; documentScope: MatterDocumentScope; usage: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; actualCostEstimateUsd: string | null; }; execution: MatterQuestionExecution; };
 type MatterQuestionPreviewResponse = { ok: true; preview: MatterQuestionPreview } | DocumentFailure;
 type MatterQuestionResponse = { ok: true; question: MatterQuestionStatus } | DocumentFailure;
 type BillingPreviewRow = { id: string; label: string; eligibleAmount: string; };
 type BillingPreviewResult = { feePool: string; currency: string; totalEligibleAmount: string; allocatedTotal: string; allocations: Array<BillingPreviewRow & { share: string; allocatedFee: string; currency: string }>; assumptions: string[]; };
 type BillingPreviewResponse = { ok: true; preview: BillingPreviewResult } | DocumentFailure;
+type ReconciliationFilters = { fromDate?: string; toDate?: string; investor?: string; subfund?: string; account?: string; isin?: string; };
+type ReconciliationAsOfFilters = { asOfDate: string; investor?: string; subfund?: string; account?: string; isin?: string; };
+type ReconciliationReadResponse = { ok: true; result: Record<string, unknown> } | DocumentFailure;
+type ReconciliationWriteResponse = { ok: true; result: Record<string, unknown> } | DocumentFailure;
+type BillingCalculationRequest = { billingAgreementId: string; asOfDate?: string; };
+type BillingCalculationReadResponse = { ok: true; result: Record<string, unknown> } | DocumentFailure;
+type BillingCalculationWriteResponse = { ok: true; result: Record<string, unknown> } | DocumentFailure;
 
 interface DocumentSummary { id: string; original_filename: string; file_size_bytes: number; imported_at: string; file_format: string; processing_status: "imported" | "parsed" | "unsupported" | "failed"; processing_error: string | null; ai_review_status: "new" | "reviewed"; }
 type DocumentFailure = { ok: false; error: { code: string; message: string } };
@@ -128,6 +147,24 @@ interface DesktopAPI {
   previewMatterQuestion(request: MatterQuestionRequest): Promise<MatterQuestionPreviewResponse>;
   askMatterQuestion(submission: MatterQuestionSubmission): Promise<MatterQuestionResponse>;
   getMatterQuestionStatus(questionId: string): Promise<MatterQuestionResponse>;
+  getReconciliationHoldingsAsOf(filters: ReconciliationAsOfFilters): Promise<ReconciliationReadResponse>;
+  getReconciliationTimeline(filters?: ReconciliationFilters): Promise<ReconciliationReadResponse>;
+  getReconciliationTransfers(filters?: ReconciliationFilters): Promise<ReconciliationReadResponse>;
+  getReconciliationAssignments(filters?: Pick<ReconciliationFilters, "fromDate" | "toDate" | "isin"> & { claimReference?: string; fromEntity?: string; toEntity?: string }): Promise<ReconciliationReadResponse>;
+  getReconciliationDiscrepancies(filters?: ReconciliationFilters): Promise<ReconciliationReadResponse>;
+  getReconciliationResult(filters: ReconciliationAsOfFilters): Promise<ReconciliationReadResponse>;
+  getReconciliationCandidates(status?: "candidate" | "confirmed" | "rejected"): Promise<ReconciliationReadResponse>;
+  confirmReconciliationCandidate(candidateId: string): Promise<ReconciliationWriteResponse>;
+  rejectReconciliationCandidate(candidateId: string, reason: string): Promise<ReconciliationWriteResponse>;
+  applyReconciliationPolicy(candidateIds: string[]): Promise<ReconciliationWriteResponse>;
+  getBillingRuleCandidates(status?: "candidate" | "approved"): Promise<BillingCalculationReadResponse>;
+  approveBillingRule(candidateId: string): Promise<BillingCalculationWriteResponse>;
+  getBillingRule(billingAgreementId: string): Promise<BillingCalculationReadResponse>;
+  previewBillingCalculation(request: BillingCalculationRequest): Promise<BillingCalculationReadResponse>;
+  saveBillingCalculation(request: BillingCalculationRequest): Promise<BillingCalculationWriteResponse>;
+  getBillingCalculationRuns(billingAgreementId: string): Promise<BillingCalculationReadResponse>;
+  getBillingCalculationRun(runId: string): Promise<BillingCalculationReadResponse>;
+  compareBillingCalculationRuns(leftRunId: string, rightRunId: string): Promise<BillingCalculationReadResponse>;
   getBillingPreview(feePool: string, currency: string, rows: BillingPreviewRow[]): Promise<BillingPreviewResponse>;
   selectAndImportDocuments(): Promise<DocumentImportResponse>;
   selectFolderForImport(): Promise<FolderImportPreviewResponse>;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { FailedAnswer, MatterAnswer, PendingAnswer } from "./MatterAnswer";
-import { canFollowUpInScope, composerScopeSummary, DEFAULT_CHAT_SCOPE, documentsNeedingConsent, questionIntentLabel, questionScope, scopeSubmissionBlock, unavailableReasonLabel, WORKSPACE_MATTER_ID, type ChatScopeMode } from "./matter-scope";
+import { canFollowUpInScope, composerScopeSummary, DEFAULT_CHAT_SCOPE, documentsNeedingConsent, MAX_MATTER_QUESTION_CHARACTERS, questionIntentLabel, questionScope, scopeSubmissionBlock, unavailableReasonLabel, unicodeCodePointCount, WORKSPACE_MATTER_ID, type ChatScopeMode } from "./matter-scope";
 
 function matterQuestionFailure(code: string | null): string {
   if (code === "AI_AUTHORIZATION_WITHDRAWN") return "Cloud-processing authorization was withdrawn before this question could be sent.";
@@ -37,6 +37,7 @@ type MatterQuestionTurn = {
   inventory: MatterEntityInventory | null;
   holdingsComparison: MatterHoldingsComparison | null;
   model: string | null;
+  execution: MatterQuestionExecution;
 };
 
 /** A follow-up names an earlier backend-held turn; its text is never resent from React. */
@@ -237,12 +238,14 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
       id: questionJob.questionId, matterId: questionJob.matterId, question: questionPendingText, answer: questionJob.answer,
       unknown: questionJob.unknown, citations: questionJob.citations, parentId: questionPendingParentId,
       documentScope: questionJob.documentScope, intent: questionJob.intent, inventory: questionJob.inventory, holdingsComparison: questionJob.holdingsComparison,
-      model: questionJob.model,
+      model: questionJob.model, execution: questionJob.execution,
     }]);
     setQuestionFollowUp(null); setConsentChecked(false); setQuestionPreview(null); setQuestionPreviewText(""); setQuestionPreviewFollowUpId(null);
   }, [questionJob, questionPendingParentId, questionPendingText]);
 
   const activeQuestionText = questionFollowUp ? conversationDraft.trim() : questionDraft.trim();
+  const activeQuestionCharacters = unicodeCodePointCount(activeQuestionText);
+  const activeQuestionWithinLimit = activeQuestionCharacters <= MAX_MATTER_QUESTION_CHARACTERS;
   const currentScope = useMemo(() => questionScope(scopeMode, selectedIds), [scopeMode, selectedIds]);
   const scopeKey = currentScope === null ? "" : currentScope.mode === "all" ? "all" : `selected:${currentScope.documentIds.join("|")}`;
   const scopeBlock = scopeSubmissionBlock(scopeMode, selectedIds, matterDocuments.length);
@@ -270,9 +273,13 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
     // Conversation planning always passes its current draft explicitly so a
     // follow-up state update cannot cause another planning cycle.
     const question = (questionOverride ?? questionDraft).trim();
+    const questionWithinLimit = unicodeCodePointCount(question) <= MAX_MATTER_QUESTION_CHARACTERS;
     const followUp = followUpOverride === undefined ? questionFollowUp : followUpOverride;
     const request = questionRequest(question, followUp);
-    if (!question || request === null || scopeBlock) return;
+    if (!question || !questionWithinLimit || request === null || scopeBlock) {
+      if (question && !questionWithinLimit) setQuestionMessage("Questions are limited to 5,000 characters.");
+      return;
+    }
     setQuestionLoading(true); setQuestionMessage(""); setConsentChecked(false);
     try {
       const response = await window.desktopAPI.previewMatterQuestion(request);
@@ -294,7 +301,7 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
     const question = activeQuestionText;
     const preview = currentQuestionPreview;
     const request = questionRequest(question, questionFollowUp);
-    if (!preview || request === null || !canAskQuestion) return;
+    if (!preview || !activeQuestionWithinLimit || request === null || !canAskQuestion) return;
     setQuestionLoading(true); setQuestionMessage("");
     try { await submitQuestion(request, preview, questionFollowUp); }
     catch (error) { setQuestionMessage(requestFailure(error, "The Q&A is temporarily unavailable.")); }
@@ -311,7 +318,7 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
   const currentQuestionPreview = questionPreviewText === activeQuestionText && questionPreviewFollowUpId === (questionFollowUp?.id ?? null) && questionPreviewScopeKey === scopeKey ? questionPreview : null;
   const consentDocuments = currentQuestionPreview && !currentQuestionPreview.localOnly ? documentsNeedingConsent(currentQuestionPreview.documentScope) : [];
   const askingQuestion = questionLoading || questionJob?.status === "queued" || questionJob?.status === "running";
-  const canAskQuestion = Boolean(currentQuestionPreview && !scopeBlock && (currentQuestionPreview.localOnly || (currentQuestionPreview.globalAuthorization && currentQuestionPreview.configured && currentQuestionPreview.cost.withinLimit)) && (consentDocuments.length === 0 || consentChecked) && !askingQuestion);
+  const canAskQuestion = Boolean(activeQuestionWithinLimit && currentQuestionPreview && !scopeBlock && (currentQuestionPreview.localOnly || (currentQuestionPreview.globalAuthorization && currentQuestionPreview.configured && currentQuestionPreview.cost.withinLimit)) && (consentDocuments.length === 0 || consentChecked) && !askingQuestion);
   const matterTurns = useMemo(() => questionTurns.filter((turn) => turn.matterId === matterId), [matterId, questionTurns]);
   const conversationTurns = useMemo(() => {
     if (!activeConversationId) return [];
@@ -367,8 +374,9 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
       </fieldset>
       <p className="scope-status" role="status">{composerScopeSummary(scopeMode, selectedIds.length, matterDocuments)}{scopeMode === "selected" && selectedIds.length > 0 && <> · <button className="text-button" type="button" onClick={clearSelection}>Clear selection and use all documents</button></>}</p>
       {scopeBlock && <p className="viewer-warning">{scopeBlock}</p>}
-      {!questionFollowUp && <><label className="question-field">Your question<textarea value={questionDraft} maxLength={600} placeholder="For example: What changes, transfers, or unresolved rights are identified across these documents?" onChange={(event) => updateQuestion(event.target.value)} /></label><small>{questionDraft.length}/600</small>
-        {questionDraft.trim() && <><button className="primary-button" type="button" disabled={askingQuestion || Boolean(scopeBlock) || !questionDraft.trim() || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => { if (!currentQuestionPreview) void prepareQuestion(undefined, null, true); else void askQuestion(); }}>{questionLoading ? "Preparing…" : askingQuestion ? "Answering…" : currentQuestionPreview && consentDocuments.length > 0 ? "Send question" : "Ask AI"}</button>
+      {!questionFollowUp && <><label className="question-field">Your question<textarea value={questionDraft} placeholder="For example: What changes, transfers, or unresolved rights are identified across these documents?" onChange={(event) => updateQuestion(event.target.value)} /></label><small className={activeQuestionWithinLimit ? undefined : "viewer-warning"}>{activeQuestionCharacters.toLocaleString()}/{MAX_MATTER_QUESTION_CHARACTERS.toLocaleString()} characters</small>
+        {!activeQuestionWithinLimit && <p className="viewer-warning">Questions are limited to 5,000 characters.</p>}
+        {questionDraft.trim() && <><button className="primary-button" type="button" disabled={askingQuestion || !activeQuestionWithinLimit || Boolean(scopeBlock) || !questionDraft.trim() || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => { if (!currentQuestionPreview) void prepareQuestion(undefined, null, true); else void askQuestion(); }}>{questionLoading ? "Preparing…" : askingQuestion ? "Answering…" : currentQuestionPreview && consentDocuments.length > 0 ? "Send question" : "Ask AI"}</button>
           {currentQuestionPreview && previewDetails(currentQuestionPreview)}
         </>}</>}
       {(rootTurns.length > 0 || (!questionPendingParentId && (pendingQuestion || failedQuestion))) && <div className="question-transcript">
@@ -420,12 +428,13 @@ export default function MatterReviewScreen({ isActive, onOpenSource }: MatterRev
         <footer className="conversation-composer">
           {!followUpAllowed && <p className="viewer-warning">This answer used documents outside the current selection. To avoid sending their content again, ask a new question from the main composer, or switch back to a scope that includes them.</p>}
           {scopeBlock && <p className="viewer-warning">{scopeBlock}</p>}
-          <label>Ask a follow-up<textarea value={conversationDraft} maxLength={600} disabled={!followUpAllowed} placeholder="For example: What source supports that conclusion?" onChange={(event) => { setConversationDraft(event.target.value); setQuestionFollowUp(null); clearPendingQuestion(); }} /></label>
-          <small>{conversationDraft.length}/600</small>
+          <label>Ask a follow-up<textarea value={conversationDraft} disabled={!followUpAllowed} placeholder="For example: What source supports that conclusion?" onChange={(event) => { setConversationDraft(event.target.value); setQuestionFollowUp(null); clearPendingQuestion(); }} /></label>
+          <small className={activeQuestionWithinLimit ? undefined : "viewer-warning"}>{activeQuestionCharacters.toLocaleString()}/{MAX_MATTER_QUESTION_CHARACTERS.toLocaleString()} characters</small>
+          {!activeQuestionWithinLimit && <p className="viewer-warning">Questions are limited to 5,000 characters.</p>}
           {conversationDraft.trim() && <>
             {!currentQuestionPreview && <p className="support-note">Click Ask AI to check the local evidence scope.</p>}
             {currentQuestionPreview && <><p>The previous question and answer are sent as context only; only cited document evidence can support the response.</p>{previewDetails(currentQuestionPreview)}</>}
-            <button className="primary-button" type="button" disabled={!conversationDraft.trim() || !followUpAllowed || Boolean(scopeBlock) || askingQuestion || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => {
+            <button className="primary-button" type="button" disabled={!conversationDraft.trim() || !activeQuestionWithinLimit || !followUpAllowed || Boolean(scopeBlock) || askingQuestion || (Boolean(currentQuestionPreview) && !canAskQuestion)} onClick={() => {
               if (currentQuestionPreview) { void askQuestion(); return; }
               void prepareQuestion(conversationDraft, { id: latestConversationTurn.id }, true);
             }}>{questionLoading ? "Checking…" : askingQuestion ? "Answering…" : currentQuestionPreview && consentDocuments.length > 0 ? "Send question" : "Ask AI"}</button>

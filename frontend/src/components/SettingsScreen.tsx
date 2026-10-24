@@ -81,7 +81,7 @@ export default function SettingsScreen({ appInfo, desktopState }: { appInfo: App
   const hasStoredKey = ai?.credentialPresent === true;
   return <>
     <header className="page-header"><div><p className="eyebrow">Settings</p><h1>Settings</h1></div></header>
-    <section className="settings-section"><div className="settings-card"><h2>About</h2><p>{appInfo?.name ?? "ClaimFlow"} · Version {appInfo?.version ?? "Unavailable"}</p><p>Operating system: {platformName(appInfo?.platform)}</p></div></section>
+    <section className="settings-section"><div className="settings-card"><h2>About</h2><p>{appInfo?.name ?? "ClaimFlow"} · Version {appInfo?.version ?? "Unavailable"}</p><p>Build ID: {appInfo?.build.buildId ?? "Unavailable"}</p><p>Built: {appInfo?.build.buildDate ?? "Unavailable"}</p><p>Source revision: {appInfo?.build.sourceRevisionShort ?? "Unavailable"} ({appInfo?.build.sourceState ?? "Unavailable"})</p><p>Operating system: {platformName(appInfo?.platform)}</p></div></section>
     <section className="settings-section"><div className="settings-card"><h2>AI Connection</h2>
       <label className="settings-provider" htmlFor="ai-provider">AI provider<select id="ai-provider" value={ai?.provider === "openai" ? "openai" : "codex"} disabled={ai === null || switchingProvider || connectingCodex || savingKey || removingKey || updatingAuthorization} onChange={(event) => { const provider = event.target.value; if (provider === "codex" || provider === "openai") switchProvider(provider); }}><option value="codex">Codex (ChatGPT sign-in)</option><option value="openai">OpenAI API key</option></select></label>
       {switchingProvider && <p className="settings-detail" role="status">Switching provider…</p>}

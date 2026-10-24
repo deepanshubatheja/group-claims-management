@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -36,6 +37,8 @@ MAX_PDF_PAGES = 100
 MAX_OCR_PIXELS = 20_000_000
 OCR_RENDER_SCALE = 2
 OCR_PAGE_TIMEOUT_SECONDS = 30
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentImportError(RuntimeError):
@@ -420,6 +423,7 @@ class DocumentImportService:
             raise DocumentImportError("STORAGE_UNAVAILABLE", "Local storage is not ready.")
         self._database = storage.database
         self._vault = storage.vault
+        self._storage = storage
         self._repository = DocumentMetadataRepository()
         self._parser = DeterministicDocumentParser()
 
@@ -729,6 +733,7 @@ class DocumentImportService:
                 connection.execute("UPDATE document_extractions SET status = 'parsed', completed_at = ? WHERE id = ?", (_now(), extraction_id))
                 connection.execute("""UPDATE source_documents SET processing_status = 'parsed', parser_version = ?, parsed_at = ?, processing_error = NULL
                     WHERE id = ?""", (PARSER_VERSION, _now(), document.id))
+            self._generate_reconciliation_candidates(document.id)
         except ExtractionUnsupported as error:
             self._mark_parse_failure(document.id, extraction_id, "unsupported", error)
         except (DocumentImportError, VaultStorageError) as error:
@@ -741,6 +746,27 @@ class DocumentImportService:
                 "failed",
                 DocumentImportError("PARSE_FAILED", "The document could not be parsed safely."),
             )
+
+    def _generate_reconciliation_candidates(self, document_id: str) -> None:
+        """Stage deterministic observations without making import dependent on interpretation.
+
+        Candidate generation is local and bounded.  Any document that lacks a
+        safe recognised structure simply produces no candidate and remains
+        fully available for normal review.
+        """
+        from .reconciliation import ReconciliationError, ReconciliationService
+        from .billing import BillingError, BillingService
+
+        try:
+            ReconciliationService(self._storage).generate({"documentId": document_id, "includeAi": False})
+            BillingService(self._storage).generate({"documentId": document_id})
+        except (ReconciliationError, BillingError) as error:
+            logger.info("Reconciliation candidate generation skipped: %s", error.code)
+        except Exception:
+            # Candidate generation is additive.  Never mark an otherwise valid
+            # immutable import as failed because an interpretation extension is
+            # temporarily unavailable.
+            logger.exception("Reconciliation candidate generation failed.")
 
     @staticmethod
     def _insert_pdf_pages(

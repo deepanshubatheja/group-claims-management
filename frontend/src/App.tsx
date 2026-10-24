@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import DashboardScreen from "./components/DashboardScreen";
 import DocumentsScreen from "./components/DocumentsScreen";
 import MatterReviewScreen from "./components/MatterReviewScreen";
+import ReconciliationScreen from "./components/ReconciliationScreen";
+import BillingScreen from "./components/BillingScreen";
 import SettingsScreen from "./components/SettingsScreen";
 import { isAvailablePage, workspacePages, type WorkspacePage } from "./components/workspace-ui";
 
@@ -58,6 +60,9 @@ function App() {
       {activePage === "Dashboard" && <DashboardScreen onOpenDocument={openDocument} onViewDocuments={openDocuments} />}
       {activePage === "Documents" && <DocumentsScreen requestedDocumentId={requestedDocumentId} onRequestedDocumentHandled={() => setRequestedDocumentId(null)} citedSource={requestedSource} onCloseCitedSource={() => setRequestedSource(null)} />}
       <div hidden={activePage !== "Matter Review"}><MatterReviewScreen isActive={activePage === "Matter Review"} onOpenSource={openSource} /></div>
+      {activePage === "Holdings & History" && <ReconciliationScreen mode="holdings" onOpenSource={openSource} />}
+      {activePage === "Issues" && <ReconciliationScreen mode="issues" onOpenSource={openSource} />}
+      {activePage === "Billing" && <BillingScreen onOpenSource={openSource} />}
       {activePage === "Settings" && <SettingsScreen appInfo={appInfo} desktopState={connectionState} />}
     </main>
   </div>;

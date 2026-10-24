@@ -24,6 +24,12 @@ import {
   GET_MATTER_REVIEW_CHANNEL, GET_BILLING_PREVIEW_CHANNEL,
   PREVIEW_MATTER_ANALYSIS_BATCH_CHANNEL, START_MATTER_ANALYSIS_BATCH_CHANNEL, GET_MATTER_ANALYSIS_BATCH_STATUS_CHANNEL,
   PREVIEW_MATTER_QUESTION_CHANNEL, ASK_MATTER_QUESTION_CHANNEL, GET_MATTER_QUESTION_STATUS_CHANNEL,
+  GET_RECONCILIATION_HOLDINGS_AS_OF_CHANNEL, GET_RECONCILIATION_TIMELINE_CHANNEL,
+  GET_RECONCILIATION_TRANSFERS_CHANNEL, GET_RECONCILIATION_ASSIGNMENTS_CHANNEL,
+  GET_RECONCILIATION_DISCREPANCIES_CHANNEL, GET_RECONCILIATION_RESULT_CHANNEL,
+  GET_RECONCILIATION_CANDIDATES_CHANNEL, CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL, REJECT_RECONCILIATION_CANDIDATE_CHANNEL, APPLY_RECONCILIATION_POLICY_CHANNEL,
+  GET_BILLING_RULE_CANDIDATES_CHANNEL, APPROVE_BILLING_RULE_CHANNEL, SAVE_BILLING_CALCULATION_CHANNEL,
+  GET_BILLING_RULE_CHANNEL, GET_BILLING_CALCULATION_PREVIEW_CHANNEL, GET_BILLING_CALCULATION_RUNS_CHANNEL, GET_BILLING_CALCULATION_RUN_CHANNEL, COMPARE_BILLING_CALCULATION_RUNS_CHANNEL,
   SELECT_AND_IMPORT_DOCUMENTS_CHANNEL, SELECT_FOLDER_FOR_IMPORT_CHANNEL, CONFIRM_FOLDER_IMPORT_CHANNEL, CANCEL_FOLDER_IMPORT_CHANNEL, FOLDER_IMPORT_PROGRESS_CHANNEL, IMPORT_DROPPED_DOCUMENTS_CHANNEL, REMOVE_DOCUMENT_CHANNEL, LIST_DOCUMENTS_CHANNEL, GET_DOCUMENT_CONTENT_CHANNEL, RETRY_DOCUMENT_PARSE_CHANNEL,
   type AppInfo,
   type BackendHealthResponse,
@@ -37,10 +43,15 @@ import {
   type MatterReviewResponse, type MatterAnalysisBatchPreviewResponse, type MatterAnalysisBatchResponse,
   type MatterQuestionPreviewResponse, type MatterQuestionResponse,
   type BillingPreviewResponse, type MatterReviewResult, type MatterAnalysisBatchPreview, type MatterAnalysisBatch, type MatterQuestionPreview, type MatterQuestionStatus, type BillingPreviewResult,
+  type ReconciliationReadResponse,
+  type ReconciliationWriteResponse,
+  type BillingCalculationReadResponse,
+  type BillingCalculationWriteResponse,
   type DocumentImportResponse, type DocumentRemoveResponse,
 } from "./ipc-contract";
 import { discoverDroppedImportableFiles, discoverImportableFiles, type AuthorizedFolderFile, type FolderDiscovery } from "./folder-import";
 import { isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "./matter-question";
+import { BUILD_METADATA } from "./generated-build-metadata";
 
 const MAX_IMPORT_FILE_BYTES = 50 * 1024 * 1024;
 const supportedExtensions = new Set([".xlsx", ".xls", ".csv", ".pdf"]);
@@ -53,6 +64,38 @@ let backendProcess: BackendProcessManager | undefined;
 let backendLaunchPromise: Promise<void> | undefined;
 let switchingAIProvider = false;
 const folderAuthorizations = new Map<string, { files: AuthorizedFolderFile[]; skipped: number; expiresAt: number }>();
+
+/**
+ * An opt-in development profile for manual synthetic acceptance testing. It is
+ * intentionally unavailable in packaged builds and must name a non-root,
+ * absolute directory. The profile contains the SQLite database, vault, local
+ * settings, and Codex runtime home; it never copies the normal profile.
+ */
+function isolatedDevelopmentDataRoot(): string | null {
+  if (app.isPackaged) return null;
+  const configured = process.env.CLAIMFLOW_ISOLATED_TEST_DATA?.trim();
+  if (!configured) return null;
+  const resolved = path.resolve(configured);
+  if (!path.isAbsolute(resolved) || path.parse(resolved).root === resolved) {
+    console.error("Ignoring an unsafe isolated development data path.");
+    return null;
+  }
+  return resolved;
+}
+
+const isolatedDevelopmentRoot = isolatedDevelopmentDataRoot();
+const isIsolatedDevelopmentWorkspace = isolatedDevelopmentRoot !== null;
+if (isolatedDevelopmentRoot !== null) app.setPath("userData", isolatedDevelopmentRoot);
+
+function isolatedWorkspaceAIDisabled() {
+  return {
+    ok: false as const,
+    error: {
+      code: "AI_DISABLED_FOR_ISOLATED_TEST",
+      message: "Cloud AI is disabled for this isolated synthetic workspace.",
+    },
+  };
+}
 
 function isAllowedRendererUrl(url: string): boolean {
   try {
@@ -71,6 +114,7 @@ function createAppInfo(): AppInfo {
     name: app.getName(),
     version: app.getVersion(),
     platform: process.platform,
+    build: BUILD_METADATA,
   };
 
   if (
@@ -356,6 +400,28 @@ function isMatterQuestionPreview(value: unknown): value is MatterQuestionPreview
     && isQuestionScope(value.scope) && isMatterDocumentScope(value.documentScope) && isQuestionCost(value.cost);
 }
 
+function isMatterQuestionExecution(value: unknown): boolean {
+  const evidenceItemCounts = isRecord(value) ? value.evidenceItemCounts : null;
+  return isRecord(value) && typeof value.timestamp === "string"
+    && (typeof value.provider === "string" || value.provider === null)
+    && (typeof value.model === "string" || value.model === null)
+    && typeof value.providerCallAttempted === "boolean"
+    && ["queued", "attempting", "completed", "provider_failure", "local_only"].includes(String(value.providerOutcome))
+    && typeof value.fallbackUsed === "boolean"
+    && (typeof value.fallbackReason === "string" || value.fallbackReason === null)
+    && ["documentsSelected", "documentsIncluded", "documentsExcluded"].every((key) => Array.isArray(value[key]) && value[key].every((item) => typeof item === "string"))
+    && typeof value.evidenceTruncated === "boolean" && isRecord(value.requirements)
+    && Object.values(value.requirements).every((item) => typeof item === "boolean")
+    && (typeof value.modelUnknown === "boolean" || value.modelUnknown === null)
+    && (["complete", "partial", "no_supported_findings", "fallback", "local"].includes(String(value.responseStatus)) || value.responseStatus === null)
+    && Array.isArray(value.validatedSectionKinds) && value.validatedSectionKinds.every((item) => typeof item === "string")
+    && isRecord(value.validatedSectionCounts) && Object.values(value.validatedSectionCounts).every((item) => typeof item === "number")
+    && isRecord(value.validatedSectionStatusCounts) && Object.values(value.validatedSectionStatusCounts).every((item) => typeof item === "number")
+    && typeof value.validatedCitationCount === "number"
+    && isRecord(evidenceItemCounts) && Object.values(evidenceItemCounts).every((item) => isRecord(item)
+      && ["available", "included", "excluded"].every((key) => typeof item[key] === "number"));
+}
+
 function isMatterQuestionStatus(value: unknown): value is MatterQuestionStatus {
   return isRecord(value) && typeof value.questionId === "string" && typeof value.matterId === "string"
     && isMatterDocumentScope(value.documentScope) && isMatterQuestionIntent(value.intent)
@@ -365,9 +431,10 @@ function isMatterQuestionStatus(value: unknown): value is MatterQuestionStatus {
     && (typeof value.answer === "string" || value.answer === null) && typeof value.unknown === "boolean"
     && Array.isArray(value.citations) && value.citations.every((citation) => isRecord(citation)
       && typeof citation.documentId === "string" && typeof citation.filename === "string"
-      && typeof citation.sourceReference === "string" && typeof citation.evidenceSnippet === "string")
+      && typeof citation.sourceReference === "string" && typeof citation.evidenceSnippet === "string"
+      && (citation.origin === undefined || citation.origin === "local_fallback"))
     && (typeof value.errorCode === "string" || value.errorCode === null)
-    && (typeof value.model === "string" || value.model === null)
+    && (typeof value.model === "string" || value.model === null) && isMatterQuestionExecution(value.execution)
     && isQuestionScope(value.scope) && isRecord(value.usage)
     && (typeof value.usage.inputTokens === "number" || value.usage.inputTokens === null)
     && (typeof value.usage.outputTokens === "number" || value.usage.outputTokens === null)
@@ -416,9 +483,14 @@ async function startBackend(storageRoot: string): Promise<void> {
     } catch {
       console.error("AI provider preference could not be read; using the launch default.");
     }
-    const selectedProvider = selectedAIProvider(preference, process.env.GROUP_CLAIMS_AI_PROVIDER);
+    // Manual synthetic acceptance runs must never inherit the normal profile's
+    // provider credential or Codex session. Local reconciliation remains fully
+    // available with an unconfigured OpenAI provider.
+    const selectedProvider = isIsolatedDevelopmentWorkspace
+      ? "openai"
+      : selectedAIProvider(preference, process.env.GROUP_CLAIMS_AI_PROVIDER);
     let storedCredential: string | null = null;
-    if (selectedProvider === "openai") {
+    if (!isIsolatedDevelopmentWorkspace && selectedProvider === "openai") {
       try {
         storedCredential = await credentialStore().read();
       } catch {
@@ -431,6 +503,7 @@ async function startBackend(storageRoot: string): Promise<void> {
         ? resolvePackagedBackendLaunch(process.resourcesPath, storageRoot)
         : resolveDevelopmentBackendLaunch(projectRoot, storageRoot);
       launch.options.env = { ...launch.options.env, GROUP_CLAIMS_AI_PROVIDER: selectedProvider };
+      if (isIsolatedDevelopmentWorkspace) delete launch.options.env.OPENAI_API_KEY;
       if (storedCredential !== null) {
         launch.options.env = { ...launch.options.env, OPENAI_API_KEY: storedCredential };
       }
@@ -467,8 +540,25 @@ async function ensureBackend(): Promise<BackendProcessManager | undefined> {
 }
 
 app.setName("ClaimFlow");
+// Development and installed builds deliberately share the same local-first
+// ClaimFlow data directory.  Running both at once can contend for SQLite's
+// write lock while a question records its consent audit.  Keep exactly one
+// app process attached to that store; a second launch focuses the existing
+// window instead of starting another backend against the same database.
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+}
+
+app.on("second-instance", () => {
+  const window = BrowserWindow.getAllWindows()[0];
+  if (window === undefined) return;
+  if (window.isMinimized()) window.restore();
+  window.focus();
+});
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return;
   configureSessionSecurity();
   void startBackend(app.getPath("userData"));
 
@@ -521,6 +611,7 @@ app.whenReady().then(() => {
       arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)
       || !isRecord(payload) || Object.keys(payload).length !== 1 || !isAIProvider(payload.provider)
     ) throw new Error("Invalid AI provider request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     if (switchingAIProvider) return { ok: false, error: { code: "AI_PROVIDER_SWITCH_IN_PROGRESS", message: "The AI provider is already changing." } };
     switchingAIProvider = true;
     try {
@@ -547,6 +638,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(CHECK_AI_CONNECTION_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AIConnectionCheckResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid AI connection check request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try {
       const backend = await ensureBackend();
       if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
@@ -557,6 +649,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(CONNECT_CODEX_CHANNEL, async (event, ...arguments_: unknown[]): Promise<CodexConnectionResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid Codex sign-in request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try {
       const backend = await ensureBackend();
       if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
@@ -570,6 +663,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(DISCONNECT_CODEX_CHANNEL, async (event, ...arguments_: unknown[]): Promise<CodexConnectionResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid Codex sign-out request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try {
       const backend = await ensureBackend();
       if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
@@ -579,6 +673,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(SET_AI_AUTHORIZATION_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AIStatusResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url) || typeof payload !== "object" || payload === null || typeof (payload as { authorized?: unknown }).authorized !== "boolean") throw new Error("Invalid AI authorization request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try { const backend = await ensureBackend(); if (!backend) return createBackendHealthFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable.")); return { ok: true, ai: await backend.setAIAuthorization((payload as { authorized: boolean }).authorized) as AIStatusResponse extends { ok: true; ai: infer T } ? T : never }; } catch (error) { return createBackendHealthFailure(error); }
   });
   ipcMain.handle(SAVE_AI_API_KEY_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<AICredentialResponse> => {
@@ -586,6 +681,7 @@ app.whenReady().then(() => {
       arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)
       || !isRecord(payload) || Object.keys(payload).length !== 1 || typeof payload.apiKey !== "string"
     ) throw new Error("Invalid API key request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try {
       await credentialStore().save(payload.apiKey);
       await restartBackend();
@@ -596,6 +692,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(REMOVE_AI_API_KEY_CHANNEL, async (event, ...arguments_: unknown[]): Promise<AICredentialResponse> => {
     if (arguments_.length !== 0 || event.senderFrame === null || !isAllowedRendererUrl(event.senderFrame.url)) throw new Error("Invalid API key removal request.");
+    if (isIsolatedDevelopmentWorkspace) return isolatedWorkspaceAIDisabled();
     try {
       await credentialStore().remove();
       await restartBackend();
@@ -814,6 +911,142 @@ app.whenReady().then(() => {
       return { ok: true, question };
     } catch (error) { return documentFailure(error); }
   });
+  const reconciliationRequest = (payload: unknown, asOf: boolean): Record<string, string> | undefined => {
+    if (!isRecord(payload)) return undefined;
+    const allowed = asOf
+      ? ["asOfDate", "investor", "subfund", "account", "isin"]
+      : ["fromDate", "toDate", "investor", "subfund", "account", "isin", "claimReference", "fromEntity", "toEntity"];
+    if (Object.keys(payload).some((key) => !allowed.includes(key))) return undefined;
+    const dateKeys = asOf ? ["asOfDate"] : ["fromDate", "toDate"];
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(payload)) {
+      if (typeof value !== "string" || !value.trim() || value.length > 256) return undefined;
+      if (dateKeys.includes(key) && !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+      result[key] = value.trim();
+    }
+    if (asOf && result.asOfDate === undefined) return undefined;
+    if (!asOf && result.fromDate !== undefined && result.toDate !== undefined && result.fromDate > result.toDate) return undefined;
+    return result;
+  };
+  const reconciliationRead = async (
+    event: Electron.IpcMainInvokeEvent,
+    payload: unknown,
+    arguments_: unknown[],
+    command: "reconciliation.holdings_as_of" | "reconciliation.holdings_timeline" | "reconciliation.transfer_history" | "reconciliation.claim_assignment_history" | "reconciliation.open_discrepancies" | "reconciliation.result",
+    asOf: boolean,
+  ): Promise<ReconciliationReadResponse> => {
+    const request = reconciliationRequest(payload, asOf);
+    if (!validAnalysisSender(event, arguments_) || request === undefined) throw new Error("Invalid reconciliation request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation(command, request);
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid reconciliation data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  };
+  ipcMain.handle(GET_RECONCILIATION_HOLDINGS_AS_OF_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.holdings_as_of", true));
+  ipcMain.handle(GET_RECONCILIATION_TIMELINE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.holdings_timeline", false));
+  ipcMain.handle(GET_RECONCILIATION_TRANSFERS_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.transfer_history", false));
+  ipcMain.handle(GET_RECONCILIATION_ASSIGNMENTS_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.claim_assignment_history", false));
+  ipcMain.handle(GET_RECONCILIATION_DISCREPANCIES_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.open_discrepancies", false));
+  ipcMain.handle(GET_RECONCILIATION_RESULT_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) =>
+    reconciliationRead(event, payload, arguments_, "reconciliation.result", true));
+  const candidateId = (value: unknown): string | undefined =>
+    typeof value === "string" && /^[a-f0-9-]{36}$/i.test(value) ? value : undefined;
+  const reconciliationWrite = async (
+    event: Electron.IpcMainInvokeEvent, payload: unknown, arguments_: unknown[],
+    command: "reconciliation.confirm" | "reconciliation.reject" | "reconciliation.apply_policy",
+  ): Promise<ReconciliationWriteResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload)) throw new Error("Invalid reconciliation review request.");
+    let request: Record<string, unknown> | undefined;
+    if (command === "reconciliation.confirm" && Object.keys(payload).length === 2 && candidateId(payload.candidateId) && payload.acknowledged === true) request = { candidateId: payload.candidateId, acknowledged: true };
+    if (command === "reconciliation.reject" && Object.keys(payload).length === 3 && candidateId(payload.candidateId) && payload.acknowledged === true && typeof payload.reason === "string" && payload.reason.trim().length > 0 && payload.reason.trim().length <= 500) request = { candidateId: payload.candidateId, reason: payload.reason.trim(), acknowledged: true };
+    if (command === "reconciliation.apply_policy" && Object.keys(payload).length === 3 && payload.policy === "reviewed_batch" && payload.acknowledged === true && Array.isArray(payload.candidateIds) && payload.candidateIds.length > 0 && payload.candidateIds.length <= 100 && payload.candidateIds.every(candidateId)) request = { candidateIds: [...new Set(payload.candidateIds)], policy: "reviewed_batch", acknowledged: true };
+    if (!request) throw new Error("Invalid reconciliation review request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation(command, request);
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid reconciliation data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  };
+  ipcMain.handle(GET_RECONCILIATION_CANDIDATES_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<ReconciliationReadResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload) || Object.keys(payload).length > 1 || (payload.status !== undefined && !["candidate", "confirmed", "rejected"].includes(String(payload.status)))) throw new Error("Invalid candidate review request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation("reconciliation.candidates", payload.status === undefined ? {} : { status: payload.status });
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid candidate data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  });
+  ipcMain.handle(CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.confirm"));
+  ipcMain.handle(REJECT_RECONCILIATION_CANDIDATE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.reject"));
+  ipcMain.handle(APPLY_RECONCILIATION_POLICY_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.apply_policy"));
+  const billingIdRequest = (payload: unknown, key: "billingAgreementId" | "runId"): Record<string, string> | undefined => {
+    if (!isRecord(payload) || Object.keys(payload).some((name) => name !== key && !(key === "billingAgreementId" && name === "asOfDate"))) return undefined;
+    const identifier = payload[key];
+    if (typeof identifier !== "string" || !/^[a-f0-9-]{36}$/i.test(identifier)) return undefined;
+    const asOfDate = payload.asOfDate;
+    if (asOfDate !== undefined && (typeof asOfDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDate))) return undefined;
+    return asOfDate === undefined ? { [key]: identifier } : { [key]: identifier, asOfDate };
+  };
+  const billingRead = async (event: Electron.IpcMainInvokeEvent, payload: unknown, arguments_: unknown[], command: "billing.rule" | "billing.preview" | "billing.runs" | "billing.run", key: "billingAgreementId" | "runId"): Promise<BillingCalculationReadResponse> => {
+    const request = billingIdRequest(payload, key);
+    if (!validAnalysisSender(event, arguments_) || request === undefined) throw new Error("Invalid billing read request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation(command, request);
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid billing data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  };
+  ipcMain.handle(GET_BILLING_RULE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingRead(event, payload, arguments_, "billing.rule", "billingAgreementId"));
+  ipcMain.handle(GET_BILLING_CALCULATION_PREVIEW_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingRead(event, payload, arguments_, "billing.preview", "billingAgreementId"));
+  ipcMain.handle(GET_BILLING_CALCULATION_RUNS_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingRead(event, payload, arguments_, "billing.runs", "billingAgreementId"));
+  ipcMain.handle(GET_BILLING_CALCULATION_RUN_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingRead(event, payload, arguments_, "billing.run", "runId"));
+  ipcMain.handle(COMPARE_BILLING_CALCULATION_RUNS_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<BillingCalculationReadResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload) || Object.keys(payload).length !== 2 || typeof payload.leftRunId !== "string" || typeof payload.rightRunId !== "string" || !/^[a-f0-9-]{36}$/i.test(payload.leftRunId) || !/^[a-f0-9-]{36}$/i.test(payload.rightRunId)) throw new Error("Invalid billing comparison request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation("billing.compare_runs", { leftRunId: payload.leftRunId, rightRunId: payload.rightRunId });
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid billing data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  });
+  const billingWrite = async (event: Electron.IpcMainInvokeEvent, payload: unknown, arguments_: unknown[], command: "billing.approve_rule" | "billing.calculate"): Promise<BillingCalculationWriteResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload) || payload.acknowledged !== true) throw new Error("Invalid billing confirmation request.");
+    const allowed = command === "billing.approve_rule" ? ["candidateId", "acknowledged"] : ["billingAgreementId", "asOfDate", "acknowledged"];
+    if (Object.keys(payload).some((key) => !allowed.includes(key)) || (command === "billing.approve_rule" ? !candidateId(payload.candidateId) : !candidateId(payload.billingAgreementId)) || (payload.asOfDate !== undefined && (typeof payload.asOfDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(payload.asOfDate)))) throw new Error("Invalid billing confirmation request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation(command, command === "billing.approve_rule" ? { candidateId: payload.candidateId, acknowledged: true } : { billingAgreementId: payload.billingAgreementId, ...(payload.asOfDate ? { asOfDate: payload.asOfDate } : {}), acknowledged: true });
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid billing data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  };
+  ipcMain.handle(GET_BILLING_RULE_CANDIDATES_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<BillingCalculationReadResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload) || Object.keys(payload).length > 1 || (payload.status !== undefined && !["candidate", "approved"].includes(String(payload.status)))) throw new Error("Invalid billing-rule request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation("billing.candidates", payload.status === undefined ? {} : { status: payload.status });
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid billing-rule data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  });
+  ipcMain.handle(APPROVE_BILLING_RULE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingWrite(event, payload, arguments_, "billing.approve_rule"));
+  ipcMain.handle(SAVE_BILLING_CALCULATION_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => billingWrite(event, payload, arguments_, "billing.calculate"));
   ipcMain.handle(GET_BILLING_PREVIEW_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<BillingPreviewResponse> => {
     const request = billingPreviewRequest(payload);
     if (!validAnalysisSender(event, arguments_) || !request) throw new Error("Invalid billing preview request.");

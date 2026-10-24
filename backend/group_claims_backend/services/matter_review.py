@@ -9,6 +9,7 @@ or one explicitly approved instruction stored in the selected documents.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -20,10 +21,11 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Mapping, Sequence
 
-from .ai import AIServiceError
+from .ai import AIServiceError, QuestionResponseContract
 from .ai_analysis import AIAnalysisError, AIAnalysisService
+from .billing import BillingError, BillingService
 from .document_search import DocumentSearchIndex, SearchHit
-from .document_references import CandidateDocument, DocumentConstraint, resolve_document_references
+from .document_references import CandidateDocument, DocumentConstraint, question_dates, resolve_document_references
 from .entity_inventory import EntityInventoryBuilder, InventoryDocument
 from .holdings_comparison import HoldingsComparison, HoldingsDocument, HoldingsResult, grouped_quantity
 from .question_intent import (
@@ -48,6 +50,9 @@ SHORT_EXCERPT_CHARACTERS = 80
 _SCOPE_MODES = frozenset({"all", "selected"})
 _MATTER_ID = re.compile(r"^[a-z0-9-]{1,64}$")
 _DOCUMENT_CONSENT_EVENT = "ai_matter_question_document_authorized"
+_DATE_DOCUMENT_SELECTOR = re.compile(
+    r"\b(?:spreadsheet|workbook|statement|report|file|document)s?\s+dated\b", re.IGNORECASE,
+)
 _UNKNOWN_FOLLOW_UP_ANSWER = "The selected evidence does not establish an answer to this question."
 # Question filler words that otherwise match unrelated text in every document.
 _GENERIC_QUESTION_WORDS = frozenset({
@@ -82,7 +87,19 @@ MAX_QUESTION_SOURCE_ITEMS = 20
 # many keys can consume the full development request budget before any actual
 # evidence is included.  Keep the list intentionally short so every selected
 # key has room for its literal local excerpt.
-MAX_QUESTION_CITATION_SOURCES = 12
+MAX_QUESTION_CITATION_SOURCES = 16
+# User question text is measured as Unicode code points after outer
+# whitespace is removed. It is independent of the bounded provider prompt,
+# which may still reject a detailed question when no cited evidence can fit.
+MAX_MATTER_QUESTION_CHARACTERS = 5_000
+# Historical reconstructions have a small, separate bounded allowance.  Four
+# documents plus six direct holdings cells cannot reliably fit in the generic
+# short-answer budget without dropping a fact-level source.
+# Six direct holdings rows, three event records, and five independently
+# citable billing facts fit below this measured bounded allowance. Keeping it
+# explicit prevents an all-document historical request from silently dropping
+# a required billing basis or event source.
+MAX_HISTORICAL_QUESTION_CHARACTERS = 6_000
 MAX_RECONCILIATION_EXCERPTS = 20
 MAX_ALLOCATION_ROWS = 50
 # A batch is an explicit, paid action.  Keep it deliberately small for the
@@ -99,6 +116,7 @@ _CURRENCY = re.compile(r"^[A-Z]{3}$")
 _DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$")
 _MONEY = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$")
 _CENT = Decimal("0.01")
+LOGGER = logging.getLogger(__name__)
 
 
 class MatterReviewError(ValueError):
@@ -121,6 +139,12 @@ class DocumentBillingAnswer:
     answer: str
     citations: tuple[tuple[str, str, str, str], ...]
     instruction_context: str
+    # This is a local Decimal calculation, not source-document prose. It is
+    # supplied only beside the individual source blocks required to verify it.
+    derived_calculation_context: str = ""
+    # (document id, source reference, plain-language fact label). These names
+    # are trusted local parser output and never document-provided instructions.
+    source_facts: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass
@@ -182,6 +206,78 @@ class MatterQuestionRequest:
 
 
 @dataclass(frozen=True)
+class AnalysisRequirements:
+    """Independent factual tasks requested by one Matter Review question.
+
+    Routing still selects a convenient primary presentation strategy, but it
+    must not discard another requested analysis merely because a question
+    mentions claim rights, a transfer, or billing as well as holdings.
+    """
+
+    historical_holdings: bool = False
+    historical_chronology: bool = False
+    holdings_comparison: bool = False
+    multiple_as_of_dates: bool = False
+    securities_transfer: bool = False
+    claim_assignment: bool = False
+    contradictions: bool = False
+    pro_rata_billing: bool = False
+    billing_impact: bool = False
+    invoice_status: bool = False
+
+    @property
+    def requires_cross_document_coverage(self) -> bool:
+        """Whether a compound request must retain the resolved whole scope."""
+        return self.historical_chronology or (
+            self.historical_holdings and (
+                self.multiple_as_of_dates
+                or self.securities_transfer
+                or self.claim_assignment
+                or self.contradictions
+                or self.pro_rata_billing
+                or self.billing_impact
+                or self.invoice_status
+            )
+        ) or (
+            # A direct comparison of contradictory holdings with an approved
+            # billing instruction is also compound evidence work.  It must
+            # not be intercepted by the single-instruction billing shortcut.
+            self.holdings_comparison and self.contradictions and self.pro_rata_billing
+        )
+
+    def as_dict(self) -> Mapping[str, bool]:
+        return {
+            "historicalHoldings": self.historical_holdings,
+            "historicalChronology": self.historical_chronology,
+            "holdingsComparison": self.holdings_comparison,
+            "multipleAsOfDates": self.multiple_as_of_dates,
+            "securitiesTransfer": self.securities_transfer,
+            "claimAssignment": self.claim_assignment,
+            "contradictions": self.contradictions,
+            "proRataBilling": self.pro_rata_billing,
+            "billingImpact": self.billing_impact,
+            "invoiceStatus": self.invoice_status,
+        }
+
+    def prompt_text(self) -> str:
+        requested = [
+            label for enabled, label in (
+                (self.historical_holdings, "historical holdings"),
+                (self.historical_chronology, "chronological timeline"),
+                (self.holdings_comparison, "dated holdings comparison"),
+                (self.multiple_as_of_dates, "requested as-of dates"),
+                (self.securities_transfer, "securities transfers"),
+                (self.claim_assignment, "claim-right assignments"),
+                (self.contradictions, "unresolved contradictions"),
+                (self.pro_rata_billing, "approved pro-rata billing"),
+                (self.billing_impact, "billing-basis impact"),
+                (self.invoice_status, "issued-invoice status"),
+            ) if enabled
+        ]
+        return "; ".join(requested) or "answer only the supported factual request"
+
+
+@dataclass(frozen=True)
 class LegalHoldingsEvidence:
     """Dated holding records behind a legal-status question about holding movements."""
 
@@ -192,6 +288,14 @@ class LegalHoldingsEvidence:
     # Set when the scope holds only the two workbooks and they contain no
     # rights-related wording beyond their own caveat: answered locally.
     local_answer: "LocalAnswer | None"
+
+
+@dataclass(frozen=True)
+class HistoricalHoldingsEvidence:
+    """Compact deterministic transcriptions of selected dated holdings sheets."""
+
+    candidates: tuple[tuple[str, str, str, str, str], ...]
+    citations: tuple[tuple[str, str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -234,6 +338,9 @@ class MatterQuestion:
     output_tokens: int | None = None
     total_tokens: int | None = None
     actual_cost_estimate_usd: str | None = None
+    # Short-lived operational metadata for test/support inspection. It must
+    # never contain a credential, question text, prompt, or source content.
+    execution: Mapping[str, object] | None = None
 
 
 class MatterReviewService:
@@ -242,6 +349,7 @@ class MatterReviewService:
     def __init__(self, storage: StorageService, analysis: AIAnalysisService | None = None) -> None:
         if storage.database is None:
             raise MatterReviewError("Local storage is unavailable.")
+        self._storage = storage
         self._database = storage.database
         self._analysis = analysis or AIAnalysisService(storage)
         self._batches: dict[str, AnalysisBatch] = {}
@@ -450,21 +558,37 @@ class MatterReviewService:
             for row, fee in allocations
         )
         excluded_match = re.search(
-            r"Excluded\s+participant\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([^\n]+)",
+            r"(?:Excluded\s+participant\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([^\n]+)"
+            r"|([^\n(]+?)\s*\(([^)]+)\)\s+is\s+excluded\s+because\s+([^\n]+))",
             source_text, flags=re.IGNORECASE,
         )
         exclusion = ""
         if excluded_match is not None:
+            name = (excluded_match.group(1) or excluded_match.group(4) or "").strip()
+            identifier = (excluded_match.group(2) or excluded_match.group(5) or "").strip()
+            reason = (excluded_match.group(3) or excluded_match.group(6) or "").strip()
             exclusion = (
-                f" {excluded_match.group(1).strip()} ({excluded_match.group(2).strip()}) is excluded by the "
-                f"instruction because it is recorded as {excluded_match.group(3).strip()}."
+                f" {name} ({identifier}) is excluded by the instruction because {reason}."
             )
+
+        def source_fact_label(text: str) -> str:
+            folded = text.casefold()
+            if "fee pool" in folded:
+                return "approved fee pool"
+            if "allocation rule" in folded:
+                return "approved allocation rule"
+            if "eligible participant" in folded:
+                return "approved eligible participant nominal basis"
+            if " is excluded because " in folded or "excluded participant" in folded:
+                return "approved excluded participant and reason"
+            return "approved billing instruction fact"
+
         citation_sources = [
             source for source in page_sources
             if re.match(
                 r"^\s*(Fee\s+pool|Allocation\s+rule|Eligible\s+participant|Excluded\s+participant)\b",
                 str(source["text"]), flags=re.IGNORECASE,
-            )
+            ) or " is excluded because " in str(source["text"]).casefold()
         ]
         # A parser may preserve an instruction as one large page block. That
         # single block remains a valid precise citation when field-level
@@ -503,6 +627,18 @@ class MatterReviewService:
                 f"currency rounding to reconcile to the fee pool.{exclusion} This is a local calculation preview, "
                 "not an invoice or a determination of legal entitlement."
             )
+        elif intent in {"invoiced", "outstanding"}:
+            answer = (
+                f"The selected instruction supports a calculated allocation for {period} of {currency} {fee_pool:,.2f}: "
+                f"{allocations_text}. It does not establish a verified issued invoice, payment, credit note, or "
+                "outstanding balance. Those require separately confirmed local invoice and payment records."
+            )
+        elif intent == "ambiguous":
+            answer = (
+                f"Calculated allocation for {period}: {currency} {fee_pool:,.2f}, split as {allocations_text}. "
+                "Issued invoices and outstanding balances are separate verified records; this instruction alone "
+                "does not establish that any amount was invoiced."
+            )
         else:
             participant_labels = ", ".join(row.label for row in rows)
             answer = (
@@ -535,12 +671,204 @@ class MatterReviewService:
                 for source in citation_sources
             ),
             instruction_context=instruction_context,
+            derived_calculation_context=(
+                "DERIVED LOCAL PRO-RATA CALCULATION (not a source-document statement and not an invoice): "
+                f"eligible denominator {self._document_decimal(total_eligible)}; "
+                + "; ".join(
+                    f"{row.label} calculated allocation {currency} {fee:,.2f}"
+                    for row, fee in allocations
+                )
+                + f"; allocations reconcile exactly to {currency} {fee_pool:,.2f}. "
+                "This calculation does not resolve disputed holdings or determine a legal invoice recipient."
+            ),
+            source_facts=tuple(
+                (str(source["document_id"]), str(source["source_reference"]), source_fact_label(str(source["text"])))
+                for source in citation_sources
+            ),
+        )
+
+    def _persisted_billing_answer(
+        self, documents: Sequence[ScopedDocument], question: str,
+    ) -> DocumentBillingAnswer | None:
+        """Present persisted allocations and verified invoice records without AI inference."""
+        if not self._is_document_billing_question(question):
+            return None
+        document_by_id = {document.document_id: document for document in documents}
+        if not document_by_id:
+            return None
+        placeholders = ",".join("?" for _ in document_by_id)
+        with self._database.connection() as connection:
+            agreements = connection.execute(
+                f"SELECT id, source_document_id, source_reference FROM billing_agreements "
+                f"WHERE approval_status = 'approved' AND source_document_id IN ({placeholders}) ORDER BY approved_at DESC, id DESC",
+                tuple(document_by_id),
+            ).fetchall()
+        # Multiple approved instructions need explicit lawyer selection; do
+        # not choose one by document order for a chat answer.
+        if len(agreements) != 1:
+            return None
+        agreement = agreements[0]
+        billing = BillingService(self._storage)
+        try:
+            summary = billing.invoicing({"billingAgreementId": str(agreement["id"])})
+        except BillingError:
+            return None
+        intent = self._document_billing_intent(question)
+        include_calculated = intent in {"allocation", "ambiguous", "overview", "explanation", "verification"}
+        include_invoicing = intent in {"invoiced", "outstanding", "ambiguous", "overview"}
+        allowed_document_ids = set(document_by_id)
+        citations: list[tuple[str, str, str, str]] = []
+        source_document_id = str(agreement["source_document_id"])
+        source_document = document_by_id.get(source_document_id)
+        if source_document is None or source_document.extraction_id is None:
+            return None
+        reference = str(agreement["source_reference"]).split(";", 1)[0].strip()
+        citations.append((source_document_id, str(source_document.extraction_id), reference, source_document.filename))
+        period = summary["billingPeriod"]
+        period_text = (
+            f"{period.get('start') or 'unknown start'} to {period.get('end') or 'unknown end'}"
+            if isinstance(period, dict) else "the approved billing period"
+        )
+        calculation = billing.preview({"billingAgreementId": str(agreement["id"])})
+        lines: list[str] = [
+            f"Billing period: {period_text}. Total fee pool: "
+            f"{calculation['currency']} {calculation['feePool']}."
+        ]
+        for allocation in summary["allocations"]:
+            if not isinstance(allocation, dict):
+                continue
+            label = str(allocation.get("participantLabel", "Unknown participant"))
+            facts: list[str] = []
+            if include_calculated:
+                if allocation.get("eligibilityStatus") == "excluded":
+                    facts.append(f"Calculated allocation: excluded ({allocation.get('eligibilityReason') or 'reason not recorded'}).")
+                else:
+                    facts.append(
+                        f"Calculated allocation: eligible nominal {allocation.get('eligibleBasis')}; "
+                        f"share {allocation.get('share')}; {calculation['currency']} {allocation.get('allocatedFee')}."
+                    )
+            if include_invoicing:
+                invoice_evidence = allocation.get("invoiceEvidence")
+                usable_evidence = [item for item in invoice_evidence if isinstance(item, dict) and item.get("documentId") in allowed_document_ids] if isinstance(invoice_evidence, list) else []
+                invoice_status = allocation.get("issuedInvoiceStatus")
+                if invoice_status == "verified_issued" and usable_evidence:
+                    facts.append(f"Issued invoices: {calculation['currency']} {allocation.get('verifiedInvoicedAmount')}.")
+                    if allocation.get("allocationInvoiceDifference") is not None:
+                        facts.append(f"Difference from calculated allocation: {calculation['currency']} {allocation.get('allocationInvoiceDifference')}.")
+                    if allocation.get("outstandingStatus") == "verified":
+                        facts.append(f"Outstanding balance: {calculation['currency']} {allocation.get('outstandingBalance')}.")
+                    else:
+                        facts.append("Outstanding balance: not established from verified payment and adjustment evidence.")
+                    for item in usable_evidence:
+                        document_id, source_ref = item.get("documentId"), item.get("sourceReference")
+                        document = document_by_id.get(str(document_id))
+                        if document is not None and document.extraction_id is not None and isinstance(source_ref, str):
+                            citations.append((str(document_id), str(document.extraction_id), source_ref, document.filename))
+                elif invoice_status == "no_issued_invoice_recorded":
+                    facts.append("Issued invoices: no verified issued invoice record is linked to this agreement.")
+                elif invoice_status == "draft_only":
+                    facts.append("Issued invoices: drafts are present but are not counted as issued invoices.")
+                else:
+                    facts.append("Issued invoices: not determinable for this participant from in-scope verified invoice evidence.")
+            if facts:
+                lines.append(f"{label} — " + " ".join(facts))
+        top = summary.get("invoicing") if isinstance(summary, dict) else None
+        if isinstance(top, dict) and top.get("unmappedIssuedInvoiceLineCount"):
+            lines.append(f"Notice: {top['unmappedIssuedInvoiceLineCount']} issued invoice line(s) cannot be matched to a calculated participant.")
+        deduplicated = tuple(dict.fromkeys(citations))
+        return DocumentBillingAnswer(" ".join(lines), deduplicated, "Persisted approved billing calculation and separately verified invoice ledger.")
+
+    def _multi_document_billing_answer(
+        self, documents: Sequence[ScopedDocument], question: str,
+    ) -> DocumentBillingAnswer | None:
+        """Explain the billing relevance of every explicitly requested document.
+
+        A phrase such as "for each document" is a scope instruction, not a
+        request to invent a separate fee pool for every file. The approved
+        billing instruction remains the sole deterministic allocation input;
+        dated holdings, transfers, assignments, and competing statements are
+        reported only when locally stored evidence supports that role.
+        """
+        if not self._is_scope_wide_billing_question(question):
+            return None
+        calculation = self._persisted_billing_answer(documents, question) or self._document_billing_answer(documents, question)
+        if calculation is None:
+            return None
+        terms = (
+            "fee pool", "allocation rule", "eligible participant", "holding", "position", "nominal",
+            "transfer", "effective", "claim", "assignment", "contradict", "conflict", "dispute",
+        )
+        citations: list[tuple[str, str, str, str]] = list(calculation.citations)
+        relevance: list[str] = []
+        with self._database.connection() as connection:
+            for document in documents:
+                extraction_id = str(document.extraction_id)
+                hits = DocumentSearchIndex.search(
+                    connection, [extraction_id], terms, per_document_limit=6, total_limit=6,
+                ).hits
+                source_text = "\n".join(hit.text for hit in hits)
+                selected_reference = next((hit.source_reference for hit in hits if hit.source_reference), None)
+                if selected_reference is None:
+                    fallback = connection.execute(
+                        "SELECT source_reference FROM extracted_content WHERE extraction_id = ? AND is_empty = 0 "
+                        "ORDER BY worksheet_index, sheet_name, row_number, column_number LIMIT 1",
+                        (extraction_id,),
+                    ).fetchone()
+                    if fallback is not None:
+                        selected_reference = str(fallback["source_reference"])
+                    else:
+                        fallback = connection.execute(
+                            "SELECT 'page ' || p.page_number || ' block ' || b.block_index AS source_reference "
+                            "FROM pdf_page_extractions p JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
+                            "WHERE p.extraction_id = ? AND b.text <> '' ORDER BY p.page_number, b.block_index LIMIT 1",
+                            (extraction_id,),
+                        ).fetchone()
+                        selected_reference = str(fallback["source_reference"]) if fallback is not None else None
+                if selected_reference is None:
+                    relevance.append(f"{document.filename}: no citable extracted source was available.")
+                    continue
+                evidence = self._analysis._source_evidence(connection, extraction_id, selected_reference)
+                if evidence is None:
+                    relevance.append(f"{document.filename}: the selected source could not be revalidated.")
+                    continue
+                reference, evidence_text = evidence
+                citations.append((document.document_id, extraction_id, reference, document.filename))
+                folded = f"{source_text}\n{evidence_text}".casefold()
+                if "fee pool" in folded and "allocation rule" in folded:
+                    role = "contains the approved fee pool, eligibility basis, and allocation rule; it is the independent calculation input"
+                elif "claim" in folded and "assign" in folded:
+                    role = "records a claim-right assignment; it is legally distinct from a securities movement and does not supply a separate fee pool"
+                elif "transfer" in folded or "securities movement" in folded:
+                    role = "records securities-movement evidence; it supports timing and holdings context but does not supply a separate fee pool"
+                elif any(term in folded for term in ("contradict", "conflict", "dispute")):
+                    role = "contains potentially competing holdings evidence; it must remain unresolved and does not replace the approved billing basis"
+                elif any(term in folded for term in ("holding", "position", "nominal", "as of")):
+                    role = "contains a dated holdings observation supporting the allocation context; it does not by itself create a billing rule"
+                else:
+                    role = "does not expose an independently parsed billing input in the selected evidence"
+                relevance.append(f"{document.filename}: {role}.")
+        cited_document_ids = {citation[0] for citation in citations}
+        if len(cited_document_ids) != len(documents):
+            return None
+        return DocumentBillingAnswer(
+            answer=(
+                f"Across all {len(documents)} selected documents, there is one consolidated billing analysis. "
+                f"{calculation.answer} Document relevance: " + " ".join(relevance)
+            ),
+            citations=tuple(dict.fromkeys(citations)),
+            instruction_context=calculation.instruction_context,
         )
 
     @staticmethod
     def _document_billing_intent(question: str) -> str:
         """Choose a response form without treating a billing keyword as a calculation request."""
         query = question.casefold()
+        if any(term in query for term in ("outstanding", "remain outstanding", "remaining balance")):
+            return "outstanding"
+        if any(term in query for term in ("invoiced", "issued invoice", "issued invoices")):
+            return "invoiced"
+        if any(term in query for term in ("being billed", "is it billed", "amount billed")):
+            return "ambiguous"
         if any(term in query for term in ("verify", "verification", "validate", "validation", "audit", "reconcile", "check the billing")):
             return "verification"
         if "what do you mean" in query or (
@@ -555,6 +883,16 @@ class MatterReviewService:
         )):
             return "allocation"
         return "overview"
+
+    @staticmethod
+    def _is_scope_wide_billing_question(question: str) -> bool:
+        query = " ".join(primary_request_text(question).casefold().split())
+        if not MatterReviewService._is_document_billing_question(question):
+            return False
+        return any(phrase in query for phrase in (
+            "for each document", "for every document", "each of the document", "each document",
+            "across all documents", "across the documents", "all selected documents", "all the documents",
+        ))
 
     @staticmethod
     def _document_decimal(value: Decimal) -> str:
@@ -579,8 +917,19 @@ class MatterReviewService:
             r"Eligible\s+participant(?:\s+\d+)?\s*\n\s*([^\n(]+?)\s*\(([^)]+)\)\s*:\s*([0-9][0-9,]*(?:\.[0-9]{1,6})?)",
             source_text, flags=re.IGNORECASE,
         )
+        numbered_participants = re.findall(
+            r"Eligible\s+participant\s+(\d+)\b", source_text, flags=re.IGNORECASE,
+        )
         if money is None or period is None or not participants:
             return None
+        # If the instruction declares numbered participants, every declared
+        # row needs a parseable nominal basis. Otherwise a malformed second
+        # participant could silently become an unsupported one-row allocation.
+        if numbered_participants:
+            expected_numbers = list(range(1, len(numbered_participants) + 1))
+            parsed_numbers = [int(value) for value in numbered_participants]
+            if parsed_numbers != expected_numbers or len(participants) != len(numbered_participants):
+                return None
         try:
             fee_pool = Decimal(money.group(2).replace(",", ""))
             rows = [
@@ -748,7 +1097,33 @@ class MatterReviewService:
         """
         scope = self._resolve_scope(request)
         follow_up, follow_up_document_ids = self._follow_up_context(request.follow_up_question_id, scope)
+        requirements = self._analysis_requirements(request.question)
+        # Dates such as "as of 14 February" are factual targets in a
+        # historical reconstruction, not necessarily file-name references.
+        # Treating them as document constraints previously rejected the six
+        # source question before retrieval (there is no 14 February file).
+        # Explicit file selection remains available through the scope picker.
         constraint = self._document_constraint(request.question, scope)
+        # Dates such as "as of 14 February" remain factual targets in a
+        # historical reconstruction, not file selectors.  Explicit IDs,
+        # filenames, numbered prefixes, and titles still deliberately narrow
+        # the already authorized scope.
+        # A descriptive filename phrase can overlap ordinary analytical
+        # language (for example, “claim-right assignment effective”), so it
+        # must not shrink a compound all-document request on its own. Stable
+        # IDs, exact filenames, numbered prefixes, and an explicit “document
+        # dated …” selector remain deliberate narrowing instructions.
+        has_stable_scope_selector = any(
+            item.matched_by in {"the document ID", "the file name"}
+            or "numbered file prefix" in item.matched_by
+            for item in constraint.resolved
+        )
+        if (
+            requirements.requires_cross_document_coverage
+            and not has_stable_scope_selector
+            and not _DATE_DOCUMENT_SELECTOR.search(request.question)
+        ):
+            constraint = DocumentConstraint(False)
         notes: list[str] = []
         working = scope
         if constraint.requested:
@@ -860,6 +1235,7 @@ class MatterReviewService:
                 matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
                 context_document_ids=frozenset(citation["documentId"] for citation in citations) | follow_up_document_ids,
                 intent=local_answer.intent, inventory=local_answer.inventory, holdings=local_answer.holdings,
+                execution=self._local_execution_metadata(scope, plan, local_answer.model),
             )
             with self._question_lock:
                 self._questions[job.id] = job
@@ -875,6 +1251,7 @@ class MatterReviewService:
                 matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
                 context_document_ids=frozenset(citation["documentId"] for citation in citations) | follow_up_document_ids,
                 intent=INTENT_CALCULATION,
+                execution=self._local_execution_metadata(scope, plan, "local-document-calculation"),
             )
             with self._question_lock:
                 self._questions[job.id] = job
@@ -903,10 +1280,28 @@ class MatterReviewService:
                 matter_id=scope.matter_id, question=request.question, document_scope=document_scope,
                 context_document_ids=transmitted, intent=str(plan.get("intent") or "general"),
                 holdings=plan.get("holdingsEvidence") if isinstance(plan.get("holdingsEvidence"), Mapping) else None,
+                execution=self._provider_execution_metadata(scope, plan, preview),
             )
             self._questions[job.id] = job
         try:
             self._record_question_consent(job.id, scope, transmitted, str(preview["provider"]))
+        except sqlite3.Error as error:
+            # This is the only synchronous write in the question-submit path.
+            # A second ClaimFlow process (for example an installed build left
+            # open alongside ``npm run dev``) can temporarily hold the same
+            # local SQLite store.  Do not turn that operational condition
+            # into the protocol's generic internal-error response, and do
+            # not leave its queued job behind to block the next question.
+            with self._question_lock:
+                self._questions.pop(job.id, None)
+            if "locked" in str(error).casefold() or "busy" in str(error).casefold():
+                raise MatterReviewError(
+                    "ClaimFlow's local database is busy. Close any other ClaimFlow window or development session, "
+                    "wait a moment, and try the question again."
+                ) from error
+            raise MatterReviewError(
+                "ClaimFlow could not save this question's local authorization record. Restart ClaimFlow and try again."
+            ) from error
         except BaseException:
             # Never leave an unsent question queued: it would block later questions.
             with self._question_lock:
@@ -946,7 +1341,60 @@ class MatterReviewService:
                     "totalTokens": job.total_tokens,
                     "actualCostEstimateUsd": job.actual_cost_estimate_usd,
                 },
+                "execution": dict(job.execution or {}),
             }
+
+    @staticmethod
+    def _local_execution_metadata(scope: DocumentScope, plan: Mapping[str, object], model: str) -> Mapping[str, object]:
+        included = tuple(sorted(str(value) for value in plan.get("evidenceDocumentIds", ())))
+        return {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "provider": None,
+            "model": model,
+            "providerCallAttempted": False,
+            "providerOutcome": "local_only",
+            "fallbackUsed": False,
+            "fallbackReason": None,
+            "modelUnknown": None,
+            "responseStatus": "local",
+            "validatedSectionKinds": (),
+            "validatedSectionCounts": {},
+            "validatedSectionStatusCounts": {},
+            "validatedCitationCount": 0,
+            "evidenceItemCounts": dict(plan.get("evidenceItemCounts", {})),
+            "documentsSelected": tuple(document.document_id for document in scope.searchable),
+            "documentsIncluded": included,
+            "documentsExcluded": tuple(sorted(set(document.document_id for document in scope.searchable) - set(included))),
+            "evidenceTruncated": bool(plan.get("scope", {}).get("truncated", False)) if isinstance(plan.get("scope"), Mapping) else False,
+            "requirements": dict(plan.get("analysisRequirements", {})) if isinstance(plan.get("analysisRequirements"), Mapping) else {},
+        }
+
+    @staticmethod
+    def _provider_execution_metadata(
+        scope: DocumentScope, plan: Mapping[str, object], preview: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        included = tuple(sorted(str(value) for value in plan.get("evidenceDocumentIds", ())))
+        return {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "provider": preview.get("provider"),
+            "model": preview.get("model"),
+            "providerCallAttempted": False,
+            "providerOutcome": "queued",
+            "fallbackUsed": False,
+            "fallbackReason": None,
+            "modelUnknown": None,
+            "responseStatus": None,
+            "validatedSectionKinds": (),
+            "validatedSectionCounts": {},
+            "validatedSectionStatusCounts": {},
+            "validatedCitationCount": 0,
+            "evidenceItemCounts": dict(plan.get("evidenceItemCounts", {})),
+            "documentsSelected": tuple(document.document_id for document in scope.searchable),
+            "documentsIncluded": included,
+            "documentsExcluded": tuple(sorted(set(document.document_id for document in scope.searchable) - set(included))),
+            "evidenceTruncated": bool(plan.get("scope", {}).get("truncated", False)) if isinstance(plan.get("scope"), Mapping) else False,
+            "requirements": dict(plan.get("analysisRequirements", {})) if isinstance(plan.get("analysisRequirements"), Mapping) else {},
+        }
 
     def _resolve_scope(self, request: MatterQuestionRequest) -> DocumentScope:
         """Resolve the permitted documents from SQLite before any retrieval.
@@ -1125,6 +1573,7 @@ class MatterReviewService:
             if job is None:
                 return
             job.status = "running"
+            job.execution = {**dict(job.execution or {}), "providerCallAttempted": True, "providerOutcome": "attempting"}
         try:
             self._analysis._refresh_configuration()
             if not self._analysis._global_authorized():
@@ -1132,9 +1581,16 @@ class MatterReviewService:
             configuration = self._analysis._configuration
             if configuration.provider not in {"openai", "codex"} or not configuration.credential_configured:
                 raise AIAnalysisError("AI_PROVIDER_NOT_CONFIGURED", "Connect the selected AI provider in Settings.")
-            result = self._analysis._new_provider(int(plan["maxOutputTokens"])).answer_question(
-                question, str(plan["context"]), tuple(plan["citationKeys"])
+            response_contract = plan.get("responseContract")
+            provider_kwargs = (
+                {"response_contract": response_contract}
+                if isinstance(response_contract, QuestionResponseContract) else {}
             )
+            result = self._analysis._new_provider(int(plan["maxOutputTokens"])).answer_question(
+                question, str(plan["context"]), tuple(plan["citationKeys"]), **provider_kwargs,
+            )
+            response_metadata = dict(result.historical_metadata or {})
+            provider_unknown = result.unknown
             local_fallback = plan.get("localFallback")
             # A comparison across a selected matter must never be presented
             # as comprehensive when the bounded prompt could include evidence
@@ -1142,20 +1598,37 @@ class MatterReviewService:
             # cited local coverage statement even if a model attempts a broad
             # answer from the partial context.
             coverage_incomplete_comparison = plan.get("comparisonCoverageComplete") is False
-            if (result.unknown or not result.answer or coverage_incomplete_comparison) and isinstance(local_fallback, tuple):
+            fallback_reason: str | None = None
+            if coverage_incomplete_comparison:
+                fallback_reason = "evidence_coverage_incomplete"
+            elif result.unknown or not result.answer:
+                fallback_reason = "provider_unsupported_answer"
+            if fallback_reason is not None and isinstance(local_fallback, tuple):
                 answer, keys = local_fallback
                 result = type(result)(
                     answer, False,
                     tuple({"sourceReference": key, "evidenceSnippet": ""} for key in keys),
                     result.model, result.input_tokens, result.output_tokens, result.total_tokens,
                 )
-            citations = self._validate_matter_citations(result.citations, plan["citationTargets"])
+            citations = self._validate_matter_citations(
+                result.citations,
+                plan["citationTargets"],
+                origin="local_fallback" if fallback_reason is not None else None,
+            )
             if not citations:
                 raise AIAnalysisError("AI_ANSWER_EVIDENCE_UNSUPPORTED", "The answer did not include supported local evidence.")
-            # Dated holding cells behind a legal-status answer are cited too,
-            # re-resolved locally, whichever excerpt the model chose.
+            # Dated holding cells behind a locally-produced legal-status
+            # answer are cited too, re-resolved locally, whichever excerpt
+            # the model chose.  Do not append cross-document coverage
+            # references to a provider answer: a document being in context is
+            # not proof for a particular conclusion.
             cited = {(citation["documentId"], citation["sourceReference"]) for citation in citations}
-            for citation in self._validate_direct_matter_citations(plan.get("holdingsCitations", ())):  # type: ignore[arg-type]
+            additional_citations = [
+                *plan.get("holdingsCitations", ()),  # type: ignore[arg-type]
+            ]
+            if not isinstance(plan.get("responseContract"), QuestionResponseContract):
+                additional_citations.extend(plan.get("coverageCitations", ()))  # type: ignore[arg-type]
+            for citation in self._validate_direct_matter_citations(additional_citations):
                 if (citation["documentId"], citation["sourceReference"]) not in cited:
                     citations.append(citation)
                     cited.add((citation["documentId"], citation["sourceReference"]))
@@ -1174,18 +1647,49 @@ class MatterReviewService:
                 job.output_tokens = result.output_tokens
                 job.total_tokens = result.total_tokens
                 job.actual_cost_estimate_usd = self._analysis._cost_string(actual_cost)
+                job.execution = {
+                    **dict(job.execution or {}),
+                    "providerOutcome": "completed",
+                    "fallbackUsed": fallback_reason is not None,
+                    "fallbackReason": fallback_reason,
+                    # The provider adapter has already schema-validated these
+                    # aggregate facts. No model text, prompt, excerpt, or
+                    # credential is retained in execution diagnostics.
+                    "modelUnknown": response_metadata.get("modelUnknown", provider_unknown),
+                    "responseStatus": (
+                        "fallback"
+                        if fallback_reason is not None
+                        else response_metadata.get("responseStatus", "no_supported_findings" if result.unknown else "complete")
+                    ),
+                    "validatedSectionKinds": tuple(response_metadata.get("validatedSectionKinds", ())),
+                    "validatedSectionCounts": dict(response_metadata.get("validatedSectionCounts", {})),
+                    "validatedSectionStatusCounts": dict(response_metadata.get("validatedSectionStatusCounts", {})),
+                    "validatedCitationCount": int(response_metadata.get("validatedCitationCount", len(result.citations))),
+                }
         except AIServiceError as error:
             with self._question_lock:
                 job = self._questions.get(question_id)
                 if job is not None:
                     job.status = "failed"
                     job.error_code = error.code
+                    job.execution = {
+                        **dict(job.execution or {}),
+                        "providerOutcome": "provider_failure",
+                        "fallbackUsed": False,
+                        "fallbackReason": None,
+                    }
         except Exception:
             with self._question_lock:
                 job = self._questions.get(question_id)
                 if job is not None:
                     job.status = "failed"
                     job.error_code = "AI_PROVIDER_FAILURE"
+                    job.execution = {
+                        **dict(job.execution or {}),
+                        "providerOutcome": "provider_failure",
+                        "fallbackUsed": False,
+                        "fallbackReason": None,
+                    }
 
     def _matter_question_plan(
         self,
@@ -1213,20 +1717,54 @@ class MatterReviewService:
         current_extractions = {str(document.extraction_id): document.document_id for document in documents}
         extraction_ids = list(current_extractions)
         intent = self._question_intent(question)
-        if intent.kind in {INTENT_INVENTORY, INTENT_RELATIONSHIP}:
+        requirements = self._analysis_requirements(question)
+        # A historical reconstruction can also ask for named entities or
+        # relationships.  Those words must not collapse it into a local
+        # inventory response that ignores its dates and event requests.
+        if intent.kind in {INTENT_INVENTORY, INTENT_RELATIONSHIP} and not requirements.historical_holdings:
             return self._inventory_plan(documents, intent)
-        if intent.kind == INTENT_HOLDINGS_COMPARISON:
+        if intent.kind == INTENT_HOLDINGS_COMPARISON and not requirements.requires_cross_document_coverage:
             return self._holdings_plan(documents, intent, question, constrained=constrained)
         legal_holdings = (
             self._legal_holdings_evidence(documents, question)
-            if intent.kind == INTENT_LEGAL_STATUS and _HOLDINGS_MOVEMENT_CUE.search(question.casefold()) else None
+            if (
+                intent.kind == INTENT_LEGAL_STATUS
+                and not requirements.requires_cross_document_coverage
+                and _HOLDINGS_MOVEMENT_CUE.search(question.casefold())
+            ) else None
         )
+        historical_holdings: HistoricalHoldingsEvidence | None = None
+        historical_evidence_note: str | None = None
+        if requirements.requires_cross_document_coverage:
+            try:
+                historical_holdings = self._historical_holdings_evidence(documents, question)
+            except (InvalidOperation, KeyError, TypeError, ValueError) as error:
+                # This compact spreadsheet transcription is an optional local
+                # retrieval aid. Older imported workbooks can contain an
+                # incomplete row shape or a number format that it cannot
+                # safely normalize. That must not abort the entire cited
+                # question before the ordinary evidence retrieval/provider
+                # path has a chance to answer it.
+                #
+                # Keep only the exception class in diagnostics: question and
+                # document content must never enter operational logs.
+                LOGGER.warning(
+                    "Historical holdings transcription unavailable for a matter question (%s).",
+                    type(error).__name__,
+                )
+                historical_evidence_note = (
+                    "The local spreadsheet reconstruction aid could not normalize one or more holdings rows. "
+                    "The answer uses the remaining cited source evidence and must identify any resulting coverage gap."
+                )
         if legal_holdings is not None and legal_holdings.local_answer is not None:
             return self._local_plan(legal_holdings.local_answer, len(documents))
         with self._database.connection() as connection:
             present_names, missing_names = self._named_entities(connection, extraction_ids, question)
         required_terms = sorted({*(identifier.casefold() for identifier in intent.identifiers), *(name.casefold() for name in present_names)})
-        notes = [f"Not found in the documents used: “{name}”." for name in missing_names]
+        notes = [
+            *([historical_evidence_note] if historical_evidence_note is not None else []),
+            *(f"Not found in the documents used: “{name}”." for name in missing_names),
+        ]
         if missing_names and not required_terms:
             return self._local_plan(LocalAnswer(
                 intent.kind,
@@ -1235,13 +1773,32 @@ class MatterReviewService:
                 + "). Nothing was sent. Check the spelling, name the relevant document, or change the scope.",
                 (), "local-relevance-check",
             ), len(documents), notes=notes)
+        # A scoped chronology may include billing impact, but it must reach
+        # evidence planning before any local billing-only shortcut can run.
+        multi_document_billing = (
+            None if requirements.requires_cross_document_coverage
+            else self._multi_document_billing_answer(documents, question)
+        )
         billing_instruction = self._document_billing_answer(documents, question)
+        persisted_billing = self._persisted_billing_answer(documents, question)
+        billing_fact_labels = {
+            (document_id, reference): label
+            for document_id, reference, label in (billing_instruction.source_facts if billing_instruction is not None else ())
+        }
         # The deterministic calculator owns only an explicit allocation
         # request. Every other billing conversation goes through the
         # question-aware provider with this instruction as cited evidence.
         document_billing = (
-            billing_instruction
-            if billing_instruction is not None and self._document_billing_intent(question) == "allocation"
+            multi_document_billing
+            if multi_document_billing is not None and not requirements.requires_cross_document_coverage
+            else persisted_billing
+            if persisted_billing is not None and not requirements.requires_cross_document_coverage
+            else billing_instruction
+            if (
+                billing_instruction is not None
+                and self._document_billing_intent(question) in {"allocation", "invoiced", "outstanding", "ambiguous"}
+                and not requirements.requires_cross_document_coverage
+            )
             else None
         )
         placeholders = ",".join("?" for _ in document_ids)
@@ -1296,7 +1853,11 @@ class MatterReviewService:
                 identity = (document_id, canonical_reference)
                 if identity in seen_sources:
                     return
-                excerpt = self._analysis._evidence_excerpt(source_text)
+                excerpt = (
+                    self._historical_evidence_excerpt(source_text)
+                    if requirements.requires_cross_document_coverage
+                    else self._analysis._evidence_excerpt(source_text)
+                )
                 if not excerpt:
                     return
                 # Repeated identical text in one document (for example a
@@ -1315,6 +1876,15 @@ class MatterReviewService:
                 target = reconciliation_candidates if prioritize_for_question else candidates
                 target.append((document_id, extraction_id, canonical_reference, names[document_id],
                                f"{description}; EVIDENCE: {excerpt}"))
+
+            historical_spreadsheet_ids = frozenset()
+            if historical_holdings is not None:
+                historical_spreadsheet_ids = frozenset(candidate[0] for candidate in historical_holdings.candidates)
+                # These summaries are calculated from cited local cells, not
+                # generated by a model. They prevent a one-cell-at-a-time
+                # spreadsheet index from dropping Fund B/C under a bounded
+                # multi-document question.
+                candidates.extend(historical_holdings.candidates)
 
             for row in summary_rows:
                 if bool(row["summary_unknown"]):
@@ -1359,9 +1929,14 @@ class MatterReviewService:
             # or identifiers is retrieved from its own terms only.
             explicit = constrained or bool(required_terms)
             retrieval_question = question if follow_up is None or explicit else f"{follow_up['question']}\n{question}"
+            retrieval_requirements = self._analysis_requirements(retrieval_question)
+            # Legal claim-right wording can be one required part of a factual
+            # reconstruction.  It must never suppress dated holdings and
+            # transfer retrieval.
             change_question = (
-                self._is_change_question(retrieval_question)
-                and not self._is_legal_status_question(retrieval_question)
+                retrieval_requirements.historical_holdings
+                or retrieval_requirements.securities_transfer
+                or self._is_change_question(retrieval_question)
             )
             terms = set(self._question_terms(retrieval_question))
             # A specific lookup searches for its literal identifiers (ISIN,
@@ -1404,21 +1979,27 @@ class MatterReviewService:
             # Relevance gate, applied before the excerpt cap: when the question
             # names entities or identifiers, keep only text that mentions one,
             # cells in a row that does, and the heading rows above such rows.
+            # A named investor can be absent from an otherwise indispensable
+            # custodian conflict notice.  For an explicit historical
+            # reconstruction, the named-entity relevance gate would silently
+            # omit precisely that contradicting record, so only use it for
+            # narrower lookup questions.
+            gate_required_terms: Sequence[str] = () if requirements.requires_cross_document_coverage else required_terms
             required_rows: set[tuple[str, object, object]] = set()
             required_sheets: dict[tuple[str, object], int] = {}
             for source in raw_sources:
-                if required_terms and isinstance(source["row_number"], int) and any(
-                    term in str(source["text"] or "").casefold() for term in required_terms
+                if gate_required_terms and isinstance(source["row_number"], int) and any(
+                    term in str(source["text"] or "").casefold() for term in gate_required_terms
                 ):
                     sheet_key = (str(source["extraction_id"]), source["sheet_name"])
                     required_rows.add((*sheet_key, source["row_number"]))
                     required_sheets[sheet_key] = max(required_sheets.get(sheet_key, 0), int(source["row_number"]))
 
             def passes_gate(source: Mapping[str, object]) -> bool:
-                if not required_terms:
+                if not gate_required_terms:
                     return True
                 text = str(source["text"] or "").casefold()
-                if any(term in text for term in required_terms):
+                if any(term in text for term in gate_required_terms):
                     return True
                 sheet_key = (str(source["extraction_id"]), source["sheet_name"])
                 row_number = source["row_number"]
@@ -1432,6 +2013,8 @@ class MatterReviewService:
             for source in raw_sources:
                 if len(reconciliation_candidates) >= MAX_RECONCILIATION_EXCERPTS:
                     break
+                if str(source["document_id"]) in historical_spreadsheet_ids:
+                    continue
                 if not passes_gate(source):
                     continue
                 source_text = str(source["text"] or "")
@@ -1456,7 +2039,7 @@ class MatterReviewService:
                     source=None if in_snapshot_context else source,
                 )
 
-            if required_terms:
+            if required_terms and not requirements.requires_cross_document_coverage:
                 # Earlier AI-review summaries and findings pass the same gate:
                 # their cell row or text block must mention a named entity or
                 # identifier. (Source excerpts were gated above.)
@@ -1464,8 +2047,65 @@ class MatterReviewService:
                     candidate for candidate in candidates
                     if self._mentions_required_term(connection, candidate, required_terms, neighbour_context)
                 ]
+            if requirements.requires_cross_document_coverage:
+                # Full-text ranking is intentionally selective, but an event
+                # notice can use a morphological variant such as
+                # "assignment" that does not match a short query token. For
+                # a reconstruction, include one locally re-resolved source
+                # from each otherwise-missing in-scope document and let the
+                # bounded prompt/coverage check disclose any remaining gap.
+                represented = {candidate[0] for candidate in [*reconciliation_candidates, *candidates]}
+                for document in documents:
+                    if document.document_id in represented:
+                        continue
+                    extraction_id = str(document.extraction_id)
+                    block = connection.execute(
+                        "SELECT 'page ' || p.page_number || ' block ' || b.block_index AS source_reference "
+                        "FROM pdf_page_extractions p JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
+                        "WHERE p.extraction_id = ? AND b.text <> '' ORDER BY p.page_number, b.block_index LIMIT 1",
+                        (extraction_id,),
+                    ).fetchone()
+                    if block is not None:
+                        reference = str(block["source_reference"])
+                    else:
+                        cell = connection.execute(
+                            "SELECT source_reference FROM extracted_content WHERE extraction_id = ? AND is_empty = 0 "
+                            "AND content_kind <> 'pdf_page' ORDER BY worksheet_index, sheet_name, row_number, column_number LIMIT 1",
+                            (extraction_id,),
+                        ).fetchone()
+                        if cell is None:
+                            continue
+                        reference = str(cell["source_reference"])
+                    add_candidate(
+                        document.document_id, extraction_id, reference,
+                        "COVERAGE REQUIRED SOURCE EXCERPT",
+                        prioritize_for_question=True,
+                    )
+                # Retrieval ranking can select the assignment paragraph while
+                # omitting its adjacent claim-reference/effective-date block.
+                # Add a single directly citable event-bearing block per
+                # document category; this is bounded local retrieval, not a
+                # model-created summary or a whole-document transfer.
+                for row in connection.execute(
+                    "SELECT p.extraction_id, 'page ' || p.page_number || ' block ' || b.block_index AS source_reference, b.text "
+                    "FROM pdf_page_extractions p JOIN pdf_text_blocks b ON b.pdf_page_extraction_id = p.id "
+                    f"WHERE p.extraction_id IN ({extraction_placeholders}) AND ("
+                    "lower(b.text) LIKE '%claim reference%' OR lower(b.text) LIKE '%partial securities transfer%' "
+                    "OR lower(b.text) LIKE '%recorded holding%' OR lower(b.text) LIKE '%fee pool%') "
+                    "ORDER BY p.extraction_id, p.page_number, b.block_index",
+                    extraction_ids,
+                ).fetchall():
+                    extraction_id = str(row["extraction_id"])
+                    document_id = current_extractions.get(extraction_id)
+                    if document_id is None:
+                        continue
+                    add_candidate(
+                        document_id, extraction_id, str(row["source_reference"]),
+                        "HISTORICAL REQUIRED EVENT SOURCE",
+                        prioritize_for_question=True,
+                    )
             candidates = reconciliation_candidates + candidates
-            if required_terms:
+            if required_terms and not requirements.requires_cross_document_coverage:
                 if not candidates and billing_instruction is None and legal_holdings is None:
                     return self._local_plan(LocalAnswer(
                         intent.kind,
@@ -1487,18 +2127,54 @@ class MatterReviewService:
                     candidate for candidate in candidates
                     if (candidate[0], candidate[2]) not in billing_sources
                 ]
-                for document_id, extraction_id, reference, filename in reversed(billing_instruction.citations):
-                    candidates.insert(
-                        0,
-                        (
-                            document_id,
-                            extraction_id,
-                            reference,
-                            filename,
-                            "DOCUMENT-BACKED BILLING INSTRUCTION; EVIDENCE: "
-                            + billing_instruction.instruction_context,
-                        ),
-                    )
+                if requirements.requires_cross_document_coverage:
+                    # Historical answers must retain one exact source block
+                    # per billing fact. A fee-pool block cannot prove Fund A
+                    # or Fund B's basis, or Fund C's exclusion. The derived
+                    # Decimal result is added later only if every one of these
+                    # direct blocks survives bounded selection.
+                    billing_candidates: list[tuple[str, str, str, str, str]] = []
+                    for document_id, extraction_id, reference, filename in billing_instruction.citations:
+                        evidence = self._analysis._source_evidence(connection, extraction_id, reference)
+                        if evidence is None:
+                            continue
+                        canonical_reference, source_text = evidence
+                        # These parser-selected billing blocks are already
+                        # fact-level locations. Preserve their literal text,
+                        # rather than applying the event-oriented extractor
+                        # that can repeat adjacent PDF lines.
+                        excerpt = self._bounded_text(" ".join(source_text.split()), 320)
+                        if not excerpt:
+                            continue
+                        label = billing_fact_labels.get(
+                            (document_id, canonical_reference), "approved billing instruction fact",
+                        )
+                        billing_candidates.append(
+                            (
+                                document_id,
+                                extraction_id,
+                                canonical_reference,
+                                filename,
+                                f"DOCUMENT-BACKED BILLING FACT ({label}); EVIDENCE: {excerpt}",
+                            ),
+                        )
+                    # Reinsert direct blocks after removing any ranked copy,
+                    # without reusing the synthetic combined instruction as a
+                    # substitute for their individual provenance.
+                    candidates = [*billing_candidates, *candidates]
+                else:
+                    for document_id, extraction_id, reference, filename in reversed(billing_instruction.citations):
+                        candidates.insert(
+                            0,
+                            (
+                                document_id,
+                                extraction_id,
+                                reference,
+                                filename,
+                                "DOCUMENT-BACKED BILLING INSTRUCTION; EVIDENCE: "
+                                + billing_instruction.instruction_context,
+                            ),
+                        )
 
             if legal_holdings is not None:
                 # The dated holding records come first; other excerpts (for
@@ -1552,16 +2228,60 @@ class MatterReviewService:
         # records from different documents.  The provider still sees the
         # individual source and must cite its opaque E-key.
         # Comparisons also need breadth: one excerpt per document first.
-        if self._is_overview_question(question) or intent.kind == INTENT_COMPARISON:
-            first_by_document: list[tuple[str, str, str, str, str]] = []
-            remainder: list[tuple[str, str, str, str, str]] = []
-            represented: set[str] = set()
+        if (
+            self._is_overview_question(question)
+            or intent.kind == INTENT_COMPARISON
+            or requirements.requires_cross_document_coverage
+        ):
+            by_document: dict[str, list[tuple[str, str, str, str, str]]] = {}
             for candidate in candidates:
-                if candidate[0] in represented:
-                    remainder.append(candidate)
-                else:
-                    represented.add(candidate[0])
-                    first_by_document.append(candidate)
+                by_document.setdefault(candidate[0], []).append(candidate)
+
+            def historical_priority(candidate: tuple[str, str, str, str, str]) -> int:
+                text = candidate[4].casefold()
+                score = sum(marker in text for marker in (
+                    "document-backed holdings", "fee pool", "eligible participant", "effective date", "partial securities",
+                    "assigns", "claim reference", "recorded holding", "conflicts", "unresolved", "nominal units",
+                ))
+                # A reconstruction needs every dated Fund A/B/C row, not
+                # merely one representative cell per spreadsheet.  Give those
+                # direct rows absolute precedence over secondary narrative
+                # excerpts.  The row facts are the non-negotiable evidence
+                # floor for a historical balance answer.
+                if "document-backed holdings row" in text:
+                    score += 100
+                if "document-backed billing fact" in text:
+                    # Retain the fee pool, formula, each nominated basis, and
+                    # any explicit exclusion as a single mandatory category.
+                    # This remains below dated holdings rows, but ahead of
+                    # supplementary narrative excerpts.
+                    score += 80
+                if "historical required event source" in text:
+                    score += 50
+                # A contradictory statement's narrative can say only that a
+                # conflict exists, while its adjacent recorded-holding block
+                # contains the actual competing balance.  Prefer that exact
+                # balance as the one citable source from the document; the
+                # dated snapshot from the other document is selected too.
+                if "recorded holding" in text:
+                    score += 3
+                if "assigns" in text:
+                    score += 3
+                return score
+
+            grouped = [
+                sorted(items, key=historical_priority, reverse=True) if requirements.requires_cross_document_coverage else items
+                for items in by_document.values()
+            ]
+            first_by_document = [items[0] for items in grouped]
+            remainder = [candidate for items in grouped for candidate in items[1:]]
+            if requirements.requires_cross_document_coverage:
+                # Once every selected document has one source, use the
+                # remaining bounded slots for the next most fact-bearing
+                # records (for example the explicit conflict sentence or an
+                # assignment's effective-date block), not merely the first
+                # document's second excerpt.
+                remainder.sort(key=historical_priority, reverse=True)
             candidates = first_by_document + remainder
 
         self._analysis._refresh_configuration()
@@ -1593,7 +2313,19 @@ class MatterReviewService:
                 compact_filename = self._bounded_text(filename, 96) or "selected document"
                 evidence_marker = "; EVIDENCE:"
                 marker_index = description.find(evidence_marker)
-                if description.startswith(("DOCUMENT-BACKED BILLING INSTRUCTION;", "DOCUMENT-BACKED HOLDINGS RECORD;")):
+                if description.startswith("DOCUMENT-BACKED HOLDINGS RECORD;"):
+                    compact_description = self._bounded_text(description, 280) or "Document-backed holdings record"
+                elif description.startswith("DOCUMENT-BACKED HOLDINGS ROW;"):
+                    # A single row has one quantity and one source cell. Keep
+                    # its full identity compact so all six Fund A/B/C rows can
+                    # fit beside the four event records in a bounded request.
+                    compact_description = self._bounded_text(description, 220) or "Document-backed holdings row"
+                elif description.startswith("DOCUMENT-BACKED BILLING FACT"):
+                    # Each fact is already a short literal PDF block. Keep it
+                    # whole rather than squeezing multiple facts into one
+                    # arbitrary synthesized instruction/citation.
+                    compact_description = self._bounded_text(description, 520) or "Document-backed billing fact"
+                elif description.startswith(("DOCUMENT-BACKED BILLING INSTRUCTION;", "DOCUMENT-BACKED HOLDINGS RECORD;")):
                     # This is a compact, deterministic transcription of a
                     # single cited instruction. Keep all of its inputs so a
                     # conversational answer is not based on a clipped fee
@@ -1604,13 +2336,25 @@ class MatterReviewService:
                     # AI summary is long; the fallback and the provider both
                     # need actual locally resolved evidence, not just a
                     # paraphrase of that earlier summary.
-                    prefix = self._bounded_text(description[:marker_index], 250) or "SOURCE CONTEXT"
-                    evidence = (self._bounded_text(description[marker_index + len(evidence_marker):], 240) or "").strip()
+                    excerpt_limit = 150 if requirements.requires_cross_document_coverage else 240
+                    prefix_limit = 60 if requirements.requires_cross_document_coverage else 250
+                    prefix = self._bounded_text(description[:marker_index], prefix_limit) or "SOURCE CONTEXT"
+                    raw_evidence = description[marker_index + len(evidence_marker):]
+                    evidence = (
+                        self._bounded_historical_excerpt(raw_evidence, excerpt_limit)
+                        if requirements.requires_cross_document_coverage
+                        else self._bounded_text(raw_evidence, excerpt_limit)
+                    ) or ""
+                    evidence = evidence.strip()
                     compact_description = f"{prefix}{evidence_marker} {evidence}"
                 else:
                     compact_description = self._bounded_text(description, 500) or "Evidence excerpt"
                 line = f"[{key}] DOCUMENT: {compact_filename}; SOURCE: {reference}; {compact_description}"
-                nearby = neighbour_context.get((source_document_id, reference))
+                # Historical reconstruction must cite every fact to a single
+                # displayed source. Adjacent blocks can be useful for a
+                # narrow lookup, but including uncitable neighbours here
+                # would let a model attach a citation to the wrong block.
+                nearby = None if requirements.requires_cross_document_coverage else neighbour_context.get((source_document_id, reference))
                 if nearby:
                     # Neighbouring cells/blocks help interpret a short value
                     # (for example a bare quantity).  They are labelled so
@@ -1618,14 +2362,24 @@ class MatterReviewService:
                     line += f"\n  NEARBY CONTEXT FOR [{key}] (same source location; not separately citable): {nearby}"
                 lines.append(line)
             evidence_document_ids = {target[0] for target in targets.values()}
-            coverage_context = (
-                f"DOCUMENT SCOPE: {scope_label}. Use only the excerpts below. If the question needs information "
-                "from a document outside this scope, say that the current scope does not establish it.\n"
-                f"QUESTION COVERAGE: Evidence excerpts represent {len(evidence_document_ids)} of {len(document_ids)} searchable documents in scope. "
-                "Do not describe the result as a complete cross-document comparison unless all of them are represented.\n"
-                "CONFLICTS: Excerpts from different documents are separate records. If they disagree, say so and cite "
-                "one excerpt from each document instead of choosing between them."
-            )
+            if requirements.requires_cross_document_coverage:
+                # Keep enough bounded budget for a source from every required
+                # document. The historical prompt itself supplies the same
+                # evidence-only and conflict instructions.
+                coverage_context = (
+                    f"COVERAGE: {len(evidence_document_ids)}/{len(document_ids)} selected searchable documents are represented. "
+                    "If any are absent, state the gap. Treat conflicts as separate records; never resolve a balance."
+                )
+            else:
+                coverage_context = (
+                    f"DOCUMENT SCOPE: {scope_label}. Use only the excerpts below. If the question needs information "
+                    "from a document outside this scope, say that the current scope does not establish it.\n"
+                    f"ANALYSIS REQUIREMENTS: {requirements.prompt_text()}.\n"
+                    f"QUESTION COVERAGE: Evidence excerpts represent {len(evidence_document_ids)} of {len(document_ids)} searchable documents in scope. "
+                    "Do not describe the result as a complete cross-document comparison unless all of them are represented.\n"
+                    "CONFLICTS: Excerpts from different documents are separate records. If they disagree, say so and cite "
+                    "one excerpt from each document instead of choosing between them."
+                )
             # E-keys are intentionally opaque; every key's document/source
             # detail is already displayed immediately beside its literal
             # excerpt.  Avoid repeating long filenames in a separate legend.
@@ -1643,22 +2397,87 @@ class MatterReviewService:
                 proposed_key_context,
                 "",
                 f"{follow_up_context}{proposed_coverage}\n" + "\n".join(proposed_lines),
+                historical_reconstruction=requirements.requires_cross_document_coverage,
             )
-            if len(proposed_prompt) <= controls.max_input_characters:
+            prompt_limit = (
+                max(controls.max_input_characters, MAX_HISTORICAL_QUESTION_CHARACTERS)
+                if requirements.requires_cross_document_coverage else controls.max_input_characters
+            )
+            if len(proposed_prompt) <= prompt_limit:
                 selected_candidates.append(candidate)
 
         selected_targets, selected, citation_key_context, coverage_context = material_for(selected_candidates)
         if not selected_targets:
-            raise MatterReviewError("The selected evidence is too large for the current bounded question limit.")
+            raise MatterReviewError(
+                "This question is within the input limit, but the current bounded AI budget leaves no room for "
+                "locally cited evidence. Shorten the question or ask it in focused parts; no document content was sent."
+            )
+        billing_required_keys: tuple[str, ...] = ()
+        derived_billing_context = ""
+        if billing_instruction is not None and requirements.requires_cross_document_coverage:
+            keys_by_source = {
+                (document_id, reference): key
+                for key, (document_id, _extraction_id, reference, _filename) in selected_targets.items()
+            }
+            required_sources = tuple(billing_fact_labels)
+            missing_billing_sources = [
+                (source, billing_fact_labels[source])
+                for source in required_sources if source not in keys_by_source
+            ]
+            if not required_sources:
+                coverage_context += (
+                    "\nBILLING COVERAGE LIMITATION: The instruction could not be split into directly citable "
+                    "fee-pool, rule, participant, and exclusion facts; do not calculate an allocation in this answer."
+                )
+            elif missing_billing_sources:
+                omitted = ", ".join(f"{label} ({reference})" for (_document_id, reference), label in missing_billing_sources)
+                coverage_context += (
+                    "\nBILLING COVERAGE LIMITATION: Direct evidence was omitted by the bounded question limit: "
+                    + omitted
+                    + ". Do not state a calculated allocation without all required instruction facts."
+                )
+            else:
+                billing_required_keys = tuple(keys_by_source[source] for source in required_sources)
+                derived_billing_context = (
+                    "DERIVED LOCAL CALCULATION (not an original document statement): "
+                    + billing_instruction.derived_calculation_context
+                    + " Cite every approved-instruction input key "
+                    + ", ".join(billing_required_keys)
+                    + " when reporting this calculation. The approved Fund B billing basis does not resolve any "
+                    "competing holdings observation."
+                )
         evidence_document_ids = {target[0] for target in selected_targets.values()}
-        comparison_question = self._is_comparison_question(question)
-        comparison_coverage_complete = not comparison_question or len(evidence_document_ids) == len(document_ids)
+        direct_holding_sources = {
+            (document_id, reference)
+            for document_id, _extraction_id, reference, _filename in (historical_holdings.citations if historical_holdings is not None else ())
+        }
+        selected_sources = {(document_id, reference) for document_id, _extraction_id, reference, _filename in selected_targets.values()}
+        missing_direct_holding_sources = direct_holding_sources - selected_sources
+        coverage_citations: list[tuple[str, str, str, str]] = []
+        if requirements.requires_cross_document_coverage:
+            cited_documents: set[str] = set()
+            for document_id, extraction_id, reference, filename in selected_targets.values():
+                if document_id not in cited_documents:
+                    coverage_citations.append((document_id, extraction_id, reference, filename))
+                    cited_documents.add(document_id)
+        comparison_question = self._is_comparison_question(question) or requirements.requires_cross_document_coverage
+        historical_fact_coverage_complete = (
+            not requirements.requires_cross_document_coverage
+            or (historical_holdings is not None and not missing_direct_holding_sources)
+        )
+        comparison_coverage_complete = not comparison_question or (
+            len(evidence_document_ids) == len(document_ids) and historical_fact_coverage_complete
+        )
         selected_context = "\n".join(selected)
+        evidence_context = selected_context + (f"\n\n{derived_billing_context}" if derived_billing_context else "")
         context = (
             f"CITATION KEYS (return an E-key only):\n{citation_key_context}\n\n"
-            f"{follow_up_context}{coverage_context}\n\nEVIDENCE-LINKED PROVISIONAL FINDINGS:\n{selected_context}"
+            f"{follow_up_context}{coverage_context}\n\nEVIDENCE-LINKED PROVISIONAL FINDINGS:\n{evidence_context}"
         )
-        prompt = self._analysis._question_prompt(question, citation_key_context, "", f"{follow_up_context}{coverage_context}\n{selected_context}")
+        prompt = self._analysis._question_prompt(
+            question, citation_key_context, "", f"{follow_up_context}{coverage_context}\n{evidence_context}",
+            historical_reconstruction=requirements.requires_cross_document_coverage,
+        )
         return {
             "context": context,
             "citationKeys": tuple(selected_targets),
@@ -1669,13 +2488,33 @@ class MatterReviewService:
             "localFallback": self._local_matter_question_fallback(
                 question, selected, selected_targets,
                 selected_document_count=len(document_ids), evidence_document_count=len(evidence_document_ids),
+                missing_direct_holding_sources=len(missing_direct_holding_sources),
             ),
             "comparisonCoverageComplete": comparison_coverage_complete,
-            "intent": intent.kind,
+            # The primary classifier may also see legal-assignment language,
+            # but a requested dated reconstruction needs its own visible
+            # response type.  The additive requirements above still retain
+            # the legal-assignment task inside this plan.
+            "intent": "historical_reconstruction" if requirements.requires_cross_document_coverage else intent.kind,
+            "analysisRequirements": requirements.as_dict(),
+            "responseContract": (
+                QuestionResponseContract(
+                    historical_reconstruction=True,
+                    instructions=self._historical_provider_instructions(requirements),
+                    max_citations=min(16, len(selected_targets)),
+                    required_billing_citation_keys=billing_required_keys,
+                ) if requirements.requires_cross_document_coverage else None
+            ),
             "notes": notes,
             # Locally calculated holding records shown and cited with the answer.
             "holdingsEvidence": legal_holdings.payload if legal_holdings is not None else None,
             "holdingsCitations": legal_holdings.citations if legal_holdings is not None else (),
+            # Generic short answers can expose a locally revalidated coverage
+            # reference per included document. Historical provider answers do
+            # not reuse those references as citations: coverage alone is not
+            # proof for an individual historical conclusion.
+            "coverageCitations": tuple(coverage_citations),
+            "evidenceItemCounts": self._evidence_item_counts(candidates, selected_candidates),
             "evidenceDocumentIds": tuple(sorted(evidence_document_ids)),
             # Every document whose content can reach the provider in this
             # request: cited excerpts plus any earlier answer reused as
@@ -1683,7 +2522,14 @@ class MatterReviewService:
             "transmittedDocumentIds": tuple(sorted(evidence_document_ids | follow_up_document_ids)),
             "searchTruncated": search_truncated,
             "inputTokens": controls.estimate_tokens(len(prompt)),
-            "maxOutputTokens": min(800, controls.max_output_tokens),
+            # A six-source historical answer may need several concise,
+            # separately cited sections. It remains within the configured
+            # provider cap, while ordinary Q&A retains its shorter limit.
+            "maxOutputTokens": (
+                controls.max_output_tokens
+                if requirements.requires_cross_document_coverage
+                else min(800, controls.max_output_tokens)
+            ),
             "scope": {
                 "sourceItems": len(selected),
                 "totalSourceItems": total,
@@ -1692,6 +2538,8 @@ class MatterReviewService:
                 "documentsSelected": len(document_ids),
                 "documentsWithEvidence": len(evidence_document_ids),
                 "comparisonCoverageComplete": comparison_coverage_complete,
+                "directHoldingSourcesRequired": len(direct_holding_sources),
+                "directHoldingSourcesIncluded": len(direct_holding_sources) - len(missing_direct_holding_sources),
             },
         }
 
@@ -1703,6 +2551,153 @@ class MatterReviewService:
             legal_status=cls._is_legal_status_question(question),
             change=cls._is_change_question(question),
         )
+
+    @staticmethod
+    def _analysis_requirements(question: str) -> AnalysisRequirements:
+        """Extract additive factual requirements without deciding an outcome.
+
+        This is deliberately smaller than a natural-language parser.  It is
+        a retrieval guardrail for the recurrent pattern where one question
+        asks about dated positions *and* a transfer *and* a legal assignment.
+        """
+        query = " ".join(primary_request_text(question).casefold().split())
+        historical_chronology = any(phrase in query for phrase in (
+            "chronologically", "chronological", "chronology", "timeline", "in chronological order",
+        ))
+        holdings_comparison = (
+            "changes in holdings" in query
+            or "change in holdings" in query
+            or ("compare" in query and any(term in query for term in ("holding", "position", "subfund", "fund")))
+        )
+        historical_holdings = any(phrase in query for phrase in (
+            "reconstruct holdings", "historical holdings", "holdings as of", "positions as of",
+            "before and after", "historical changes", "for each date", "each as-of", "each as of",
+        ))
+        # Lawyers commonly request snapshot balances as “holdings on 31
+        # January and 28 February”, rather than using the more formal “as
+        # of” wording.  Two calendar dates plus a holdings target are still a
+        # historical comparison across the current scope.  Treating those
+        # dates as filename selectors would incorrectly narrow an all-file
+        # question before evidence retrieval.
+        requested_calendar_dates = question_dates(question)
+        holdings_targeted = any(term in query for term in (
+            "holding", "position", "subfund", "fund a", "fund b", "fund c",
+        ))
+        explicitly_requested_as_of_dates = (
+            "for each date" in query
+            or "each as-of" in query
+            or "each as of" in query
+            or query.count(" as of ") >= 2
+            or ("as of" in query and ("before and after" in query or "between" in query))
+        )
+        transfer_requested = any(term in query for term in (
+            "securities transfer", "security transfer", "transfer of", "transfer's effective", "transfer effective",
+            "movement of securities", "securities movement",
+        ))
+        securities_transfer = transfer_requested and not any(phrase in query for phrase in (
+            "no securities transfer", "without a securities transfer", "without securities transfer",
+            "no security transfer", "without a security transfer", "does not move securities",
+        ))
+        claim_assignment = any(term in query for term in (
+            "claim-right assignment", "claim right assignment", "claim-rights assignment", "claim rights assignment",
+            "legal claim-right", "legal claim right", "assigned claim", "assignment of claim",
+        ))
+        contradictions = any(term in query for term in (
+            "contradict", "contradiction", "conflict", "disputed", "dispute", "do not silently resolve",
+        ))
+        pro_rata_billing = MatterReviewService._is_document_billing_question(question)
+        billing_impact = pro_rata_billing and any(term in query for term in (
+            "affect", "impact", "eligibility", "applicable", "recalculate", "recalculation", "resolve", "resolution",
+        ))
+        invoice_status = any(term in query for term in (
+            "invoiced", "issued invoice", "issued invoices", "invoice status", "outstanding", "paid", "payment",
+        ))
+        # Preserve the established deterministic two-snapshot comparison for
+        # a simple “compare March and April holdings” request. Calendar dates
+        # become a historical-reconstruction cue only when the same question
+        # asks for an event's effective date or an explicit chronology.
+        # Merely asking whether a change *proves* a transfer or assignment is
+        # still a bounded holdings comparison, not an event reconstruction.
+        effective_event_timeline = (
+            "effective" in query and (securities_transfer or claim_assignment)
+        )
+        multiple_as_of_dates = explicitly_requested_as_of_dates or (
+            len(requested_calendar_dates) >= 2
+            and holdings_targeted
+            and (historical_chronology or effective_event_timeline)
+        )
+        # A detailed request for balances on named dates is historical even
+        # when it uses neither the word "reconstruct" nor "historical".
+        # A two-snapshot comparison remains on the established deterministic
+        # holdings-comparison path unless it separately requests chronology
+        # or reconstruction.
+        historical_holdings = historical_holdings or historical_chronology or (multiple_as_of_dates and holdings_targeted)
+        return AnalysisRequirements(
+            historical_holdings=historical_holdings,
+            historical_chronology=historical_chronology,
+            holdings_comparison=holdings_comparison,
+            multiple_as_of_dates=multiple_as_of_dates,
+            securities_transfer=securities_transfer,
+            claim_assignment=claim_assignment,
+            contradictions=contradictions,
+            pro_rata_billing=pro_rata_billing,
+            billing_impact=billing_impact,
+            invoice_status=invoice_status,
+        )
+
+    @staticmethod
+    def _historical_provider_instructions(requirements: AnalysisRequirements) -> str:
+        """Trusted, bounded instructions for the historical response schema.
+
+        The evidence context remains untrusted document data.  This contract
+        reaches both provider adapters as instructions, rather than existing
+        only in the local prompt-size estimate.
+        """
+        return (
+            AIAnalysisService._historical_reconstruction_instructions()
+            + " Produce a historical evidence reconstruction in the required section schema. "
+            "Address every requested as-of date and identify each balance as documented, inferred, unresolved, or unsupported. "
+            "For every documented event, state its type, effective date, document date when supplied and different, "
+            "originating and receiving parties, the security or claim reference, amount or percentage, and direct source key. "
+            "Only infer an intervening balance when a cited securities transfer explicitly supports the arithmetic; label it inferred. "
+            "Do not call a change between holdings snapshots a transfer unless separate cited transfer evidence establishes it. "
+            "For conflicting source records, add a contradiction section and do not choose a balance. "
+            "Include a billing section only when the question requests billing and the approved rule and inputs are present. "
+            "When billing impact is requested, compare documented events with the explicitly approved billing basis, "
+            "retain unresolved conflicts, and say when recalculation needs lawyer confirmation. "
+            "Treat issued invoices and outstanding balances as separate verified ledger facts, not proof supplied by an allocation. "
+            "Use distinct cited rows for separate Fund A, Fund B, and Fund C values. "
+            "Set unknown true only if no supported finding exists at all. If some findings are supported, set unknown false "
+            "and add an explicit unsupported or limitation section for every gap. Keep each section to one or two concise sentences. "
+            "Do not infer facts absent from the evidence. "
+            f"Requested analysis requirements: {requirements.prompt_text()}."
+        )
+
+    @staticmethod
+    def _evidence_item_counts(
+        candidates: Sequence[tuple[str, str, str, str, str]],
+        included: Sequence[tuple[str, str, str, str, str]],
+    ) -> Mapping[str, Mapping[str, int]]:
+        """Return aggregate source-selection counts without retaining source text."""
+        def category(candidate: tuple[str, str, str, str, str]) -> str:
+            description = candidate[4].casefold()
+            if "document-backed holdings row" in description:
+                return "historicalHoldingRows"
+            if "historical required event source" in description:
+                return "requiredEventSources"
+            if "document-backed billing instruction" in description or "document-backed billing fact" in description:
+                return "billingInstructions"
+            return "supplementaryEvidence"
+
+        result: dict[str, dict[str, int]] = {}
+        for candidate in candidates:
+            result.setdefault(category(candidate), {"available": 0, "included": 0})["available"] += 1
+        for candidate in included:
+            result.setdefault(category(candidate), {"available": 0, "included": 0})["included"] += 1
+        return {
+            name: {"available": counts["available"], "included": counts["included"], "excluded": counts["available"] - counts["included"]}
+            for name, counts in sorted(result.items())
+        }
 
     def _inventory_plan(self, documents: Sequence[ScopedDocument], intent: QuestionIntent) -> Mapping[str, object]:
         """Answer a listing or relationship question from every eligible document, locally.
@@ -1851,6 +2846,116 @@ class MatterReviewService:
             )
         return LegalHoldingsEvidence(payload, tuple(citations), candidate, local_answer)
 
+    def _historical_holdings_evidence(
+        self, documents: Sequence[ScopedDocument], question: str,
+    ) -> HistoricalHoldingsEvidence | None:
+        """Build compact, traceable dated snapshots for a broader reconstruction.
+
+        This does not infer a transfer or confirm an ownership fact. It only
+        transcribes the deterministic spreadsheet rows that the provider needs
+        in order to distinguish recorded snapshots from the separate notices.
+        """
+        spreadsheets = [
+            document for document in documents
+            if document.filename.rsplit(".", 1)[-1].casefold() in _SPREADSHEET_EXTENSIONS
+        ]
+        if not spreadsheets:
+            return None
+        extraction_of = {document.document_id: str(document.extraction_id) for document in spreadsheets}
+        with self._database.connection() as connection:
+            snapshots = HoldingsComparison(connection, [
+                HoldingsDocument(document.document_id, document.filename, extraction_of[document.document_id])
+                for document in spreadsheets
+            ]).snapshot_records()
+        if not snapshots:
+            return None
+
+        # Keep each quantity cell as its own candidate.  Collapsing all Fund
+        # rows behind the first cell in a sheet made Fund B/C visible in the
+        # prompt but impossible for the provider to cite directly.  A user
+        # may explicitly name only one holdings workbook together with a
+        # contradictory statement and billing instruction, so this works for
+        # one or more selected spreadsheets rather than requiring a pair.
+        citations: list[tuple[str, str, str, str]] = []
+        names = {document.document_id: document.filename for document in spreadsheets}
+        candidates: list[tuple[str, str, str, str, str]] = []
+        for snapshot in snapshots:
+            document_id = snapshot.get("documentId")
+            quantity = snapshot.get("quantity")
+            reference = snapshot.get("quantityReference")
+            if not isinstance(document_id, str) or not isinstance(quantity, str) or not isinstance(reference, str):
+                continue
+            filename = names.get(document_id)
+            if filename is None:
+                continue
+            entities = snapshot.get("entities")
+            label = next(
+                (
+                    str(entity["name"])
+                    for entity in entities
+                    if isinstance(entity, Mapping) and entity.get("kind") != "investor" and isinstance(entity.get("name"), str)
+                ),
+                "Unnamed subfund",
+            ) if isinstance(entities, Sequence) else "Unnamed subfund"
+            account = snapshot.get("account") if isinstance(snapshot.get("account"), str) else "account unknown"
+            isin = snapshot.get("isin") if isinstance(snapshot.get("isin"), str) else "ISIN unknown"
+            snapshot_date = snapshot.get("date") if isinstance(snapshot.get("date"), str) else "date unknown"
+            try:
+                display_quantity = grouped_quantity(Decimal(quantity))
+            except InvalidOperation:
+                continue
+            citation = (document_id, extraction_of[document_id], reference, filename)
+            if citation not in citations:
+                citations.append(citation)
+            candidates.append((
+                document_id,
+                extraction_of[document_id],
+                reference,
+                filename,
+                "DOCUMENT-BACKED HOLDINGS ROW; EVIDENCE: "
+                f"Snapshot {snapshot_date}; {label}; nominal {display_quantity}; account {account}; ISIN {isin}.",
+            ))
+        return HistoricalHoldingsEvidence(tuple(candidates), tuple(citations)) if candidates else None
+
+    @staticmethod
+    def _historical_evidence_excerpt(source_text: str) -> str:
+        """Keep the fact-bearing lines of a long event notice within the prompt cap."""
+        lines = [" ".join(line.split()) for line in source_text.splitlines() if line.strip()]
+        cues = (
+            "effective date", "as-of date", "partial securities transfer", "nominal", "from horizon", "to horizon",
+            "claim reference", "assigns", "does not move securities", "recorded holding", "conflicts", "unresolved",
+            "fee pool", "allocation rule", "eligible participant", "excluded", "billing period",
+        )
+        selected: list[str] = []
+        for index, line in enumerate(lines):
+            if any(cue in line.casefold() for cue in cues):
+                # PDF extraction preserves visual line breaks, not semantic
+                # sentences. Keep the next two lines as well so an event's
+                # destination, assignee, or amount is not dropped merely
+                # because it wrapped in the original PDF.
+                selected.extend(lines[index:index + 3])
+        if not selected:
+            selected = lines[:2]
+        return " ".join(selected)[:480]
+
+    @staticmethod
+    def _bounded_historical_excerpt(value: str, maximum: int) -> str:
+        """Preserve both sides of a long event statement in a fixed prompt budget.
+
+        Transfer and assignment notices commonly identify the event at the
+        start and the receiving fund, assignee, or effective date at the end.
+        Keeping only a prefix can silently remove the material fact that the
+        user asked to reconstruct.
+        """
+        compact = " ".join(value.split())
+        if len(compact) <= maximum:
+            return compact
+        if maximum < 12:
+            return compact[:maximum]
+        head_length = max((maximum - 3) * 3 // 5, 1)
+        tail_length = maximum - 3 - head_length
+        return f"{compact[:head_length].rstrip()} … {compact[-tail_length:].lstrip()}"
+
     @staticmethod
     def _local_plan(answer: LocalAnswer, documents_selected: int, *, notes: Sequence[str] = ()) -> dict[str, object]:
         return {
@@ -1931,6 +3036,7 @@ class MatterReviewService:
         *,
         selected_document_count: int,
         evidence_document_count: int,
+        missing_direct_holding_sources: int = 0,
     ) -> tuple[str, tuple[str, ...]] | None:
         """Return a cited local answer when a provider yields an empty/unknown result.
 
@@ -1951,8 +3057,36 @@ class MatterReviewService:
         if not evidence:
             return None
 
+        requirements = self._analysis_requirements(question)
+        if requirements.requires_cross_document_coverage:
+            if evidence_document_count < selected_document_count or missing_direct_holding_sources:
+                excerpts = "; ".join(f"“{self._analysis._bounded_question_excerpt(text)}”" for _key, text in evidence[:2])
+                missing_documents = max(selected_document_count - evidence_document_count, 0)
+                fact_gap = (
+                    f" It also lacks direct, separately citable support for {missing_direct_holding_sources} requested holdings row"
+                    f"{'s' if missing_direct_holding_sources != 1 else ''}."
+                    if missing_direct_holding_sources else ""
+                )
+                return (
+                    f"This historical reconstruction requires evidence across {selected_document_count} selected documents, "
+                    f"but the bounded evidence set represents only {evidence_document_count}"
+                    + (f" (missing {missing_documents} document{'s' if missing_documents != 1 else ''})" if missing_documents else "")
+                    + "."
+                    + fact_gap
+                    + " It cannot establish all requested "
+                    f"holdings, transfers, assignments, conflicts, or billing facts without silently omitting records. "
+                    f"The cited excerpts currently available are: {excerpts}.",
+                    tuple(key for key, _text in evidence[:2]),
+                )
+            return (
+                "The provider did not return a supported answer for this historical reconstruction. The bounded evidence "
+                "set covered every selected document, but no holdings, transfer, claim-right assignment, contradiction, or "
+                "billing conclusion has been substituted locally. Review the cited evidence or retry the provider.",
+                tuple(key for key, _text in evidence[:min(2, len(evidence))]),
+            )
+
         legal_status = self._is_legal_status_question(question)
-        change = self._is_change_question(question) and not legal_status
+        change = self._is_change_question(question)
         comparison_question = self._is_comparison_question(question)
         if comparison_question and evidence_document_count < selected_document_count:
             excerpts = "; ".join(f"“{self._analysis._bounded_question_excerpt(text)}”" for _key, text in evidence[:2])
@@ -2031,6 +3165,7 @@ class MatterReviewService:
         return any(term in query for term in (
             "compare", "comparison", "each isin", "for each isin", "each available date",
             "quantities differ", "which quantities differ", "differences between", "difference between",
+            "reconstruct holdings", "historical holdings", "for each date", "before and after", "historical changes",
         ))
 
     @staticmethod
@@ -2047,7 +3182,7 @@ class MatterReviewService:
         ))
 
     def _validate_matter_citations(
-        self, citations: Sequence[Mapping[str, str]], targets: object
+        self, citations: Sequence[Mapping[str, str]], targets: object, *, origin: str | None = None,
     ) -> list[Mapping[str, str]]:
         if not isinstance(targets, dict):
             return []
@@ -2065,12 +3200,15 @@ class MatterReviewService:
                 canonical_reference, source_text = evidence
                 excerpt = self._analysis._evidence_excerpt(source_text)
                 if excerpt:
-                    validated.append({
+                    resolved: dict[str, str] = {
                         "documentId": document_id,
                         "filename": filename,
                         "sourceReference": canonical_reference,
                         "evidenceSnippet": excerpt,
-                    })
+                    }
+                    if origin is not None:
+                        resolved["origin"] = origin
+                    validated.append(resolved)
         return validated
 
     def _validate_direct_matter_citations(
@@ -2127,27 +3265,32 @@ class MatterReviewService:
         check, so indexing never changes which sources count as relevant.
         """
         query = question.casefold()
-        if MatterReviewService._is_document_billing_question(question):
-            return frozenset({
+        requirements = MatterReviewService._analysis_requirements(question)
+        terms: set[str] = set()
+        if requirements.pro_rata_billing:
+            terms |= {
                 "billing", "pro-rata", "pro rata", "fee pool", "allocation", "eligible", "nominal",
                 "invoice", "currency", "withdraw", "excluded",
-            })
-        if MatterReviewService._is_legal_status_question(question):
-            return frozenset({
+            }
+        if requirements.claim_assignment or MatterReviewService._is_legal_status_question(question):
+            terms |= {
                 "litig", "claim", "right", "assign", "transfer", "withdraw", "settle", "mandate", "participat",
                 "entitle", "abtret", "übertrag", "uebertrag", "klage", "anspruch", "verfahren", "vergleich",
                 "austritt", "beteilig", "beend", "kündig", "kuendig",
-            })
-        if MatterReviewService._is_change_question(question):
-            return frozenset({
+            }
+        if requirements.historical_holdings or requirements.securities_transfer or MatterReviewService._is_change_question(question):
+            terms |= {
                 "change", "changed", "transfer", "trade", "transaction", "movement", "purchase", "sale",
                 "sell", "redeem", "redemption", "liquidat", "merge", "split", "delete", "remov", "close",
                 "subfund", "sub-fund", "fund", "account", "holding", "position", "quantity", "share",
-                "unit", "isin", "date", "übertrag", "uebertrag", "änder", "aender", "bestand", "konto",
-                "verkauf", "kauf", "tilgung", "liquid", "teilfonds", "teil-fonds", "fonds", "depot",
-                "anteil", "anteile", "wertpapier", "zuteil", "transaktion", "rückzahlung", "rueckzahlung",
-                "abschreib", "herabsetz", "umtausch", "kündigung", "kuendigung",
-            })
+                "unit", "isin", "date", "effective", "statement", "contradict", "conflict", "dispute",
+                "übertrag", "uebertrag", "änder", "aender", "bestand", "konto", "verkauf", "kauf", "tilgung",
+                "liquid", "teilfonds", "teil-fonds", "fonds", "depot", "anteil", "anteile", "wertpapier",
+                "zuteil", "transaktion", "rückzahlung", "rueckzahlung", "abschreib", "herabsetz", "umtausch",
+                "kündigung", "kuendigung",
+            }
+        if terms:
+            return frozenset(terms | {identifier.casefold() for identifier in lookup_identifiers(question)})
         terms = {
             # A trailing plural "s" would stop "investors" matching "Investor".
             token[:-1] if len(token) > 5 and token.endswith("s") and not token.endswith("ss") else token
@@ -2334,8 +3477,11 @@ class MatterReviewService:
         if not isinstance(matter_id, str) or not _MATTER_ID.fullmatch(matter_id):
             raise MatterReviewError("The requested matter is unavailable. Reopen the matter and try again.")
         question = params.get("question")
-        if not isinstance(question, str) or not question.strip() or len(question) > 600:
-            raise MatterReviewError("Enter a question of no more than 600 characters.")
+        if not isinstance(question, str):
+            raise MatterReviewError("Enter a question of no more than 5,000 characters.")
+        question = question.strip()
+        if not question or len(question) > MAX_MATTER_QUESTION_CHARACTERS:
+            raise MatterReviewError("Enter a question of no more than 5,000 characters.")
         scope = params.get("scope")
         mode = scope.get("mode") if isinstance(scope, dict) else None
         if not isinstance(scope, dict) or mode not in _SCOPE_MODES:

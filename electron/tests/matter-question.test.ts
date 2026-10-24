@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { MAX_MATTER_QUESTION_CHARACTERS, unicodeCodePointCount } from "../src/ipc-contract";
 import { isMatterDocumentScope, isMatterEntityInventory, isMatterHoldingsComparison, isMatterQuestionIntent, matterQuestionRequest } from "../src/matter-question";
 
 const first = "11111111-1111-4111-8111-111111111111";
@@ -12,6 +13,20 @@ test("accepts explicit all-document and selected-document scopes", () => {
     matterQuestionRequest({ ...base, scope: { mode: "selected", documentIds: [first, second] } }, false),
     { ...base, scope: { mode: "selected", documentIds: [first, second] } },
   );
+});
+
+test("accepts multiline and Unicode Matter Review questions through the 5,000-code-point boundary", () => {
+  const multiline = "1. Reconstruct the holdings.\n2. Identify transfers.\n3. Flag contradictions.";
+  const unicodeAtLimit = "😀".repeat(MAX_MATTER_QUESTION_CHARACTERS);
+  assert.equal(unicodeCodePointCount(unicodeAtLimit), MAX_MATTER_QUESTION_CHARACTERS);
+  assert.deepEqual(
+    matterQuestionRequest({ ...base, question: multiline, scope: { mode: "all" } }, false),
+    { ...base, question: multiline, scope: { mode: "all" } },
+  );
+  assert.equal(matterQuestionRequest({ ...base, question: "a".repeat(MAX_MATTER_QUESTION_CHARACTERS - 1), scope: { mode: "all" } }, false)?.question.length, MAX_MATTER_QUESTION_CHARACTERS - 1);
+  assert.equal(matterQuestionRequest({ ...base, question: unicodeAtLimit, scope: { mode: "all" } }, false)?.question, unicodeAtLimit);
+  assert.equal(matterQuestionRequest({ ...base, question: "😀".repeat(MAX_MATTER_QUESTION_CHARACTERS + 1), scope: { mode: "all" } }, false), undefined);
+  assert.equal(matterQuestionRequest({ ...base, question: "\n \t", scope: { mode: "all" } }, false), undefined);
 });
 
 test("rejects implicit, empty, widened, or malformed scopes", () => {

@@ -527,3 +527,107 @@ rows are every record row of both tables. A source control total is shown as
 reconciling the comparison only when it covers exactly the compared rows and
 its record total equals their exact `Decimal` total; otherwise it is reported
 as checking its own rows only, or as failed.
+## 2026-10-21 — Confirmation-gated reconciliation ledger
+
+ClaimFlow keeps reconciliation results in a provenance-backed candidate ledger
+before creating any holding snapshot, securities-transfer, or claim-right
+assignment record. Each candidate retains its original document, source
+reference, evidence snippet, document issue date, origin, and creation time;
+the source document separately retains its immutable file hash and import time.
+An explicit local confirmation is required before a candidate becomes a
+business record. AI-origin candidates additionally require a locally validated
+AI proposal with the same document and source reference. Claim-right
+assignments never modify securities holdings.
+
+The initial scope intentionally supports exact, explicitly evidenced identities
+and quantities only. It detects conflicting same-day balances and refuses
+transfers that exceed the latest confirmed source balance. The existing Decimal
+pro-rata calculator remains an in-memory preview and runs only where an
+explicit billing instruction supplies the eligible bases and fee rule; it does
+not infer eligibility from AI output or ledger records.
+
+## 2026-10-22 — Evidence-to-business-record candidate pipeline
+
+The document-import path now creates only bounded, provenance-pinned
+reconciliation *candidates* from structured spreadsheet holdings and narrowly
+recognised transfer, claim-assignment, and custodial-statement text. Completed
+AI analysis can add candidates only where all cited field proposals were
+independently validated against the same immutable extraction; AI output never
+confirms a fact by itself. Candidates record the extraction ID, parser version,
+origin, validation status, confidence, source locator, issue date, original
+document import time, and candidate creation time.
+
+There is deliberately no silent confirmation policy. A user-acknowledged
+reviewed batch may confirm only deterministic, nonconflicting holdings and
+securities transfers that pass the source-balance check. Conflicting holdings,
+AI-origin candidates, and claim-right assignments remain review-required; a
+claim assignment requires an individual explicit confirmation and never changes
+a securities holding. Duplicate notices add provenance to the existing event
+rather than creating a second event. The review surface for these candidates is
+deferred to the next UI milestone; this backend policy remains the single
+reconciliation path.
+
+## 2026-10-22 — Read-only historical reconciliation timeline
+
+Historical reconciliation is derived only from confirmed holdings snapshots and
+confirmed securities-transfer records. An exact-date snapshot is labelled
+`documented`; a later balance assembled from a snapshot plus confirmed
+transfers is `reconstructed`; a carry-forward without a recorded intervening
+transfer is `inferred`. Reconstructed and inferred values explicitly state that
+undocumented intervening events cannot be ruled out. A transfer on the same
+date as a snapshot is never netted into that snapshot because intraday ordering
+is unresolved.
+
+The read-only protocol exposes holdings-as-of, a combined holdings/transfer
+timeline, transfer history, claim-right-assignment history, open discrepancies,
+and a composite reconciliation result. Each result returns candidate/extraction
+provenance, source locators, import and processing timestamps, and local audit
+references. Claim-right assignments have their own timeline and remain unable
+to alter securities balances. Contradictory holding candidates remain open
+issues with both quantities and their exact difference; no source is selected
+as canonical merely because it was imported or issued later.
+
+## 2026-10-22 — Evidence-backed, immutable pro-rata calculation runs
+
+An extracted billing instruction is staged as a deterministic local candidate
+and becomes a billing agreement only after explicit confirmation. The existing
+`Decimal` largest-remainder calculation is reused for persisted runs. A run is
+not an invoice and does not create an invoice recipient. It freezes the
+approved rule, eligible bases, linked holding records, evidence, rounding
+method, and open issues; later recalculation creates a new version rather than
+rewriting the prior result.
+
+An explicit approved billing basis can be used while a related holdings
+observation remains disputed, but the resulting calculation is `provisional`
+and names the issue. Without an approved basis the workflow blocks rather than
+silently selecting a disputed balance. Claim-right assignments have no effect
+on billing participants or invoice recipients without separate evidence.
+
+## 2026-10-22 — Lawyer-facing reconciliation review remains confirmation-gated
+
+The Holdings, Issues, and Billing screens use only the existing typed Electron
+bridge and local Python services. They never receive a database handle or
+perform browser-side calculations. Candidate confirmation, candidate rejection,
+reviewed batches, billing-rule approval, and saving a calculation each require
+an explicit local confirmation and are validated, transactional, and audited
+by the backend. A rejection retains the candidate and its source evidence;
+confirmed records cannot be overwritten through the review screen.
+
+The screens show source-document locators as links back to the existing local
+viewer. Conflicting values remain open and visible, and no issue-resolution
+command is exposed because the backend has no safe audited resolution workflow
+yet. Saved billing runs remain immutable; the UI describes them as calculations,
+not invoices, and keeps invoice recipients unresolved unless source evidence
+establishes them.
+
+## 2026-10-22 — Isolated development acceptance workspace
+
+An opt-in `CLAIMFLOW_ISOLATED_TEST_DATA` environment variable can select a
+separate absolute Electron user-data root in an unpackaged development run.
+Electron passes that root unchanged to the local Python backend, so its SQLite
+database, document vault, exports, logs, preferences, and Codex runtime home
+are separate from the normal ClaimFlow profile. The override is ignored by
+packaged builds. It does not copy an existing profile, and cloud-AI actions and
+credential management are disabled in this mode to prevent use or mutation of
+normal Keychain credentials or ChatGPT sessions during synthetic acceptance
+testing.

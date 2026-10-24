@@ -27,6 +27,7 @@ from .question_intent import question_entity_names
 MAX_HEADER_SCAN_ROWS = 60
 MAX_DATA_ROWS = 2_000
 MAX_RESULT_ROWS = 200
+MAX_SNAPSHOT_RECORDS = 200
 MAX_SCANNED_CELLS = 60_000
 MAX_CAVEATS_PER_DOCUMENT = 5
 
@@ -360,6 +361,51 @@ class HoldingsComparison:
             payload=payload, citations=tuple(citations[:120]),
             evidence_document_ids=frozenset(citation[0] for citation in citations), complete=complete,
         )
+
+    def snapshot_records(self) -> tuple[Mapping[str, object], ...]:
+        """Return bounded, directly citable rows from each recognised table.
+
+        Historical Matter Review questions can deliberately name just one
+        dated holdings workbook alongside notices or billing instructions.
+        That is not a two-spreadsheet comparison, but its individual rows
+        remain document-backed observations.  Reuse this parser's header and
+        numeric validation rather than treating generic spreadsheet cells as
+        holdings evidence.
+
+        The returned records are observations only.  They do not calculate a
+        change, infer an event, or reconcile conflicting documents.
+        """
+        records: list[Mapping[str, object]] = []
+        for document in self._documents:
+            rows = self._rows(document)
+            document_date, date_basis = self._date(document)
+            for row in rows:
+                if len(records) >= MAX_SNAPSHOT_RECORDS:
+                    return tuple(records)
+                if row.quantity is None:
+                    continue
+                quantity, problem = parse_quantity(*self._quantity(row))
+                if quantity is None or problem is not None:
+                    continue
+                row_date = _iso_date(row.date[0]) if row.date else None
+                records.append({
+                    "documentId": document.document_id,
+                    "filename": document.filename,
+                    "date": row_date or document_date,
+                    "dateBasis": "row cell" if row_date else date_basis,
+                    "entities": tuple(
+                        {"kind": kind, "name": name, "reference": reference}
+                        for kind, (name, reference) in sorted(row.entities.items())
+                    ),
+                    "account": row.account[0] if row.account else None,
+                    "accountReference": row.account[1] if row.account else None,
+                    "isin": row.isin[0] if row.isin else None,
+                    "isinReference": row.isin[1] if row.isin else None,
+                    "quantity": format(quantity, "f"),
+                    "quantityReference": row.quantity[1],
+                    "rowReference": row.row_reference,
+                })
+        return tuple(records)
 
     # -- dates -----------------------------------------------------------
 

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { type BackendHealth, type StorageStatus } from "./ipc-contract";
+import { type BackendHealth, type BuildMetadata, type StorageStatus } from "./ipc-contract";
 
 const PROTOCOL_VERSION = "1.0";
 const MAX_PROTOCOL_LINE_BYTES = 65_536;
@@ -47,7 +47,7 @@ export interface BackendLaunchConfiguration {
   options: SpawnOptionsWithoutStdio;
 }
 
-type BackendCommand = "health.check" | "storage.status" | "ai.status" | "ai.check_connection" | "ai.codex_connect" | "ai.codex_disconnect" | "ai.set_authorization" | "ai.analysis_preview" | "ai.analyze_document" | "ai.analysis_status" | "ai.analysis_findings" | "ai.question_preview" | "ai.ask_question" | "ai.question_status" | "matter.review" | "matter.billing_preview" | "matter.analysis_batch_preview" | "matter.start_analysis_batch" | "matter.analysis_batch_status" | "matter.question_preview" | "matter.ask_question" | "matter.question_status" | "documents.import" | "documents.list" | "documents.remove" | "documents.content" | "documents.retry_parse";
+type BackendCommand = "health.check" | "storage.status" | "ai.status" | "ai.check_connection" | "ai.codex_connect" | "ai.codex_disconnect" | "ai.set_authorization" | "ai.analysis_preview" | "ai.analyze_document" | "ai.analysis_status" | "ai.analysis_findings" | "ai.question_preview" | "ai.ask_question" | "ai.question_status" | "matter.review" | "matter.billing_preview" | "matter.analysis_batch_preview" | "matter.start_analysis_batch" | "matter.analysis_batch_status" | "matter.question_preview" | "matter.ask_question" | "matter.question_status" | "reconciliation.candidates" | "reconciliation.confirm" | "reconciliation.reject" | "reconciliation.apply_policy" | "reconciliation.holdings_as_of" | "reconciliation.holdings_timeline" | "reconciliation.transfer_history" | "reconciliation.claim_assignment_history" | "reconciliation.open_discrepancies" | "reconciliation.result" | "billing.candidates" | "billing.approve_rule" | "billing.rule" | "billing.preview" | "billing.calculate" | "billing.runs" | "billing.run" | "billing.compare_runs" | "documents.import" | "documents.list" | "documents.remove" | "documents.content" | "documents.retry_parse";
 
 export type BackendSpawn = (
   command: string,
@@ -97,6 +97,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function parseBuildMetadata(value: unknown): BuildMetadata | null {
+  if (!isRecord(value) || ["applicationVersion", "buildDate", "sourceRevision", "sourceRevisionShort", "sourceState", "buildId"].some((key) => typeof value[key] !== "string" || value[key].length === 0)) return null;
+  return Object.freeze({
+    applicationVersion: value.applicationVersion as string,
+    buildDate: value.buildDate as string,
+    sourceRevision: value.sourceRevision as string,
+    sourceRevisionShort: value.sourceRevisionShort as string,
+    sourceState: value.sourceState as string,
+    buildId: value.buildId as string,
+  });
+}
+
 function isBackendResponse(value: unknown): value is BackendResponse {
   if (!isRecord(value) || value.protocolVersion !== PROTOCOL_VERSION) {
     return false;
@@ -122,6 +134,7 @@ function isBackendResponse(value: unknown): value is BackendResponse {
 }
 
 function parseBackendHealth(value: Record<string, unknown>): BackendHealth {
+  const build = parseBuildMetadata(value.build);
   if (
     value.status !== "ok" ||
     typeof value.applicationVersion !== "string" ||
@@ -134,7 +147,8 @@ function parseBackendHealth(value: Record<string, unknown>): BackendHealth {
     typeof value.platform.release !== "string" ||
     value.platform.release.length === 0 ||
     typeof value.platform.machine !== "string" ||
-    value.platform.machine.length === 0
+    value.platform.machine.length === 0 ||
+    build === null
   ) {
     throw new BackendProcessError(
       "BACKEND_PROTOCOL_ERROR",
@@ -151,6 +165,7 @@ function parseBackendHealth(value: Record<string, unknown>): BackendHealth {
       release: value.platform.release,
       machine: value.platform.machine,
     }),
+    build,
   });
 }
 

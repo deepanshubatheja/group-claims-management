@@ -3,6 +3,12 @@ import { evidenceTarget, spreadsheetRequest } from "./document-viewer-navigation
 /** ClaimFlow's single local workspace is one implicit matter; Python validates this ID. */
 export const WORKSPACE_MATTER_ID = "workspace";
 export const MAX_SELECTED_QUESTION_DOCUMENTS = 20;
+/** Matches the Electron/Python Matter Review limit: Unicode code points after trim. */
+export const MAX_MATTER_QUESTION_CHARACTERS = 5_000;
+
+export function unicodeCodePointCount(value: string): number {
+  return Array.from(value).length;
+}
 
 export type ChatScopeMode = "all" | "selected";
 
@@ -123,6 +129,7 @@ export function questionIntentLabel(intent: MatterQuestionIntent): string {
     relationship: "Entity relationship mapping (built locally)",
     specific_lookup: "Exact account/ISIN lookup",
     holdings_comparison: "Dated holdings comparison (calculated locally)",
+    historical_reconstruction: "Historical holdings reconstruction",
     change: "Document change or transfer analysis",
     legal_status: "Legal claim status",
     comparison: "Cross-document comparison",

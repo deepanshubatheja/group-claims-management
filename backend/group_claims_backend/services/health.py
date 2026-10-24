@@ -6,6 +6,7 @@ import platform
 from collections.abc import Mapping
 
 from group_claims_backend import __version__
+from group_claims_backend.generated_build_metadata import BUILD_METADATA
 
 
 def get_health_status() -> Mapping[str, object]:
@@ -14,6 +15,7 @@ def get_health_status() -> Mapping[str, object]:
     return {
         "status": "ok",
         "applicationVersion": __version__,
+        "build": dict(BUILD_METADATA),
         "pythonVersion": platform.python_version(),
         "platform": {
             "system": platform.system(),

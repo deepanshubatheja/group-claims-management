@@ -56,7 +56,7 @@ class StorageTestCase(unittest.TestCase):
         return source
 
     def test_first_run_creates_expected_directories_and_schema(self) -> None:
-        self.assertEqual(self.status.schema_version, 10)
+        self.assertEqual(self.status.schema_version, MIGRATIONS[-1].version)
         self.assertTrue(all(directory.is_dir() for directory in (
             self.paths.database,
             self.paths.documents,
@@ -111,7 +111,7 @@ class StorageTestCase(unittest.TestCase):
         assert self.service.database is not None
         with self.service.database.connection() as connection:
             version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        self.assertEqual(version, 10)
+        self.assertEqual(version, MIGRATIONS[-1].version)
 
         failed_database = StorageService(str(Path(self.temporary_directory.name) / "failed-migration"))
         self.assertEqual(failed_database.initialize().status, "ready")
@@ -121,15 +121,66 @@ class StorageTestCase(unittest.TestCase):
             connection.execute("CREATE TABLE partial_migration (id INTEGER PRIMARY KEY)")
             connection.execute("THIS IS NOT VALID SQL")
 
+        next_version = MIGRATIONS[-1].version + 1
         with self.assertRaises(Exception):
-            MigrationRunner(failed_database.database, (Migration(11, invalid_migration),)).initialize()
+            MigrationRunner(failed_database.database, (Migration(next_version, invalid_migration),)).initialize()
         with failed_database.database.connection() as connection:
             partial = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'partial_migration'"
             ).fetchone()
             version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
         self.assertIsNone(partial)
-        self.assertEqual(version, 10)
+        self.assertEqual(version, MIGRATIONS[-1].version)
+
+    def test_reconciliation_migration_resumes_when_schema_exists_without_its_version_record(self) -> None:
+        """An interrupted pre-version-record upgrade must not block app startup."""
+        assert self.service.database is not None
+        with self.service.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO legal_entities (id, display_name, entity_type, created_at) VALUES (?, ?, ?, ?)",
+                ("preexisting-entity", "Existing Entity", "organization", "2026-10-22T00:00:00+00:00"),
+            )
+            connection.execute("DELETE FROM schema_migrations WHERE version = ?", (MIGRATIONS[-1].version,))
+
+        restarted = StorageService(str(self.root))
+        status = restarted.initialize()
+
+        self.assertEqual(status.status, "ready")
+        self.assertEqual(status.schema_version, MIGRATIONS[-1].version)
+        assert restarted.database is not None
+        with restarted.database.connection() as connection:
+            entity = connection.execute(
+                "SELECT display_name FROM legal_entities WHERE id = ?", ("preexisting-entity",)
+            ).fetchone()
+        self.assertEqual(entity["display_name"], "Existing Entity")
+
+    def test_search_index_repair_migration_restores_missing_derived_tables(self) -> None:
+        """A v10 version record without its derived tables must be repairable."""
+        legacy_root = Path(self.temporary_directory.name) / "missing-search-index"
+        legacy_paths = StoragePaths.from_root(legacy_root)
+        legacy_paths.initialize_directories()
+        legacy_database = Database(legacy_paths.database_file)
+        # This models the affected persisted state: migrations through v11
+        # are recorded, but the interrupted v10 cache schema is absent.
+        # Keep the fixture at the historical v11 boundary: v12 repairs the
+        # derived search index and v13 adds reconciliation provenance.
+        self.assertEqual(MigrationRunner(legacy_database, MIGRATIONS[:11]).initialize(), 11)
+        with legacy_database.transaction() as connection:
+            connection.execute("DROP TABLE document_search_fts")
+            connection.execute("DROP TABLE document_search_index")
+
+        self.assertEqual(MigrationRunner(legacy_database).initialize(), MIGRATIONS[-1].version)
+        with legacy_database.connection() as connection:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+                )
+            }
+            version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        self.assertIn("document_search_fts", tables)
+        self.assertIn("document_search_index", tables)
+        self.assertEqual(version, MIGRATIONS[-1].version)
 
     def test_existing_version_one_database_upgrades_without_resetting_data(self) -> None:
         legacy_root = Path(self.temporary_directory.name) / "legacy-app-data"
@@ -143,7 +194,7 @@ class StorageTestCase(unittest.TestCase):
                 ("legacy-entity", "Legacy Entity", "organization", "2026-10-14T00:00:00+00:00"),
             )
 
-        self.assertEqual(MigrationRunner(legacy_database).initialize(), 10)
+        self.assertEqual(MigrationRunner(legacy_database).initialize(), MIGRATIONS[-1].version)
         with legacy_database.connection() as connection:
             entity = connection.execute(
                 "SELECT display_name FROM legal_entities WHERE id = ?", ("legacy-entity",)

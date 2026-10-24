@@ -330,6 +330,66 @@ class DocumentConstraintTests(unittest.TestCase):
         # Without a document noun, a date is content, not a document reference.
         self.assertFalse(resolve_document_references("What was traded on March 28?", documents).requested)
 
+    def test_numbered_documents_take_precedence_over_a_repeated_date(self) -> None:
+        documents = [
+            CandidateDocument("one", "01_opening_holdings_2025-01-31.xlsx", "xlsx", True),
+            CandidateDocument("four", "04_later_holdings_2025-02-28.xlsx", "xlsx", True),
+            CandidateDocument("five", "05_contradictory_custodian_statement_2025-02-28.pdf", "pdf", True),
+            CandidateDocument("six", "06_approved_billing_instruction_2025-03-01.pdf", "pdf", True),
+        ]
+        question = (
+            "Compare the February 28 holdings in document 04 with the contradictory custodian statement in document 05. "
+            "Does the approved billing instruction in document 06 resolve the conflict?"
+        )
+        constraint = resolve_document_references(question, documents)
+        self.assertEqual([item.document_id for item in constraint.resolved], ["four", "five", "six"])
+        self.assertEqual(constraint.problems, ())
+
+    def test_multiple_document_numbers_ranges_and_nonexistent_number_are_explicit(self) -> None:
+        documents = [
+            CandidateDocument("one", "01_opening_holdings.xlsx", "xlsx", True),
+            CandidateDocument("two", "02_transfer.pdf", "pdf", True),
+            CandidateDocument("three", "03_assignment.pdf", "pdf", True),
+        ]
+        constraint = resolve_document_references("Compare documents 01 through 03.", documents)
+        self.assertEqual([item.document_id for item in constraint.resolved], ["one", "two", "three"])
+        missing = resolve_document_references("What is in document 09?", documents)
+        self.assertEqual(missing.resolved, ())
+        self.assertEqual(missing.problems, ("No document numbered 09 is in this matter.",))
+
+    def test_numbered_prefix_and_descriptive_title_never_choose_duplicates(self) -> None:
+        duplicated_prefix = [
+            CandidateDocument("one", "04_later_holdings.xlsx", "xlsx", True),
+            CandidateDocument("two", "04_other_holdings.pdf", "pdf", True),
+        ]
+        constraint = resolve_document_references("Compare document 04.", duplicated_prefix)
+        self.assertEqual(constraint.resolved, ())
+        self.assertIn("More than one document has the numbered file prefix 04", constraint.problems[0])
+        duplicated_title = [
+            CandidateDocument("one", "contradictory_custodian_statement_1.pdf", "pdf", True),
+            CandidateDocument("two", "contradictory_custodian_statement_2.pdf", "pdf", True),
+        ]
+        constraint = resolve_document_references("Review the contradictory custodian statement.", duplicated_title)
+        self.assertEqual(constraint.resolved, ())
+        self.assertIn("More than one document matches the descriptive title", constraint.problems[0])
+
+    def test_descriptive_titles_stable_ids_and_out_of_scope_duplicates_are_resolved_safely(self) -> None:
+        documents = [
+            CandidateDocument("a0f3b7c1-1111-2222-3333-444444444444", "05_contradictory_custodian_statement.pdf", "pdf", True),
+            CandidateDocument("b0f3b7c1-1111-2222-3333-444444444444", "05_contradictory_custodian_statement.pdf", "pdf", False),
+            CandidateDocument("billing", "06_approved_billing_instruction.pdf", "pdf", True),
+        ]
+        by_title = resolve_document_references("Review the approved billing instruction.", documents)
+        self.assertEqual([item.document_id for item in by_title.resolved], ["billing"])
+        by_id = resolve_document_references(
+            "Review a0f3b7c1-1111-2222-3333-444444444444.", documents,
+        )
+        self.assertEqual([item.document_id for item in by_id.resolved], ["a0f3b7c1-1111-2222-3333-444444444444"])
+        # The duplicate filename outside the currently permitted scope does
+        # not make the in-scope file ambiguous.
+        by_name = resolve_document_references("Use 05_contradictory_custodian_statement.pdf.", documents)
+        self.assertEqual([item.document_id for item in by_name.resolved], ["a0f3b7c1-1111-2222-3333-444444444444"])
+
     def test_exact_filename_narrows_all_documents_scope(self) -> None:
         status = self._ask(self._request("Using 02_Holdings_2023-04-30.xlsx, list all subfunds."))
         self.assertEqual(status["intent"], "inventory")

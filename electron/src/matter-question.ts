@@ -1,4 +1,4 @@
-import type { MatterDocumentScope, MatterEntityInventory, MatterHoldingsComparison, MatterQuestionRequest, MatterQuestionScopeRequest, MatterQuestionSubmission } from "./ipc-contract";
+import { MAX_MATTER_QUESTION_CHARACTERS, unicodeCodePointCount, type MatterDocumentScope, type MatterEntityInventory, type MatterHoldingsComparison, type MatterQuestionRequest, type MatterQuestionScopeRequest, type MatterQuestionSubmission } from "./ipc-contract";
 
 const DOCUMENT_ID = /^[a-f0-9-]{36}$/i;
 const MATTER_ID = /^[a-z0-9-]{1,64}$/;
@@ -34,13 +34,15 @@ export function matterQuestionRequest(payload: unknown, submission: boolean): Ma
   const allowed = new Set(["matterId", "scope", "question", "followUpQuestionId", ...(submission ? ["acknowledged", "consentedDocumentIds"] : [])]);
   if (Object.keys(payload).some((key) => !allowed.has(key))) return undefined;
   if (typeof payload.matterId !== "string" || !MATTER_ID.test(payload.matterId)) return undefined;
-  if (typeof payload.question !== "string" || !payload.question.trim() || payload.question.length > 600) return undefined;
+  if (typeof payload.question !== "string") return undefined;
+  const question = payload.question.trim();
+  if (!question || unicodeCodePointCount(question) > MAX_MATTER_QUESTION_CHARACTERS) return undefined;
   const scope = scopeRequest(payload.scope);
   if (!scope) return undefined;
   const followUpQuestionId = payload.followUpQuestionId;
   if (followUpQuestionId !== undefined && (typeof followUpQuestionId !== "string" || !DOCUMENT_ID.test(followUpQuestionId))) return undefined;
   const request: MatterQuestionRequest = {
-    matterId: payload.matterId, scope, question: payload.question.trim(),
+    matterId: payload.matterId, scope, question,
     ...(followUpQuestionId !== undefined ? { followUpQuestionId } : {}),
   };
   if (!submission) return request;
@@ -66,7 +68,7 @@ export function isMatterDocumentScope(value: unknown): value is MatterDocumentSc
     && Array.isArray(value.notes) && value.notes.every((note) => typeof note === "string");
 }
 
-const INTENTS = new Set(["inventory", "relationship", "specific_lookup", "holdings_comparison", "change", "legal_status", "comparison", "calculation", "general"]);
+const INTENTS = new Set(["inventory", "relationship", "specific_lookup", "holdings_comparison", "historical_reconstruction", "change", "legal_status", "comparison", "calculation", "general"]);
 const RELATION_KINDS = new Set(["explicit_statement", "explicit_heading", "document_section", "same_row"]);
 const HOLDING_STATUSES = new Set(["compared", "only_earlier", "only_later", "duplicate_rows", "unusable_quantity", "unit_mismatch", "currency_mismatch"]);
 const CONTROL_TOTAL_STATUSES = new Set(["formula_covers_records", "matches", "differs", "not_verified"]);

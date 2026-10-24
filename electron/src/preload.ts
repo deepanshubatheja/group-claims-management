@@ -1,8 +1,14 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIProviderSelectionResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionRequest, MatterQuestionSubmission, BillingPreviewResponse, BillingPreviewRow } from "./ipc-contract";
+import type { AppInfo, BackendHealthResponse, StorageStatusResponse, AIStatusResponse, AIProviderSelectionResponse, AIConnectionCheckResponse, AICredentialResponse, DocumentContentResponse, DocumentImportResponse, DocumentRemoveResponse, DocumentListResponse, DocumentRetryResponse, DocumentContentOptions, FolderImportPreviewResponse, FolderImportResponse, FolderImportProgress, DocumentAnalysisPreviewResponse, DocumentAnalysisStartResponse, DocumentAnalysisStatusResponse, DocumentAnalysisFindingsResponse, DocumentQuestionPreviewResponse, DocumentQuestionStartResponse, DocumentQuestionStatusResponse, DocumentQuestionFollowUp, MatterReviewResponse, MatterAnalysisBatchPreviewResponse, MatterAnalysisBatchResponse, MatterQuestionPreviewResponse, MatterQuestionResponse, MatterQuestionRequest, MatterQuestionSubmission, BillingPreviewResponse, BillingPreviewRow, ReconciliationFilters, ReconciliationAsOfFilters, ReconciliationReadResponse, ReconciliationWriteResponse, BillingCalculationRequest, BillingCalculationReadResponse, BillingCalculationWriteResponse } from "./ipc-contract";
 
 // Sandboxed preloads cannot load arbitrary local CommonJS modules at runtime.
 // Keep this one allowlisted channel local while sharing the response type.
+// This input boundary must stay local as well: importing ipc-contract for a
+// runtime constant would make the sandboxed preload require that module.
+const MAX_MATTER_QUESTION_CHARACTERS = 5_000;
+function unicodeCodePointCount(value: string): number {
+  return Array.from(value).length;
+}
 const GET_APP_INFO_CHANNEL = "app:get-info" as const;
 const GET_BACKEND_HEALTH_CHANNEL = "app:get-backend-health" as const;
 const GET_STORAGE_STATUS_CHANNEL = "app:get-storage-status" as const;
@@ -19,7 +25,7 @@ const DISCONNECT_CODEX_CHANNEL = "app:disconnect-codex" as const;
 function matterQuestionPayload(request: MatterQuestionRequest): MatterQuestionRequest {
   const scope = request.scope;
   const question = request.question.trim();
-  if (!/^[a-z0-9-]{1,64}$/.test(request.matterId) || !question || question.length > 600) throw new Error("Invalid matter question.");
+  if (!/^[a-z0-9-]{1,64}$/.test(request.matterId) || !question || unicodeCodePointCount(question) > MAX_MATTER_QUESTION_CHARACTERS) throw new Error("Invalid matter question.");
   if (scope.mode === "selected" && (!Array.isArray(scope.documentIds) || scope.documentIds.length < 1 || scope.documentIds.length > 20 || !scope.documentIds.every((id) => /^[a-f0-9-]{36}$/i.test(id)))) throw new Error("Select between one and 20 valid documents.");
   if (request.followUpQuestionId !== undefined && !/^[a-f0-9-]{36}$/i.test(request.followUpQuestionId)) throw new Error("Invalid follow-up reference.");
   return {
@@ -51,6 +57,24 @@ const GET_MATTER_ANALYSIS_BATCH_STATUS_CHANNEL = "matter:get-analysis-batch-stat
 const PREVIEW_MATTER_QUESTION_CHANNEL = "matter:preview-question" as const;
 const ASK_MATTER_QUESTION_CHANNEL = "matter:ask-question" as const;
 const GET_MATTER_QUESTION_STATUS_CHANNEL = "matter:get-question-status" as const;
+const GET_RECONCILIATION_HOLDINGS_AS_OF_CHANNEL = "reconciliation:get-holdings-as-of" as const;
+const GET_RECONCILIATION_TIMELINE_CHANNEL = "reconciliation:get-timeline" as const;
+const GET_RECONCILIATION_TRANSFERS_CHANNEL = "reconciliation:get-transfers" as const;
+const GET_RECONCILIATION_ASSIGNMENTS_CHANNEL = "reconciliation:get-assignments" as const;
+const GET_RECONCILIATION_DISCREPANCIES_CHANNEL = "reconciliation:get-discrepancies" as const;
+const GET_RECONCILIATION_RESULT_CHANNEL = "reconciliation:get-result" as const;
+const GET_RECONCILIATION_CANDIDATES_CHANNEL = "reconciliation:get-candidates" as const;
+const CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:confirm-candidate" as const;
+const REJECT_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:reject-candidate" as const;
+const APPLY_RECONCILIATION_POLICY_CHANNEL = "reconciliation:apply-policy" as const;
+const GET_BILLING_RULE_CANDIDATES_CHANNEL = "billing:get-rule-candidates" as const;
+const APPROVE_BILLING_RULE_CHANNEL = "billing:approve-rule" as const;
+const SAVE_BILLING_CALCULATION_CHANNEL = "billing:save-calculation" as const;
+const GET_BILLING_RULE_CHANNEL = "billing:get-rule" as const;
+const GET_BILLING_CALCULATION_PREVIEW_CHANNEL = "billing:get-calculation-preview" as const;
+const GET_BILLING_CALCULATION_RUNS_CHANNEL = "billing:get-calculation-runs" as const;
+const GET_BILLING_CALCULATION_RUN_CHANNEL = "billing:get-calculation-run" as const;
+const COMPARE_BILLING_CALCULATION_RUNS_CHANNEL = "billing:compare-calculation-runs" as const;
 const SELECT_AND_IMPORT_DOCUMENTS_CHANNEL = "documents:select-and-import" as const;
 const SELECT_FOLDER_FOR_IMPORT_CHANNEL = "documents:select-folder-for-import" as const;
 const CONFIRM_FOLDER_IMPORT_CHANNEL = "documents:confirm-folder-import" as const;
@@ -101,8 +125,15 @@ function isAppInfo(value: unknown): value is AppInfo {
     candidate.version.length > 0 &&
     (candidate.platform === "darwin" ||
       candidate.platform === "win32" ||
-      candidate.platform === "linux")
+      candidate.platform === "linux") &&
+    isBuildMetadata(candidate.build)
   );
+}
+
+function isBuildMetadata(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return ["applicationVersion", "buildDate", "sourceRevision", "sourceRevisionShort", "sourceState", "buildId"].every((key) => typeof candidate[key] === "string" && candidate[key].length > 0);
 }
 
 function isBackendHealthResponse(value: unknown): value is BackendHealthResponse {
@@ -136,7 +167,8 @@ function isBackendHealthResponse(value: unknown): value is BackendHealthResponse
     platform !== null &&
     typeof (platform as Record<string, unknown>).system === "string" &&
     typeof (platform as Record<string, unknown>).release === "string" &&
-    typeof (platform as Record<string, unknown>).machine === "string"
+    typeof (platform as Record<string, unknown>).machine === "string" &&
+    isBuildMetadata(health.build)
   );
 }
 
@@ -281,6 +313,70 @@ const desktopApi = Object.freeze({
   async getMatterQuestionStatus(questionId: string): Promise<MatterQuestionResponse> {
     if (!/^[a-f0-9-]{36}$/i.test(questionId)) throw new Error("Invalid consolidated question reference.");
     return Object.freeze(await ipcRenderer.invoke(GET_MATTER_QUESTION_STATUS_CHANNEL, { questionId }) as MatterQuestionResponse);
+  },
+  async getReconciliationHoldingsAsOf(filters: ReconciliationAsOfFilters): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_HOLDINGS_AS_OF_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationTimeline(filters: ReconciliationFilters = {}): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_TIMELINE_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationTransfers(filters: ReconciliationFilters = {}): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_TRANSFERS_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationAssignments(filters: Pick<ReconciliationFilters, "fromDate" | "toDate" | "isin"> & { claimReference?: string; fromEntity?: string; toEntity?: string } = {}): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_ASSIGNMENTS_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationDiscrepancies(filters: ReconciliationFilters = {}): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_DISCREPANCIES_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationResult(filters: ReconciliationAsOfFilters): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_RESULT_CHANNEL, { ...filters }) as ReconciliationReadResponse);
+  },
+  async getReconciliationCandidates(status?: "candidate" | "confirmed" | "rejected"): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_RECONCILIATION_CANDIDATES_CHANNEL, status ? { status } : {}) as ReconciliationReadResponse);
+  },
+  async confirmReconciliationCandidate(candidateId: string): Promise<ReconciliationWriteResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(candidateId)) throw new Error("Invalid candidate reference.");
+    return Object.freeze(await ipcRenderer.invoke(CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL, { candidateId, acknowledged: true }) as ReconciliationWriteResponse);
+  },
+  async rejectReconciliationCandidate(candidateId: string, reason: string): Promise<ReconciliationWriteResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(candidateId) || !reason.trim() || reason.trim().length > 500) throw new Error("A short rejection reason is required.");
+    return Object.freeze(await ipcRenderer.invoke(REJECT_RECONCILIATION_CANDIDATE_CHANNEL, { candidateId, reason: reason.trim(), acknowledged: true }) as ReconciliationWriteResponse);
+  },
+  async applyReconciliationPolicy(candidateIds: string[]): Promise<ReconciliationWriteResponse> {
+    if (!Array.isArray(candidateIds) || candidateIds.length < 1 || candidateIds.length > 100 || !candidateIds.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Invalid candidate review list.");
+    return Object.freeze(await ipcRenderer.invoke(APPLY_RECONCILIATION_POLICY_CHANNEL, { candidateIds: [...new Set(candidateIds)], policy: "reviewed_batch", acknowledged: true }) as ReconciliationWriteResponse);
+  },
+  async getBillingRuleCandidates(status?: "candidate" | "approved"): Promise<BillingCalculationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_RULE_CANDIDATES_CHANNEL, status ? { status } : {}) as BillingCalculationReadResponse);
+  },
+  async approveBillingRule(candidateId: string): Promise<BillingCalculationWriteResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(candidateId)) throw new Error("Invalid billing-rule candidate reference.");
+    return Object.freeze(await ipcRenderer.invoke(APPROVE_BILLING_RULE_CHANNEL, { candidateId, acknowledged: true }) as BillingCalculationWriteResponse);
+  },
+  async getBillingRule(billingAgreementId: string): Promise<BillingCalculationReadResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(billingAgreementId)) throw new Error("Invalid billing agreement reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_RULE_CHANNEL, { billingAgreementId }) as BillingCalculationReadResponse);
+  },
+  async previewBillingCalculation(request: BillingCalculationRequest): Promise<BillingCalculationReadResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(request.billingAgreementId) || (request.asOfDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.asOfDate))) throw new Error("Invalid billing calculation request.");
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_CALCULATION_PREVIEW_CHANNEL, { ...request }) as BillingCalculationReadResponse);
+  },
+  async saveBillingCalculation(request: BillingCalculationRequest): Promise<BillingCalculationWriteResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(request.billingAgreementId) || (request.asOfDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.asOfDate))) throw new Error("Invalid billing calculation request.");
+    return Object.freeze(await ipcRenderer.invoke(SAVE_BILLING_CALCULATION_CHANNEL, { ...request, acknowledged: true }) as BillingCalculationWriteResponse);
+  },
+  async getBillingCalculationRuns(billingAgreementId: string): Promise<BillingCalculationReadResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(billingAgreementId)) throw new Error("Invalid billing agreement reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_CALCULATION_RUNS_CHANNEL, { billingAgreementId }) as BillingCalculationReadResponse);
+  },
+  async getBillingCalculationRun(runId: string): Promise<BillingCalculationReadResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(runId)) throw new Error("Invalid billing calculation reference.");
+    return Object.freeze(await ipcRenderer.invoke(GET_BILLING_CALCULATION_RUN_CHANNEL, { runId }) as BillingCalculationReadResponse);
+  },
+  async compareBillingCalculationRuns(leftRunId: string, rightRunId: string): Promise<BillingCalculationReadResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(leftRunId) || !/^[a-f0-9-]{36}$/i.test(rightRunId)) throw new Error("Invalid billing calculation comparison.");
+    return Object.freeze(await ipcRenderer.invoke(COMPARE_BILLING_CALCULATION_RUNS_CHANNEL, { leftRunId, rightRunId }) as BillingCalculationReadResponse);
   },
   async getBillingPreview(feePool: string, currency: string, rows: BillingPreviewRow[]): Promise<BillingPreviewResponse> {
     if (typeof feePool !== "string" || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$/.test(feePool) || !/^[A-Z]{3}$/.test(currency) || !Array.isArray(rows) || rows.length < 1 || rows.length > 50 || !rows.every((row) => typeof row.id === "string" && typeof row.label === "string" && typeof row.eligibleAmount === "string")) throw new Error("Invalid billing preview assumptions.");

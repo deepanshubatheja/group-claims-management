@@ -20,6 +20,7 @@ export type AnswerInput = {
   inventory?: MatterEntityInventory | null;
   holdingsComparison?: MatterHoldingsComparison | null;
   model?: string | null;
+  execution?: MatterQuestionExecution | null;
 };
 
 export type AnswerLayout = "holdings" | "entities" | "relationships" | "prose";
@@ -89,6 +90,7 @@ export type AnswerView = {
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const TITLES: Record<MatterQuestionIntent, string> = {
   holdings_comparison: "Holdings comparison",
+  historical_reconstruction: "Historical holdings reconstruction",
   inventory: "Entity listing",
   relationship: "Entity relationships",
   specific_lookup: "Account / ISIN lookup",
@@ -289,7 +291,33 @@ function baseTechnical(input: AnswerInput): TechnicalDetail[] {
     { label: "Response type", value: questionIntentLabel(input.intent) },
     { label: "Scope", value: answerScopeLabel(scope) },
   ];
-  if (input.model) details.push({ label: "Answered by", value: input.model });
+  if (input.model) details.push({
+    label: "Answered by",
+    value: input.model === "codex-default" ? "Codex (underlying model not reported)" : input.model,
+  });
+  const execution = input.execution;
+  if (execution) {
+    details.push(
+      { label: "Provider", value: execution.provider ?? "Local processing" },
+      { label: "Provider call", value: execution.providerCallAttempted ? execution.providerOutcome.replace(/_/g, " ") : "not attempted" },
+      { label: "Evidence coverage", value: `${execution.documentsIncluded.length} included · ${execution.documentsExcluded.length} excluded · ${execution.documentsSelected.length} selected${execution.evidenceTruncated ? " · bounded evidence truncated" : ""}` },
+    );
+    if (execution.responseStatus) details.push({ label: "Response coverage", value: execution.responseStatus.replace(/_/g, " ") });
+    if (execution.modelUnknown !== null) details.push({ label: "Model reported no supported findings", value: execution.modelUnknown ? "yes" : "no" });
+    if (execution.validatedSectionKinds.length) {
+      const sections = execution.validatedSectionKinds.map((kind) => `${kind.replace(/_/g, " ")} ${execution.validatedSectionCounts[kind] ?? 0}`);
+      details.push({ label: "Validated findings", value: sections.join(" · ") });
+      details.push({ label: "Validated citations", value: String(execution.validatedCitationCount) });
+    }
+    const evidenceItems = Object.entries(execution.evidenceItemCounts);
+    if (evidenceItems.length) details.push({
+      label: "Evidence items",
+      value: evidenceItems.map(([kind, counts]) => `${kind.replace(/([A-Z])/g, " $1").toLowerCase()}: ${counts.included}/${counts.available}`).join(" · "),
+    });
+    if (execution.fallbackUsed) details.push({ label: "Fallback", value: execution.fallbackReason?.replace(/_/g, " ") ?? "used" });
+    const fallbackEvidence = input.citations.filter((citation) => citation.origin === "local_fallback");
+    if (fallbackEvidence.length) details.push({ label: "Fallback evidence", value: `${plural(fallbackEvidence.length, "locally selected citation")} — not provider-selected` });
+  }
   for (const document of scope.resolvedDocuments ?? []) {
     details.push({ label: "Named in the question", value: `${document.filename} (matched by ${document.matchedBy})` });
   }

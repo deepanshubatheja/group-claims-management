@@ -10,8 +10,11 @@ from group_claims_backend.services.ai import (
     MockAIProvider,
     OPENAI_API_BASE_URL,
     OpenAIProvider,
+    QuestionResponseContract,
     _normalized_openai_api_key,
     validate_answer,
+    validate_historical_answer,
+    validate_historical_answer_details,
     validate_proposal,
     validate_proposals,
 )
@@ -187,6 +190,128 @@ class OpenAIProviderTests(unittest.TestCase):
                     {"sourceReference": "E2"},
                     {"sourceReference": "E3"},
                 ],
+            })
+
+    def test_historical_question_uses_section_schema_and_more_citations(self):
+        payload = json.dumps({
+            "unknown": False,
+            "sections": [
+                {"kind": "holdings", "status": "documented", "text": "Fund A is 600,000.", "citations": [{"sourceReference": "E1"}]},
+                {"kind": "securities_transfer", "status": "documented", "text": "200,000 moved.", "citations": [{"sourceReference": "E2"}]},
+                {"kind": "claim_assignment", "status": "documented", "text": "Claim rights assigned.", "citations": [{"sourceReference": "E3"}]},
+            ],
+        })
+        client = FakeClient(FakeResponse(payload))
+        contract = QuestionResponseContract(
+            historical_reconstruction=True, instructions="Keep transfers separate from assignments.", max_citations=6,
+        )
+        result = OpenAIProvider(api_key="test-key", client=client, sleep=lambda _: None).answer_question(
+            "Reconstruct holdings", "bounded evidence", ("E1", "E2", "E3", "E4", "E5", "E6"), response_contract=contract,
+        )
+        self.assertIn("Holdings (documented)", str(result.answer))
+        self.assertEqual([item["sourceReference"] for item in result.citations], ["E1", "E2", "E3"])
+        call = client.responses.calls[0]
+        sections = call["text"]["format"]["schema"]["properties"]["sections"]
+        self.assertEqual(sections["items"]["properties"]["citations"]["maxItems"], 3)
+        self.assertIn("HISTORICAL RECONSTRUCTION CONTRACT", call["instructions"])
+        self.assertIn("Keep transfers separate", call["instructions"])
+        self.assertFalse(result.historical_metadata["modelUnknown"])
+        self.assertEqual(result.historical_metadata["responseStatus"], "complete")
+
+    def test_historical_partial_answer_is_retained_with_explicit_limitation(self):
+        payload = json.dumps({
+            "unknown": False,
+            "sections": [
+                {"kind": "holdings", "status": "documented", "text": "Fund A is 600,000.", "citations": [{"sourceReference": "E1"}]},
+                {"kind": "limitation", "status": "unsupported", "text": "Fund C is not established by the supplied records.", "citations": [{"sourceReference": "E2"}]},
+            ],
+        })
+        contract = QuestionResponseContract(True, "Keep uncertainty explicit.", 4)
+        result = OpenAIProvider(api_key="test-key", client=FakeClient(FakeResponse(payload)), sleep=lambda _: None).answer_question(
+            "Reconstruct holdings", "bounded evidence", ("E1", "E2", "E3", "E4"), response_contract=contract,
+        )
+        self.assertFalse(result.unknown)
+        self.assertIn("Limitation (unsupported)", str(result.answer))
+        self.assertEqual(result.historical_metadata["responseStatus"], "partial")
+        self.assertEqual(result.historical_metadata["validatedCitationCount"], 2)
+
+    def test_historical_unknown_means_no_supported_finding(self):
+        answer, unknown, citations, metadata = validate_historical_answer_details({
+            "unknown": True,
+            "sections": [{"kind": "limitation", "status": "unsupported", "text": "No dated holdings record is available.", "citations": [{"sourceReference": "E1"}]}],
+        })
+        self.assertIsNone(answer)
+        self.assertTrue(unknown)
+        self.assertEqual(citations[0]["sourceReference"], "E1")
+        self.assertEqual(metadata["responseStatus"], "no_supported_findings")
+        with self.assertRaises(AIServiceError):
+            validate_historical_answer({
+                "unknown": True,
+                "sections": [{"kind": "holdings", "status": "documented", "text": "Fund A is 600,000.", "citations": [{"sourceReference": "E1"}]}],
+            })
+
+    def test_historical_provider_rejects_fabricated_citation(self):
+        payload = json.dumps({
+            "unknown": False,
+            "sections": [{"kind": "holdings", "status": "documented", "text": "Fund A is 600,000.", "citations": [{"sourceReference": "E99"}]}],
+        })
+        with self.assertRaises(AIServiceError) as raised:
+            OpenAIProvider(api_key="test-key", client=FakeClient(FakeResponse(payload)), sleep=lambda _: None).answer_question(
+                "Reconstruct holdings", "bounded evidence", ("E1",),
+                response_contract=QuestionResponseContract(True, "Cite facts.", 1),
+            )
+        self.assertEqual(raised.exception.code, "AI_RESPONSE_CONTRACT_INVALID")
+
+    def test_historical_billing_section_downgrades_incomplete_citations_without_losing_other_findings(self):
+        keys = ("E1", "E2", "E3", "E4", "E5")
+        incomplete = json.dumps({
+            "unknown": False,
+            "sections": [
+                {
+                    "kind": "holdings", "status": "documented", "text": "Fund B is recorded at 1,000,000.",
+                    "citations": [{"sourceReference": "E2"}],
+                },
+                {
+                    "kind": "billing", "status": "documented", "text": "The calculated allocation is supported.",
+                    "citations": [{"sourceReference": "E1"}],
+                },
+            ],
+        })
+        contract = QuestionResponseContract(True, "Use direct billing sources.", 5, keys)
+        result = OpenAIProvider(api_key="test-key", client=FakeClient(FakeResponse(incomplete)), sleep=lambda _: None).answer_question(
+            "Explain the approved allocation", "bounded evidence", keys, response_contract=contract,
+        )
+        self.assertIn("Holdings (documented): Fund B is recorded at 1,000,000.", str(result.answer))
+        self.assertIn("Billing (unsupported)", str(result.answer))
+        self.assertNotIn("The calculated allocation is supported.", str(result.answer))
+        self.assertFalse(result.unknown)
+        self.assertEqual(result.historical_metadata["responseStatus"], "partial")
+        self.assertEqual(result.historical_metadata["billingCitationCoverage"], "incomplete")
+        self.assertEqual(result.historical_metadata["billingSectionsDowngraded"], 1)
+        # The fee-pool citation is not displayed once its untrusted allocation
+        # text is removed, so it cannot appear to prove E2-E5.
+        self.assertEqual([item["sourceReference"] for item in result.citations], ["E2"])
+
+        complete = json.dumps({
+            "unknown": False,
+            "sections": [{
+                "kind": "billing", "status": "documented", "text": "The local calculation is derived from the approved inputs.",
+                "citations": [{"sourceReference": key} for key in keys],
+            }],
+        })
+        client = FakeClient(FakeResponse(complete))
+        result = OpenAIProvider(api_key="test-key", client=client, sleep=lambda _: None).answer_question(
+            "Explain the approved allocation", "bounded evidence", keys, response_contract=contract,
+        )
+        self.assertEqual(result.historical_metadata["validatedCitationCount"], 5)
+        schema = client.responses.calls[0]["text"]["format"]["schema"]
+        self.assertEqual(schema["properties"]["sections"]["items"]["properties"]["citations"]["maxItems"], 5)
+
+    def test_historical_answer_rejects_invalid_section_citations(self):
+        with self.assertRaises(AIServiceError):
+            validate_historical_answer({
+                "unknown": False,
+                "sections": [{"kind": "holdings", "status": "documented", "text": "Fund A", "citations": []}],
             })
 
     def test_unknown_answer_requires_evidence_and_is_shown_as_no_conclusion(self):

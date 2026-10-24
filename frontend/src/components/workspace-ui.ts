@@ -1,6 +1,6 @@
-export const workspacePages = ["Dashboard", "Documents", "Matter Review", "Holdings", "Discrepancies", "Billing", "Reports", "AI Assistant", "Settings"] as const;
+export const workspacePages = ["Dashboard", "Documents", "Matter Review", "Holdings & History", "Issues", "Billing", "Reports", "AI Assistant", "Settings"] as const;
 export type WorkspacePage = (typeof workspacePages)[number];
-export function isAvailablePage(page: WorkspacePage): boolean { return page === "Dashboard" || page === "Documents" || page === "Matter Review" || page === "Settings"; }
+export function isAvailablePage(page: WorkspacePage): boolean { return page === "Dashboard" || page === "Documents" || page === "Matter Review" || page === "Holdings & History" || page === "Issues" || page === "Billing" || page === "Settings"; }
 export function recentDocuments(documents: DocumentSummary[], maximum = 5): DocumentSummary[] { return [...documents].sort((first, second) => Date.parse(second.imported_at) - Date.parse(first.imported_at)).slice(0, maximum); }
 export function platformName(platform: string | undefined): string { return platform === "darwin" ? "macOS" : platform === "win32" ? "Windows" : platform || "Unavailable"; }
 

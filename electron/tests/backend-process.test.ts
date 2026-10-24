@@ -49,6 +49,14 @@ function healthResult(version = "0.1.0"): Record<string, unknown> {
     applicationVersion: version,
     pythonVersion: "3.13.0",
     platform: { system: "Darwin", release: "24.0.0", machine: "arm64" },
+    build: {
+      applicationVersion: version,
+      buildDate: "2026-10-22T00:00:00.000Z",
+      sourceRevision: "a".repeat(40),
+      sourceRevisionShort: "a".repeat(12),
+      sourceState: "clean",
+      buildId: `claimflow-${version}-test`,
+    },
   };
 }
 

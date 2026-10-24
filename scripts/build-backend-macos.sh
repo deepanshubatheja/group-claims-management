@@ -92,6 +92,10 @@ done < <(otool -L "$TESSERACT_BIN" | awk 'NR > 1 { print $1 }')
 
 typeset -a bundle_binaries
 bundle_binaries=("$OCR_BIN/tesseract" "$OCR_LIB"/*.dylib)
+# Homebrew may ship a dependency with execute-only permissions. The copied
+# release artifact must be writable for the ad-hoc signing step below; this
+# affects only the generated OCR bundle, never the Homebrew original.
+chmod u+rw "${bundle_binaries[@]}"
 for binary in "${bundle_binaries[@]}"; do
   install_name_tool -add_rpath "@loader_path/../lib" "$binary" 2>/dev/null || true
   install_name_tool -add_rpath "@loader_path" "$binary" 2>/dev/null || true

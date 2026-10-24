@@ -65,6 +65,12 @@ generated-reports/
 logs/
 *.log
 
+# Generated validation artifacts and synthetic source files (rebuilt by scripts/validation-sprint/)
+outputs/
+*.inspect.ndjson
+backend/tests/fixtures/synthetic_claims_v1/*.pdf
+backend/tests/fixtures/synthetic_claims_v1/*.xlsx
+
 # OS and editor temporary files
 .DS_Store
 .AppleDouble

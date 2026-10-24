@@ -10,7 +10,7 @@ from pathlib import Path
 
 from group_claims_backend.services.ai import AIService, AnswerResult
 from group_claims_backend.services.ai_analysis import AIAnalysisService
-from group_claims_backend.services.matter_review import MatterReviewError, MatterReviewService
+from group_claims_backend.services.matter_review import MAX_MATTER_QUESTION_CHARACTERS, MatterReviewError, MatterReviewService
 from group_claims_backend.storage.service import StorageService
 
 
@@ -79,6 +79,29 @@ class MatterReviewTests(unittest.TestCase):
         self.assertEqual(result["findings"][0]["value"], "Fund A")
         self.assertEqual(result["findings"][0]["sourceReference"], "CSV!A2")
 
+    def test_matter_question_input_accepts_multiline_and_unicode_code_points_through_5000(self) -> None:
+        short_request = self.service._matter_question_params({**self._all_documents(), "question": "Which holding is recorded?"}, acknowledged=False)
+        self.assertEqual(short_request.question, "Which holding is recorded?")
+
+        multiline = "1. Reconstruct dated holdings.\n2. Identify transfers.\n3. Flag contradictions."
+        request = self.service._matter_question_params({**self._all_documents(), "question": multiline}, acknowledged=False)
+        self.assertEqual(request.question, multiline)
+
+        near_limit = "a" * (MAX_MATTER_QUESTION_CHARACTERS - 1)
+        request = self.service._matter_question_params({**self._all_documents(), "question": near_limit}, acknowledged=False)
+        self.assertEqual(request.question, near_limit)
+
+        unicode_question = "😀" * MAX_MATTER_QUESTION_CHARACTERS
+        request = self.service._matter_question_params({**self._all_documents(), "question": unicode_question}, acknowledged=False)
+        self.assertEqual(request.question, unicode_question)
+
+        with self.assertRaisesRegex(MatterReviewError, "5,000 characters"):
+            self.service._matter_question_params(
+                {**self._all_documents(), "question": "😀" * (MAX_MATTER_QUESTION_CHARACTERS + 1)}, acknowledged=False,
+            )
+        with self.assertRaisesRegex(MatterReviewError, "5,000 characters"):
+            self.service._matter_question_params({**self._all_documents(), "question": "\n\t "}, acknowledged=False)
+
     def test_largest_remainder_preview_reconciles_exactly(self) -> None:
         result = self.service.billing_preview({"feePool": "100.00", "currency": "USD", "rows": [
             {"id": "a", "label": "Fund A", "eligibleAmount": "1"},
@@ -105,6 +128,30 @@ class MatterReviewTests(unittest.TestCase):
         self.assertIn("Meridian Income Fund C (AC-3001) is excluded", str(started["answer"]))
         self.assertEqual(started["citations"][0]["filename"], "approved-billing.pdf")
         self.assertEqual(started["citations"][0]["sourceReference"], "page 1 block 0")
+
+    def test_billing_questions_keep_calculation_and_invoicing_distinct(self) -> None:
+        """An instruction can calculate a fee but cannot prove an invoice exists."""
+        billing_document = self._add_billing_instruction()
+        service = MatterReviewService(self.storage)
+        invoiced = service.ask_question({
+            **self._selected(billing_document),
+            "question": "How much has already been invoiced?",
+            "acknowledged": True,
+            "consentedDocumentIds": [],
+        })
+        self.assertEqual(invoiced["status"], "completed")
+        self.assertIn("does not establish a verified issued invoice", str(invoiced["answer"]))
+        self.assertNotIn("Issued invoices: USD", str(invoiced["answer"]))
+
+        ambiguous = service.ask_question({
+            **self._selected(billing_document),
+            "question": "How much pro rata is it being billed?",
+            "acknowledged": True,
+            "consentedDocumentIds": [],
+        })
+        self.assertEqual(ambiguous["status"], "completed")
+        self.assertIn("Calculated allocation", str(ambiguous["answer"]))
+        self.assertIn("Issued invoices and outstanding balances are separate", str(ambiguous["answer"]))
 
     def test_document_backed_billing_conversation_uses_question_aware_provider(self) -> None:
         billing_document = self._add_billing_instruction()

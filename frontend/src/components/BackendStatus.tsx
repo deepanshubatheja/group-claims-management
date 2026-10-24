@@ -67,6 +67,14 @@ export default function BackendStatus() {
             <dd>{health.applicationVersion}</dd>
           </div>
           <div>
+            <dt>Backend build ID</dt>
+            <dd>{health.build.buildId}</dd>
+          </div>
+          <div>
+            <dt>Backend source revision</dt>
+            <dd>{health.build.sourceRevisionShort} ({health.build.sourceState})</dd>
+          </div>
+          <div>
             <dt>Python runtime</dt>
             <dd>{health.pythonVersion}</dd>
           </div>

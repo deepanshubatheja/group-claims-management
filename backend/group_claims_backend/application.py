@@ -13,6 +13,8 @@ from .services.ai import AIService, AIServiceError
 from .services.ai_analysis import AIAnalysisError, AIAnalysisService
 from .services.codex import CodexManager
 from .services.matter_review import MatterReviewError, MatterReviewService
+from .services.reconciliation import ReconciliationError, ReconciliationService
+from .services.billing import BillingError, BillingService
 from .storage.service import StorageService
 
 
@@ -48,6 +50,8 @@ def main(
         ai = AIService(storage, codex_manager=codex)
         analysis = AIAnalysisService(storage, codex_manager=codex)
         matter_review = MatterReviewService(storage, analysis)
+        reconciliation = ReconciliationService(storage)
+        billing = BillingService(storage)
         commands = {
             "health.check": no_params(get_health_status), "storage.status": no_params(storage.status),
             "documents.import": lambda params: documents.import_authorized_paths(params.get("paths")),
@@ -81,8 +85,31 @@ def main(
             "matter.question_preview": matter_review.question_preview,
             "matter.ask_question": matter_review.ask_question,
             "matter.question_status": matter_review.question_status,
+            "reconciliation.stage": reconciliation.stage,
+            "reconciliation.generate": reconciliation.generate,
+            "reconciliation.candidate": reconciliation.candidate,
+            "reconciliation.candidates": reconciliation.candidates,
+            "reconciliation.confirm": reconciliation.confirm,
+            "reconciliation.reject": reconciliation.reject,
+            "reconciliation.apply_policy": reconciliation.apply_policy,
+            "reconciliation.holdings_as_of": reconciliation.holdings_as_of,
+            "reconciliation.holdings_timeline": reconciliation.holdings_timeline,
+            "reconciliation.transfer_history": reconciliation.transfer_history,
+            "reconciliation.claim_assignment_history": reconciliation.claim_assignment_history,
+            "reconciliation.open_discrepancies": reconciliation.open_discrepancies,
+            "reconciliation.result": reconciliation.reconciliation_result,
+            "billing.generate": billing.generate,
+            "billing.candidate": billing.candidate,
+            "billing.candidates": billing.candidates,
+            "billing.approve_rule": billing.approve_rule,
+            "billing.rule": billing.rule_details,
+            "billing.preview": billing.preview,
+            "billing.calculate": billing.calculate,
+            "billing.runs": billing.runs,
+            "billing.run": billing.run,
+            "billing.compare_runs": billing.compare_runs,
         }
-    except (DocumentImportError, AIServiceError, AIAnalysisError, MatterReviewError):
+    except (DocumentImportError, AIServiceError, AIAnalysisError, MatterReviewError, ReconciliationError, BillingError):
         commands = {"health.check": no_params(get_health_status), "storage.status": no_params(storage.status)}
     server = ProtocolServer(
         commands

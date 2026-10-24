@@ -404,6 +404,84 @@ def _migration_009_add_ai_analysis_summaries(connection: sqlite3.Connection) -> 
         """
     )
 
+def _migration_011_add_reconciliation_candidates(connection: sqlite3.Connection) -> None:
+    """Create the reconciliation schema and safely resume an interrupted local upgrade.
+
+    ``sqlite3.executescript`` commits before executing its statements, which
+    means a process interruption after table creation but before the migration
+    version is recorded leaves a valid, partial schema.  Never ask a user to
+    delete their database in that situation: create only missing pieces and
+    verify the completed shape before recording migration 11.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_candidates (
+            id TEXT PRIMARY KEY,
+            candidate_type TEXT NOT NULL CHECK (candidate_type IN ('holding_snapshot','securities_transfer','claim_assignment')),
+            lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('candidate','confirmed','rejected')),
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            document_issue_date TEXT NOT NULL,
+            origin TEXT NOT NULL CHECK (origin IN ('deterministic','ai_validated')),
+            source_reference TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            UNIQUE(source_document_id, candidate_type, source_reference, payload_sha256)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS securities_transfers (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL UNIQUE REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT,
+            from_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            to_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            security_id TEXT NOT NULL REFERENCES securities(id) ON DELETE RESTRICT,
+            effective_date TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    def add_column_if_missing(table: str, definition: str, column: str) -> None:
+        columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not columns:
+            raise MigrationError(f"Required local table {table} is unavailable.")
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    add_column_if_missing(
+        "holding_positions",
+        "candidate_id TEXT REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT",
+        "candidate_id",
+    )
+    add_column_if_missing(
+        "claim_right_assignments",
+        "candidate_id TEXT REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT",
+        "candidate_id",
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_holding_candidate "
+        "ON holding_positions(candidate_id) WHERE candidate_id IS NOT NULL"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_assignment_candidate "
+        "ON claim_right_assignments(candidate_id) WHERE candidate_id IS NOT NULL"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_status "
+        "ON reconciliation_candidates(lifecycle_status, candidate_type)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transfer_date "
+        "ON securities_transfers(security_id, effective_date)"
+    )
+
 
 def _migration_010_add_document_search_index(connection: sqlite3.Connection) -> None:
     """Add a derived, local full-text index over deterministic extraction output.
@@ -416,9 +494,9 @@ def _migration_010_add_document_search_index(connection: sqlite3.Connection) -> 
     of the earlier in-memory scan, including German compound words.
     """
 
-    connection.executescript(
+    connection.execute(
         """
-        CREATE VIRTUAL TABLE document_search_fts USING fts5(
+        CREATE VIRTUAL TABLE IF NOT EXISTS document_search_fts USING fts5(
             text,
             source_document_id UNINDEXED,
             extraction_id UNINDEXED,
@@ -431,16 +509,244 @@ def _migration_010_add_document_search_index(connection: sqlite3.Connection) -> 
             page_number UNINDEXED,
             block_index UNINDEXED,
             tokenize = 'trigram case_sensitive 0'
-        );
-        CREATE TABLE document_search_index (
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_search_index (
             extraction_id TEXT PRIMARY KEY,
             source_document_id TEXT NOT NULL,
             item_count INTEGER NOT NULL CHECK (item_count >= 0),
             unavailable_page_count INTEGER NOT NULL DEFAULT 0 CHECK (unavailable_page_count >= 0),
             indexed_at TEXT NOT NULL
-        );
-        CREATE INDEX idx_document_search_index_document ON document_search_index(source_document_id);
+        )
         """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_search_index_document "
+        "ON document_search_index(source_document_id)"
+    )
+
+
+def _migration_012_repair_document_search_index(connection: sqlite3.Connection) -> None:
+    """Repair an interrupted v10 derived-search migration without touching evidence.
+
+    ``document_search_fts`` and ``document_search_index`` contain only a
+    rebuildable local lookup cache.  Some early databases recorded migration
+    10 even though those tables were absent, so Matter Review later failed
+    while preparing a question.  Re-running this idempotent schema creation
+    restores the cache; it is lazily repopulated from immutable extractions.
+    """
+
+    _migration_010_add_document_search_index(connection)
+
+
+def _migration_013_add_candidate_provenance(connection: sqlite3.Connection) -> None:
+    """Pin reconciliation candidates to the extraction that supported them.
+
+    Existing candidates predate the extraction-version requirement and remain
+    readable.  New candidates always populate these additive fields.  The
+    migration deliberately does not rewrite historical user data.
+    """
+
+    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(reconciliation_candidates)")}
+    additions = (
+        ("extraction_id", "extraction_id TEXT REFERENCES document_extractions(id) ON DELETE RESTRICT"),
+        ("parser_version", "parser_version TEXT"),
+        ("confidence", "confidence REAL"),
+        (
+            "validation_status",
+            "validation_status TEXT NOT NULL DEFAULT 'supported' "
+            "CHECK (validation_status IN ('supported', 'validated_ai', 'review_required'))",
+        ),
+    )
+    for column, definition in additions:
+        if column not in columns:
+            connection.execute(f"ALTER TABLE reconciliation_candidates ADD COLUMN {definition}")
+
+    assignment_columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(claim_right_assignments)")
+    }
+    if "assignment_percentage" not in assignment_columns:
+        connection.execute(
+            "ALTER TABLE claim_right_assignments ADD COLUMN assignment_percentage TEXT"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_extraction_status "
+        "ON reconciliation_candidates(extraction_id, lifecycle_status)"
+    )
+
+
+def _migration_014_add_evidence_backed_billing(connection: sqlite3.Connection) -> None:
+    """Add confirmation-gated billing rules and immutable calculation runs.
+
+    A billing instruction is deliberately staged separately from a confirmed
+    billing agreement.  Calculation runs are not invoices: they preserve the
+    rule, inputs, evidence, and open issues that were known at calculation
+    time so a later reconciliation update never rewrites a prior result.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS billing_rule_candidates (
+            id TEXT PRIMARY KEY,
+            lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('candidate','approved','rejected')),
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            parser_version TEXT NOT NULL,
+            source_reference TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            document_issue_date TEXT NOT NULL,
+            origin TEXT NOT NULL CHECK (origin IN ('deterministic','ai_validated')),
+            payload_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approved_at TEXT,
+            UNIQUE(source_document_id, source_reference, payload_sha256)
+        )
+        """
+    )
+    agreement_columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(billing_agreements)")
+    }
+    additions = (
+        ("billing_rule_candidate_id", "billing_rule_candidate_id TEXT REFERENCES billing_rule_candidates(id) ON DELETE RESTRICT"),
+        ("source_document_id", "source_document_id TEXT REFERENCES source_documents(id) ON DELETE RESTRICT"),
+        ("source_reference", "source_reference TEXT"),
+        ("rule_json", "rule_json TEXT"),
+        ("approval_status", "approval_status TEXT NOT NULL DEFAULT 'legacy' CHECK (approval_status IN ('legacy','approved','rejected'))"),
+        ("approved_at", "approved_at TEXT"),
+    )
+    for column, definition in additions:
+        if column not in agreement_columns:
+            connection.execute(f"ALTER TABLE billing_agreements ADD COLUMN {definition}")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_agreement_candidate "
+        "ON billing_agreements(billing_rule_candidate_id) WHERE billing_rule_candidate_id IS NOT NULL"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS billing_calculation_runs (
+            id TEXT PRIMARY KEY,
+            billing_agreement_id TEXT NOT NULL REFERENCES billing_agreements(id) ON DELETE RESTRICT,
+            previous_run_id TEXT REFERENCES billing_calculation_runs(id) ON DELETE RESTRICT,
+            run_version INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('approved_calculation','provisional','blocked')),
+            allocation_date TEXT,
+            currency_code TEXT,
+            fee_pool_decimal TEXT,
+            total_eligible_decimal TEXT,
+            rounding_method TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            related_issues_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(billing_agreement_id, run_version),
+            UNIQUE(billing_agreement_id, input_fingerprint)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS billing_calculation_allocations (
+            id TEXT PRIMARY KEY,
+            calculation_run_id TEXT NOT NULL REFERENCES billing_calculation_runs(id) ON DELETE RESTRICT,
+            participant_key TEXT NOT NULL,
+            participant_label TEXT NOT NULL,
+            subfund_reference TEXT,
+            eligible_basis_decimal TEXT,
+            share_decimal TEXT,
+            allocated_fee_decimal TEXT,
+            currency_code TEXT,
+            eligibility_status TEXT NOT NULL CHECK (eligibility_status IN ('eligible','excluded','unresolved')),
+            eligibility_reason TEXT,
+            holdings_record_ids_json TEXT NOT NULL,
+            evidence_references_json TEXT NOT NULL,
+            invoice_recipient_status TEXT NOT NULL CHECK (invoice_recipient_status IN ('unresolved','specified')),
+            created_at TEXT NOT NULL,
+            UNIQUE(calculation_run_id, participant_key)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_billing_rule_candidate_status "
+        "ON billing_rule_candidates(lifecycle_status, source_document_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_billing_calculation_agreement "
+        "ON billing_calculation_runs(billing_agreement_id, run_version)"
+    )
+
+
+def _migration_015_add_provisional_holding_conflicts(connection: sqlite3.Connection) -> None:
+    """Persist contradictory holding observations before either is confirmed.
+
+    A conflict is keyed by the business identity shared by the observations,
+    while the link table pins every competing amount to the exact candidate,
+    extraction, document, and source locator that established it.  This keeps
+    an issue auditable even if a candidate is later rejected or a separate
+    resolution workflow is introduced.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_holding_conflicts (
+            id TEXT PRIMARY KEY,
+            conflict_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (status IN ('open','resolved')),
+            account_reference TEXT NOT NULL,
+            security_isin TEXT NOT NULL,
+            position_date TEXT NOT NULL,
+            investor_name TEXT,
+            subfund_name TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_holding_conflict_candidates (
+            conflict_id TEXT NOT NULL REFERENCES reconciliation_holding_conflicts(id) ON DELETE RESTRICT,
+            candidate_id TEXT NOT NULL UNIQUE REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT,
+            quantity TEXT NOT NULL,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            extraction_id TEXT REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            parser_version TEXT,
+            source_reference TEXT NOT NULL,
+            document_issue_date TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            PRIMARY KEY (conflict_id, candidate_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_holding_conflict_open_identity "
+        "ON reconciliation_holding_conflicts(status, account_reference, security_isin, position_date)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_holding_conflict_candidate "
+        "ON reconciliation_holding_conflict_candidates(candidate_id)"
+    )
+
+
+def _migration_016_link_invoice_lines_to_calculation_allocations(connection: sqlite3.Connection) -> None:
+    """Permit an explicitly verified invoice line to reference one allocation.
+
+    Imports and AI findings never populate this link.  It exists only so a
+    separately verified invoice record can be compared to a persisted,
+    evidence-backed calculation without guessing from a description or a
+    subfund name.
+    """
+    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(invoice_line_items)")}
+    if "billing_calculation_allocation_id" not in columns:
+        connection.execute(
+            "ALTER TABLE invoice_line_items ADD COLUMN billing_calculation_allocation_id "
+            "TEXT REFERENCES billing_calculation_allocations(id) ON DELETE RESTRICT"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invoice_line_allocation "
+        "ON invoice_line_items(billing_calculation_allocation_id)"
     )
 
 
@@ -455,6 +761,12 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(8, _migration_008_add_ai_usage_cost_metadata),
     Migration(9, _migration_009_add_ai_analysis_summaries),
     Migration(10, _migration_010_add_document_search_index),
+    Migration(11, _migration_011_add_reconciliation_candidates),
+    Migration(12, _migration_012_repair_document_search_index),
+    Migration(13, _migration_013_add_candidate_provenance),
+    Migration(14, _migration_014_add_evidence_backed_billing),
+    Migration(15, _migration_015_add_provisional_holding_conflicts),
+    Migration(16, _migration_016_link_invoice_lines_to_calculation_allocations),
 )
 
 

@@ -510,6 +510,24 @@ h2 {
 .summary-card span { color: #64798d; font-size: 0.84rem; }
 .summary-card-error strong { color: #8f2930; font-size: 1.15rem; letter-spacing: normal; }
 .dashboard-card, .settings-card { max-width: 980px; margin-top: 18px; padding: 24px 26px; }
+.reconciliation-filters { display: flex; flex-wrap: wrap; gap: 14px; align-items: end; }
+.reconciliation-filters label, .billing-rule-picker { display: grid; gap: 6px; color: #405e77; font-weight: 650; }
+.reconciliation-filters input, .billing-rule-picker select { min-height: 38px; border: 1px solid #b8cce0; border-radius: 7px; padding: 7px 9px; color: #183b5b; background: #fff; }
+.candidate-list, .issue-list { display: grid; gap: 12px; }
+.candidate-row, .issue-card { border: 1px solid #d9e3ec; border-radius: 9px; padding: 15px; background: #fbfdff; }
+.candidate-row { display: flex; justify-content: space-between; gap: 18px; align-items: start; }
+.candidate-row p, .issue-card p { margin: 6px 0; color: #566f87; }
+.candidate-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.source-link { padding: 0; font-size: .86rem; }
+.candidate-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 16px; margin: 12px 0; }
+.candidate-details div { display: grid; gap: 2px; }.candidate-details dt { color: #64798f; font-size: 0.9rem; }.candidate-details dd { margin: 0; font-variant-numeric: tabular-nums; }
+.candidate-conflict { margin: 12px 0; padding: 12px; border: 1px solid #dba0a0; border-radius: 7px; background: #fff6f5; color: #703333; }.candidate-conflict p { color: inherit; }.candidate-conflict ul { margin: 8px 0; padding-left: 20px; }
+.issue-card h3 { margin: 0; text-transform: capitalize; }
+.issue-card dl { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 12px 0; }
+.issue-card dt { color: #64798f; }.issue-card dd { margin: 0; font-variant-numeric: tabular-nums; }
+.billing-rule-picker { max-width: 560px; margin: 12px 0; }
+.billing-summary { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; margin: 16px 0; padding: 11px 13px; border-radius: 8px; background: #f1f7fb; color: #274a67; }
+@media (max-width: 620px) { .candidate-row { display: grid; } }
 .dashboard-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .dashboard-section-heading h2, .settings-card h2 { margin-bottom: 0; }
 .dashboard-message { margin: 16px 0 0; color: #536b83; font-size: 0.9rem; }

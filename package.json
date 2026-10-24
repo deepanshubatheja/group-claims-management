@@ -13,14 +13,15 @@
     "npm": ">=10.0.0"
   },
   "scripts": {
-    "dev": "concurrently --kill-others --names frontend,electron-build,electron \"npm run dev --workspace frontend\" \"npm run dev:build --workspace electron\" \"npm run dev:start --workspace electron\"",
-    "build": "npm run build --workspace frontend && npm run build --workspace electron",
-    "typecheck": "npm run typecheck --workspace frontend && npm run typecheck --workspace electron",
+    "prepare:build-metadata": "node ./scripts/generate-build-metadata.mjs",
+    "dev": "npm run prepare:build-metadata && concurrently --kill-others --names frontend,electron-build,electron \"npm run dev --workspace frontend\" \"npm run dev:build --workspace electron\" \"npm run dev:start --workspace electron\"",
+    "build": "npm run prepare:build-metadata && npm run build --workspace frontend && npm run build --workspace electron",
+    "typecheck": "npm run prepare:build-metadata && npm run typecheck --workspace frontend && npm run typecheck --workspace electron",
     "test:electron": "npm run test --workspace electron",
     "test:frontend": "npm run test --workspace frontend",
     "build:backend:mac": "./scripts/build-backend-macos.sh",
     "build:credential-helper:mac": "./scripts/build-credential-helper-macos.sh",
-    "package:mac": "npm run build:credential-helper:mac && npm run build:backend:mac && npm run build && electron-builder --mac dmg --arm64",
+    "package:mac": "npm run prepare:build-metadata && npm run build:credential-helper:mac && npm run build:backend:mac && npm run build --workspace frontend && npm run build --workspace electron && electron-builder --mac dmg --arm64",
     "package:win": "npm run build && electron-builder --win nsis --x64"
   },
   "devDependencies": {
