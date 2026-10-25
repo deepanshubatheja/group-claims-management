@@ -582,3 +582,25 @@ Nothing is assumed, and no model is asked to calculate.
 
 Amounts carry the currency code and are padded to cents but never rounded.
 Nominal amounts carry no currency. ClaimFlow still issues no invoices.
+
+## 2026-10-24 — Dated document references and local holdings reconstruction
+
+A date in a Matter Review question narrows the scope to a document only when
+the question attaches it to a document noun ("the spreadsheet dated 28 March",
+"the 28 March and 30 April holdings spreadsheets"). A date the facts are asked
+about ("holdings as of 28 February 2025"), a descriptive phrase ("the opening
+statement", "the transfer notice"), or a dated document named alongside other
+described documents does not narrow it. Explicit file names still do.
+
+A question asking to reconstruct a subject's holding or explain a holdings
+discrepancy is answered locally, before any billing-keyword route: the
+earliest documented balance before the requested date is rolled forward with
+effective-dated securities transfers that name the subject on exactly one
+side, and every record on that date is compared with the result and with each
+other. Conflicts stay unresolved; no source is preferred for being later,
+custodial, or consistent with the arithmetic. Claim-right passages are listed
+but never change a balance. When billing is asked about, the approved
+instruction's amount is described against those records; the allocation is
+not recalculated. A follow-up may borrow the earlier question's subject names
+or the earlier billing answer's flagged conflicts, but every figure and
+citation is read again from the documents in scope.

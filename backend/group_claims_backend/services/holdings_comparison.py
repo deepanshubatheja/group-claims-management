@@ -208,6 +208,7 @@ class DatedRecord:
     quantity_reference: str
     # The record's own row date, else its table's stated date, else the file-name date.
     date: str | None
+    account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -393,6 +394,7 @@ class HoldingsComparison:
                     document, dict(row.entities),
                     row.isin[0].upper() if row.isin else None, quantity, row.quantity[0], row.quantity[1],
                     row_date or (str(stated) if stated else None) or file_date,
+                    row.account[0].strip() if row.account else None,
                 ))
         return records
 

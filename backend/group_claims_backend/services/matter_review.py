@@ -28,13 +28,19 @@ from .billing_allocation import (
     instruction_isin, missing_inputs as billing_missing_inputs, split_label as split_participant_label,
 )
 from .document_search import DocumentSearchIndex, SearchHit
-from .document_references import CandidateDocument, DocumentConstraint, resolve_document_references
+from .document_references import CandidateDocument, DocumentConstraint, question_dates, resolve_document_references
 from .entity_inventory import EntityInventoryBuilder, InventoryDocument
 from .holdings_comparison import HoldingsComparison, HoldingsDocument, HoldingsResult, grouped_quantity
+from .holdings_reconstruction import (
+    Subject as HoldingsSubject, answer_text as reconstruction_text, billing_effect as reconstruction_billing_effect,
+    gather as gather_holdings_evidence, reconstruct as reconstruct_holdings,
+)
 from .question_intent import (
-    INTENT_CALCULATION, INTENT_COMPARISON, INTENT_HOLDINGS_COMPARISON, INTENT_INVENTORY, INTENT_LEGAL_STATUS, INTENT_RELATIONSHIP,
+    INTENT_CALCULATION, INTENT_COMPARISON, INTENT_HOLDINGS_COMPARISON, INTENT_HOLDINGS_RECONSTRUCTION, INTENT_INVENTORY,
+    INTENT_LEGAL_STATUS, INTENT_RELATIONSHIP,
     ROLE_INVESTOR, ROLE_INVESTOR_OR_ENTITY, ROLE_SUBFUND, ROLE_VEHICLE, ROLE_VEHICLE_OR_SUBFUND,
-    QuestionIntent, classify_question, lookup_identifiers, primary_request_text, question_entity_names,
+    QuestionIntent, classify_question, is_holdings_reconstruction, lookup_identifiers, primary_request_text,
+    question_entity_names,
 )
 from ..storage.service import StorageService
 
@@ -62,6 +68,8 @@ _GENERIC_QUESTION_WORDS = frozenset({
     "provide", "information", "details", "anything",
 })
 _SPREADSHEET_EXTENSIONS = frozenset({"xlsx", "xls", "csv"})
+# Subjects one reconstruction question may cover.
+MAX_RECONSTRUCTION_SUBJECTS = 3
 # A legal-status question that refers to recorded holding movements.  Bare
 # years are not a cue; grouped amounts such as "400,000" are.
 _HOLDINGS_MOVEMENT_CUE = re.compile(
@@ -392,7 +400,7 @@ class MatterReviewService:
         }
 
     def _document_billing_answer(
-        self, documents: Sequence[ScopedDocument], question: str,
+        self, documents: Sequence[ScopedDocument], question: str, *, intent: str | None = None,
     ) -> DocumentBillingAnswer | None:
         """Calculate only from an expressly approved local billing instruction.
 
@@ -402,7 +410,7 @@ class MatterReviewService:
         selected material itself supplies all of those inputs, such as the
         synthetic matter supplied with ClaimFlow.
         """
-        if not self._is_document_billing_question(question):
+        if intent is None and not self._is_document_billing_question(question):
             return None
         extraction_documents = {
             str(document.extraction_id): document.document_id
@@ -450,7 +458,7 @@ class MatterReviewService:
                 continue
             currency, fee_pool, rows, period = parsed
             instructions.append((page_sources, currency, fee_pool, rows, period))
-        intent = self._document_billing_intent(question)
+        intent = intent or self._document_billing_intent(question)
         # Multiple valid instructions could represent conflicting billing
         # agreements.  Refuse to choose between them automatically.  An
         # allocation request says so locally, as it does for an instruction
@@ -1191,6 +1199,13 @@ class MatterReviewService:
                 raise MatterReviewError("The earlier answer is unavailable. Ask this as a new question.")
             parent_question, parent_answer = job.question, job.answer
             parent_unknown, parent_documents, parent_matter = job.unknown, job.context_document_ids, job.matter_id
+            # Names an earlier billing answer flagged as conflicting, so "explain
+            # that discrepancy" can be resolved.  Only names: the figures are
+            # read again from the documents.
+            parent_subjects = [
+                str(check.get("participant") or "") for check in (job.billing or {}).get("crossChecks", [])  # type: ignore[union-attr]
+                if isinstance(check, Mapping) and check.get("status") == "conflict"
+            ]
         if parent_matter != scope.matter_id:
             raise MatterReviewError("The earlier answer belongs to another matter. Ask this as a new question.")
         if not parent_documents <= scope.document_ids:
@@ -1199,7 +1214,10 @@ class MatterReviewService:
                 "Ask it as a new question in this scope instead."
             )
         answer = parent_answer if parent_answer and not parent_unknown else _UNKNOWN_FOLLOW_UP_ANSWER
-        return {"question": parent_question[:600], "answer": answer[:1200]}, parent_documents
+        return {
+            "question": parent_question[:600], "answer": answer[:1200],
+            "subjects": "\n".join(dict.fromkeys(name for name in parent_subjects if name)),
+        }, parent_documents
 
     def _record_question_consent(
         self, question_id: str, scope: DocumentScope, transmitted: frozenset[str], provider: str,
@@ -1362,6 +1380,12 @@ class MatterReviewService:
         current_extractions = {str(document.extraction_id): document.document_id for document in documents}
         extraction_ids = list(current_extractions)
         intent = self._question_intent(question)
+        if intent.kind == INTENT_HOLDINGS_RECONSTRUCTION:
+            reconstruction = self._reconstruction_plan(documents, question, intent, follow_up)
+            if reconstruction is not None:
+                return reconstruction
+            # No subject with dated records in scope: answer it as before.
+            intent = self._question_intent(question, reconstruction=False)
         if intent.kind in {INTENT_INVENTORY, INTENT_RELATIONSHIP}:
             return self._inventory_plan(documents, intent)
         if intent.kind == INTENT_HOLDINGS_COMPARISON:
@@ -1845,13 +1869,87 @@ class MatterReviewService:
         }
 
     @classmethod
-    def _question_intent(cls, question: str) -> QuestionIntent:
+    def _question_intent(cls, question: str, *, reconstruction: bool = True) -> QuestionIntent:
         return classify_question(
             question,
             calculation=cls._is_document_billing_question(question),
             legal_status=cls._is_legal_status_question(question),
             change=cls._is_change_question(question),
+            reconstruction=reconstruction and is_holdings_reconstruction(question),
         )
+
+    def _reconstruction_plan(
+        self, documents: Sequence[ScopedDocument], question: str, intent: QuestionIntent,
+        follow_up: Mapping[str, str] | None,
+    ) -> Mapping[str, object] | None:
+        """Reconstruct each named subject's holding from the documents in scope, locally.
+
+        The subject comes from the question; a follow-up that only says "its
+        holdings" or "that discrepancy" borrows the names of the earlier
+        question or the earlier answer's flagged conflict.  Either way every
+        figure, date and citation is read again from the documents here.
+        """
+        scope_documents = [
+            BillingScopeDocument(
+                document.document_id, document.filename, str(document.extraction_id),
+                document.filename.rsplit(".", 1)[-1].casefold() in _SPREADSHEET_EXTENSIONS,
+            )
+            for document in documents if document.extraction_id is not None
+        ]
+        extraction_ids = [document.extraction_id for document in scope_documents]
+        notes: list[str] = []
+        with self._database.connection() as connection:
+            names, _missing = self._named_entities(connection, extraction_ids, question)
+            if not names and follow_up is not None:
+                names, _missing = self._named_entities(connection, extraction_ids, follow_up.get("question", ""))
+                names = names or [
+                    name for name in follow_up.get("subjects", "").split("\n")
+                    if name and DocumentSearchIndex.search(connection, extraction_ids, (name.casefold(),), per_document_limit=1, total_limit=1).hits
+                ]
+                if names:
+                    notes.append(
+                        "This follow-up was read as being about " + ", ".join(f"“{name}”" for name in names)
+                        + " from the earlier question and answer. The figures below were read again from the documents."
+                    )
+            evidence = [
+                found for found in (
+                    gather_holdings_evidence(connection, scope_documents, HoldingsSubject(name))
+                    for name in names[:MAX_RECONSTRUCTION_SUBJECTS]
+                ) if found.found
+            ]
+        if not evidence:
+            return None
+        if len(names) > MAX_RECONSTRUCTION_SUBJECTS:
+            notes.append(f"Only the first {MAX_RECONSTRUCTION_SUBJECTS} names in the question were reconstructed.")
+        billing = (
+            self._document_billing_answer(documents, question, intent="allocation")
+            if self._is_document_billing_question(question) else None
+        )
+        payload = billing.payload if billing is not None else None
+        dated = [date for date in question_dates(question) if date.year is not None]
+        comparison = (payload or {}).get("crossCheck") or {}
+        on_date = (
+            f"{dated[0].year:04d}-{dated[0].month:02d}-{dated[0].day:02d}" if dated
+            else str(comparison.get("comparisonDate") or "") or None  # type: ignore[union-attr]
+        )
+        isin = next((identifier for identifier in intent.identifiers if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", identifier)), None)
+        sections: list[str] = []
+        citations: list[tuple[str, str, str, str]] = []
+        billing_sources = {(citation[0], citation[2]): citation for citation in (billing.citations if billing else ())}
+        for found in evidence:
+            result = reconstruct_holdings(found, on_date, isin)
+            billing_lines, billing_cited = (
+                reconstruction_billing_effect(found.subject, result, payload) if self._is_document_billing_question(question)
+                else (None, [])
+            )
+            text, sources = reconstruction_text(found, result, billing_lines)
+            sections.append(f"{found.subject.label}\n\n{text}" if len(evidence) > 1 else text)
+            citations += [*sources, *(billing_sources[key] for key in billing_cited if key in billing_sources)]
+        citations = list(dict.fromkeys(citations))
+        return self._local_plan(LocalAnswer(
+            INTENT_HOLDINGS_RECONSTRUCTION, "\n\n".join(sections), tuple(citations), "local-holdings-reconstruction",
+            frozenset(citation[0] for citation in citations), any(found.truncated for found in evidence),
+        ), len(documents), notes=notes)
 
     def _inventory_plan(self, documents: Sequence[ScopedDocument], intent: QuestionIntent) -> Mapping[str, object]:
         """Answer a listing or relationship question from every eligible document, locally.

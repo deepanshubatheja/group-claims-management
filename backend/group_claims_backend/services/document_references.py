@@ -4,6 +4,14 @@ Question-level references only ever *narrow* the already-authorized scope.
 A date or type must be supported by stored metadata (the file name and
 format); nothing is guessed from content, and ambiguity is reported for the
 user to clarify instead of choosing a document.
+
+A date narrows the scope only when the question attaches it to a document
+("the spreadsheet dated March 28", "the March 28 and April 30 holdings
+spreadsheets").  A date the facts are asked about ("holdings as of
+28 February 2025") is not a document reference, and neither is a
+descriptive phrase such as "the opening statement" or "the transfer
+notice".  When a question also describes other documents, a dated
+reference is one document among several, not a restriction.
 """
 
 from __future__ import annotations
@@ -30,8 +38,22 @@ _FILENAME_DATES = (
     re.compile(r"(?<!\d)(?P<d>0[1-9]|[12]\d|3[01])[-_.](?P<m>0[1-9]|1[0-2])[-_.](?P<y>(?:19|20)\d{2})(?!\d)"),
 )
 _FILENAME = re.compile(r"[\w\-.()]+\.(?:xlsx|xls|csv|pdf)\b", re.IGNORECASE)
-_DOCUMENT_NOUN = re.compile(
-    r"\b(?:spreadsheets?|workbooks?|excel|xlsx|xls|csv|files?|documents?|statements?|reports?|pdfs?|sheets?|registers?)\b",
+_NOUN = r"(?:spreadsheets?|workbooks?|excel|xlsx|xls|csv|files?|documents?|statements?|reports?|pdfs?|sheets?|registers?)"
+# Words joining dates in one reference: "March 28 and April 30", "28.03.2023, 30.04.2023".
+_DATE_JOIN = re.compile(r"\s*(?:,|and|or|&|to|vs\.?|versus)?\s*(?:the\s+)?", re.IGNORECASE)
+# "<document> dated|from|of|for <date>" — the text just before the dates.
+_NOUN_BEFORE = re.compile(rf"\b{_NOUN}\s+(?:dated|from|of|for)\s+(?:the\s+)?$", re.IGNORECASE)
+# "<date> [up to two describing words] <document>" — the text just after the dates.
+_NOUN_AFTER = re.compile(
+    r"^(?:\s+(?!(?:using|use|with|from|in|by|per|to|of|for|and|or|the|a|an|its|their|this|that|these|those)\b)"
+    rf"[A-Za-z][\w\-]*){{0,2}}\s+{_NOUN}\b",
+    re.IGNORECASE,
+)
+# A date the facts are stated at, never a document's own date.
+_FACT_DATE_BEFORE = re.compile(r"\b(?:as\s+(?:of|at)|effective(?:\s+(?:as\s+of|from|on))?)\s+(?:the\s+)?$", re.IGNORECASE)
+# Nouns that describe another document ("the opening statement", "the transfer notice").
+_OTHER_DOCUMENT = re.compile(
+    r"\b(?:spreadsheets?|workbooks?|statements?|reports?|pdfs?|notices?|instructions?|letters?|confirmations?)\b",
     re.IGNORECASE,
 )
 _SPREADSHEET_NOUN = re.compile(r"\b(?:spreadsheets?|workbooks?|excel|xlsx|xls|csv|sheets?)\b", re.IGNORECASE)
@@ -80,12 +102,11 @@ class DocumentConstraint:
     problems: tuple[str, ...] = ()
 
 
-def question_dates(question: str) -> list[DateReference]:
-    dates: list[DateReference] = []
-    taken: list[tuple[int, int]] = []
+def _date_spans(question: str) -> list[tuple[int, int, DateReference]]:
+    spans: list[tuple[int, int, DateReference]] = []
     for pattern, numeric in _QUESTION_DATES:
         for match in pattern.finditer(question):
-            if any(start < match.end() and match.start() < end for start, end in taken):
+            if any(start < match.end() and match.start() < end for start, end, _date in spans):
                 continue
             try:
                 month = int(match.group("m")) if numeric else _MONTHS[match.group("mon").casefold()]
@@ -93,9 +114,43 @@ def question_dates(question: str) -> list[DateReference]:
             except (KeyError, ValueError):
                 continue
             if 1 <= month <= 12 and 1 <= day <= 31:
-                taken.append((match.start(), match.end()))
-                dates.append(DateReference(int(year) if year else None, month, day, match.group(0).strip()))
-    return sorted(dates, key=lambda date: question.find(date.text))
+                spans.append((match.start(), match.end(), DateReference(int(year) if year else None, month, day, match.group(0).strip())))
+    return sorted(spans, key=lambda span: span[0])
+
+
+def question_dates(question: str) -> list[DateReference]:
+    return [date for _start, _end, date in _date_spans(question)]
+
+
+def document_date_references(question: str) -> tuple[list[DateReference], list[tuple[int, int]]]:
+    """Dates the question attaches to a document, and the text spans of those references.
+
+    Adjacent dates joined by "and", "or" or a comma form one reference
+    ("the March 28 and April 30 holdings spreadsheets").  A group counts
+    only when a document noun directly precedes it with "dated", "from",
+    "of" or "for", or follows it within two describing words.  A group
+    introduced by "as of", "as at" or "effective" is a fact date.
+    """
+    groups: list[list[tuple[int, int, DateReference]]] = []
+    for span in _date_spans(question):
+        if groups and _DATE_JOIN.fullmatch(question[groups[-1][-1][1]:span[0]]):
+            groups[-1].append(span)
+        else:
+            groups.append([span])
+    dates: list[DateReference] = []
+    spans: list[tuple[int, int]] = []
+    for group in groups:
+        start, end = group[0][0], group[-1][1]
+        before, after = question[:start], question[end:]
+        if _FACT_DATE_BEFORE.search(before):
+            continue
+        preceding = _NOUN_BEFORE.search(before)
+        following = _NOUN_AFTER.match(after)
+        if preceding is None and following is None:
+            continue
+        dates.extend(date for _start, _end, date in group)
+        spans.append((preceding.start() if preceding else start, end + (following.end() if following else 0)))
+    return dates, spans
 
 
 def filename_dates(filename: str) -> list[tuple[int, int, int]]:
@@ -125,7 +180,17 @@ def resolve_document_references(question: str, documents: Sequence[CandidateDocu
     instead of being silently replaced by an in-scope document.
     """
     filenames = [match.group(0) for match in _FILENAME.finditer(question)]
-    dates = question_dates(question) if _DOCUMENT_NOUN.search(question) else []
+    dates, reference_spans = document_date_references(question)
+    if dates and not filenames:
+        # "Compare the 28 February statement with the transfer notice" names
+        # one document among others it only describes: that is a mention,
+        # not a request to use the dated document alone.
+        outside = "".join(
+            question[previous_end:start] + " "
+            for previous_end, start in zip([0, *(end for _start, end in reference_spans)], [start for start, _end in reference_spans] + [len(question)])
+        )
+        if _OTHER_DOCUMENT.search(outside):
+            dates = []
     if not filenames and not dates:
         return DocumentConstraint(False)
     resolved: list[ResolvedDocument] = []

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from group_claims_backend.services.ai import (
+    AICostControls,
     AIService,
     AIServiceError,
     MockAIProvider,
@@ -411,3 +412,24 @@ class AIConnectionStatusTests(unittest.TestCase):
                 ("legacy-check", "ai_connection_checked", "ai_provider", "openai", "user", "2026-10-15T00:00:00+00:00", '{\"outcome\":\"request_failed\"}'),
             )
         self.assertEqual(AIService(self.storage).status()["lastConnectionCheck"]["outcome"], "provider_error")
+
+
+class AICostControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._previous = os.environ.pop("GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS", None)
+
+    def tearDown(self) -> None:
+        os.environ.pop("GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS", None)
+        if self._previous is not None:
+            os.environ["GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS"] = self._previous
+
+    def test_codex_questions_get_a_larger_bounded_input_limit(self) -> None:
+        self.assertEqual(AICostControls.from_environment("gpt-4.1-mini", "openai").max_input_characters, 4_000)
+        self.assertEqual(AICostControls.from_environment(None, None).max_input_characters, 4_000)
+        self.assertEqual(AICostControls.from_environment(None, "codex").max_input_characters, 12_000)
+        # The explicit environment value still wins, within the same bounds.
+        os.environ["GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS"] = "6000"
+        self.assertEqual(AICostControls.from_environment(None, "codex").max_input_characters, 6_000)
+        os.environ["GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS"] = "20000"
+        with self.assertRaises(AIServiceError):
+            AICostControls.from_environment(None, "codex")

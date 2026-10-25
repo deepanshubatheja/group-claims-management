@@ -97,6 +97,7 @@ test("relationship and holdings labels never overstate the evidence", () => {
   assert.match(holdingStatusLabel("unit_mismatch"), /not compared/);
   assert.match(holdingStatusLabel("duplicate_rows"), /not summed/);
   assert.match(questionIntentLabel("holdings_comparison"), /calculated locally/);
+  assert.match(questionIntentLabel("holdings_reconstruction"), /reconstruction \(calculated locally\)/);
   assert.match(holdingStatusLabel("currency_mismatch"), /not compared/);
   assert.match(controlTotalLabel("formula_covers_records"), /exactly the record rows/);
 });

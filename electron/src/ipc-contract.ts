@@ -171,7 +171,7 @@ export interface MatterDocumentScope {
   resolvedDocuments: Array<{ documentId: string; filename: string; matchedBy: string }>;
   notes: string[];
 }
-export type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "change" | "legal_status" | "comparison" | "calculation" | "general";
+export type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "holdings_reconstruction" | "change" | "legal_status" | "comparison" | "calculation" | "general";
 export interface MatterRelationship { documentId: string; filename: string; subject: string; subjectRole: string; subjectReference: string; related: string; relatedRole: string; relatedReference: string; kind: "explicit_statement" | "explicit_heading" | "document_section" | "same_row"; basis: string; }
 export interface MatterHoldingSide { documentId: string; filename: string; sheet: string; row: number; rowReference: string | null; quantity: string | null; quantityReference: string | null; isinReference: string | null; accountReference: string | null; entityReferences: string[]; unit: string | null; unitReference: string | null; currency: string | null; currencyReference: string | null; rowDate: string | null; rowDateReference: string | null; cells: Array<{ heading: string; value: string; reference: string }>; }
 export interface MatterHoldingRow { entities: Array<{ kind: string; name: string }>; account: string | null; isin: string | null; currency: string | null; earlier: MatterHoldingSide | null; later: MatterHoldingSide | null; difference: string | null; status: "compared" | "only_earlier" | "only_later" | "duplicate_rows" | "unusable_quantity" | "unit_mismatch" | "currency_mismatch"; note: string | null; }

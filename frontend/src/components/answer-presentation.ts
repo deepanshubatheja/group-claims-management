@@ -122,6 +122,7 @@ export type AnswerView = {
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const TITLES: Record<MatterQuestionIntent, string> = {
   holdings_comparison: "Holdings comparison",
+  holdings_reconstruction: "Holdings reconstruction",
   inventory: "Entity listing",
   relationship: "Entity relationships",
   specific_lookup: "Account / ISIN lookup",

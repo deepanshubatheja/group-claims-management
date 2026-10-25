@@ -171,7 +171,7 @@ class AIAnalysisService:
             raise AIAnalysisError("STORAGE_UNAVAILABLE", "Local storage is unavailable.")
         self._database = storage.database
         self._configuration = AIConfiguration.from_environment()
-        self._cost_controls = AICostControls.from_environment(self._configuration.model)
+        self._cost_controls = AICostControls.from_environment(self._configuration.model, self._configuration.provider)
         self._provider_factory = provider_factory
         self._codex_manager = codex_manager
         self._threads: dict[str, threading.Thread] = {}
@@ -294,7 +294,7 @@ class AIAnalysisService:
             if self._codex_manager is not None and os.environ.get("GROUP_CLAIMS_AI_PROVIDER") == "codex"
             else False
         )
-        self._cost_controls = AICostControls.from_environment(self._configuration.model)
+        self._cost_controls = AICostControls.from_environment(self._configuration.model, self._configuration.provider)
 
     def job_status(self, params: object) -> Mapping[str, object]:
         job_id = self._job_id(params)

@@ -28,6 +28,10 @@ OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 OPENAI_MAX_ATTEMPTS = 1
 DEFAULT_MAX_ANALYSIS_CHUNKS = 1
 DEFAULT_MAX_INPUT_CHARACTERS = 4_000
+# Codex runs on the user's ChatGPT plan, so its requests carry no per-request
+# API charge; it gets the largest bounded question context by default.  The
+# environment value below still overrides either default within 500–12,000.
+CODEX_MAX_INPUT_CHARACTERS = 12_000
 DEFAULT_MAX_INPUT_TOKENS = 1_500
 # Strict structured proposals repeat provenance fields for every finding. The
 # former 300-token ceiling made valid small document analyses terminate before
@@ -136,12 +140,13 @@ class AICostControls:
     output_usd_per_million: Decimal | None
 
     @classmethod
-    def from_environment(cls, model: str | None) -> "AICostControls":
+    def from_environment(cls, model: str | None, provider: str | None = None) -> "AICostControls":
         max_chunks = _bounded_int(
             "GROUP_CLAIMS_AI_MAX_CHUNKS", DEFAULT_MAX_ANALYSIS_CHUNKS, 1, 8
         )
         max_input_characters = _bounded_int(
-            "GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS", DEFAULT_MAX_INPUT_CHARACTERS, 500, 12_000
+            "GROUP_CLAIMS_AI_MAX_INPUT_CHARACTERS",
+            CODEX_MAX_INPUT_CHARACTERS if provider == "codex" else DEFAULT_MAX_INPUT_CHARACTERS, 500, 12_000,
         )
         max_input_tokens = _bounded_int(
             "GROUP_CLAIMS_AI_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS, 200, 4_000

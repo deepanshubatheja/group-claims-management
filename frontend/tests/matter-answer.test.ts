@@ -456,3 +456,37 @@ test("a partial comparison never presents its totals as full holdings or as reco
   assert.match(body, /<li class="warning">“Zeta Growth Fund Z” does not appear under an entity heading in either spreadsheet\.<\/li>/);
   assert.doesNotMatch(body, /Recorded total/);
 });
+
+test("a holdings reconstruction keeps its all-document scope and separates facts, arithmetic, discrepancies and billing effect", () => {
+  const opening = "44444444-4444-4444-8444-444444444444";
+  const custodian = "55555555-5555-4555-8555-555555555555";
+  const answer = [
+    "The documents in scope do not agree on Horizon Credit Fund B (SF-B)'s holding in XS0123456789 as of 28 Feb 2025: they record 900,000 and 1,000,000 nominal.",
+    "Documented facts:\n- 31 Jan 2025 · holdings record: 800,000 nominal (01_opening_holdings_2025-01-31.xlsx, Holdings!G9)\n- 28 Feb 2025 · holding statement: 900,000 nominal (05_contradictory_custodian_statement_2025-02-28.pdf, page 1 block 2)",
+    "Derived arithmetic:\n- 800,000 (opening, 31 Jan 2025) + 200,000 (transfer in, 15 Feb 2025) = 1,000,000 nominal as of 28 Feb 2025.",
+    "Discrepancies:\n- Unresolved. No source was preferred because it was issued later, issued by a custodian, or agrees with the arithmetic.",
+    "Billing effect (provisional):\n- ClaimFlow used the instruction amount unchanged. It did not substitute another figure or recalculate.",
+  ].join("\n\n");
+  const input: AnswerInput = {
+    answer, unknown: false, intent: "holdings_reconstruction", model: "local-holdings-reconstruction",
+    documentScope: scope({ resolvedDocuments: [], documentsInScope: 7, searchableDocuments: 7, documentsWithEvidence: 6 }),
+    citations: [
+      citation(opening, "01_opening_holdings_2025-01-31.xlsx", "Holdings!G9", "800000"),
+      citation(custodian, "05_contradictory_custodian_statement_2025-02-28.pdf", "page 1 block 2", "900,000 nominal units"),
+    ],
+  };
+  const view = buildAnswerView(input);
+  assert.equal(view.layout, "prose");
+  assert.equal(view.title, "Holdings reconstruction");
+  assert.equal(view.method, "Provisional · answered locally");
+  assert.deepEqual(view.prose.filter((block) => block.kind === "paragraph").map((block) => block.kind === "paragraph" && block.text), [
+    answer.split("\n\n")[0], "Documented facts:", "Derived arithmetic:", "Discrepancies:", "Billing effect (provisional):",
+  ]);
+  assert.equal(view.prose.filter((block) => block.kind === "list").length, 4);
+  const markup = render(input);
+  assert.match(markup, /<h4>Holdings reconstruction<\/h4>/);
+  assert.match(markup, /All documents in this matter · 7 documents · evidence from 6/);
+  assert.doesNotMatch(markup, /narrowed by the question/);
+  assert.match(markup, /<li>800,000 \(opening, 31 Jan 2025\) \+ 200,000 \(transfer in, 15 Feb 2025\) = 1,000,000 nominal as of 28 Feb 2025\.<\/li>/);
+  assert.match(technicalDetails(markup), /Nothing \(answered from local data\)/);
+});

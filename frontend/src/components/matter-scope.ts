@@ -123,6 +123,7 @@ export function questionIntentLabel(intent: MatterQuestionIntent): string {
     relationship: "Entity relationship mapping (built locally)",
     specific_lookup: "Exact account/ISIN lookup",
     holdings_comparison: "Dated holdings comparison (calculated locally)",
+    holdings_reconstruction: "Dated holdings reconstruction (calculated locally)",
     change: "Document change or transfer analysis",
     legal_status: "Legal claim status",
     comparison: "Cross-document comparison",

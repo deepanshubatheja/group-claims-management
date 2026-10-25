@@ -32,6 +32,7 @@ INTENT_INVENTORY = "inventory"
 INTENT_RELATIONSHIP = "relationship"
 INTENT_LOOKUP = "specific_lookup"
 INTENT_HOLDINGS_COMPARISON = "holdings_comparison"
+INTENT_HOLDINGS_RECONSTRUCTION = "holdings_reconstruction"
 INTENT_CHANGE = "change"
 INTENT_LEGAL_STATUS = "legal_status"
 INTENT_COMPARISON = "comparison"
@@ -57,6 +58,13 @@ _QUANTITATIVE_CUE = re.compile(
     r"\b(?:compare|comparison|differences?|calculate|net change|quantity changes?|"
     r"quantit(?:y|ies) on (?:both|each)|quantit(?:y|ies) (?:at|for) (?:both|each))\b"
 )
+# "Reconstruct its holdings", "explain the discrepancy in Fund B's holdings",
+# "which sources conflict on the position": a dated roll-forward of one
+# subject's holdings across documents, not a two-spreadsheet comparison.
+_RECONSTRUCTION_CUE = re.compile(
+    r"\b(?:reconstruct\w*|roll(?:ed|ing|s)?[- ]?forward|discrepanc(?:y|ies)|conflict(?:s|ing)?|contradict\w*|inconsisten\w*)\b"
+)
+_RECONSTRUCTION_SUBJECT = re.compile(r"\b(?:holdings?|positions?|balances?|nominal|quantit(?:y|ies)|bestand)\b")
 # Caveats and negative instructions ("do not treat this as a legal
 # assignment") mention legal words without asking a legal question.
 _CAVEAT_NOUN = re.compile(r"\b(?:caveats?|disclaimers?|warnings?|limitations?)\b")
@@ -139,8 +147,20 @@ def primary_request_text(question: str) -> str:
     return " ".join(" ".join(kept).split())
 
 
+def is_holdings_reconstruction(question: str) -> bool:
+    """Whether the question asks to reconstruct or reconcile a holding across sources.
+
+    Only the affirmative request counts: "do not treat the conflict as …"
+    qualifies another question.  A billing word in the same question ("does
+    the discrepancy affect the billing calculation?") does not make it a
+    billing calculation.
+    """
+    primary = primary_request_text(question)
+    return bool(_RECONSTRUCTION_CUE.search(primary) and _RECONSTRUCTION_SUBJECT.search(primary))
+
+
 def classify_question(
-    question: str, *, calculation: bool, legal_status: bool, change: bool,
+    question: str, *, calculation: bool, legal_status: bool, change: bool, reconstruction: bool = False,
 ) -> QuestionIntent:
     """Choose one retrieval strategy, most specific rule first.
 
@@ -151,11 +171,15 @@ def classify_question(
     structured holdings, relationship and inventory rules.  An explicit
     quantitative holdings comparison ("compare … quantities …, calculate
     differences") is the primary operation even when the question also asks
-    about legal status; that part is answered as a separate caveat.
+    about legal status; that part is answered as a separate caveat.  A
+    holdings reconstruction comes first: its billing or legal wording asks
+    about the effect of a holdings discrepancy, not for a new calculation.
     """
     query = " ".join(question.casefold().split())
     roles, plural = _role_mentions(query)
     identifiers = lookup_identifiers(question)
+    if reconstruction:
+        return QuestionIntent(INTENT_HOLDINGS_RECONSTRUCTION, roles=roles, identifiers=identifiers)
     if calculation:
         return QuestionIntent(INTENT_CALCULATION)
     holdings_comparison = bool(_HOLDINGS_CUE.search(query) and (_COMPARISON_CUE.search(query) or _BETWEEN_CUE.search(query)))

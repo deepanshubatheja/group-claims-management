@@ -113,6 +113,7 @@ test("guards a dated holdings comparison", () => {
   assert.equal(isMatterHoldingsComparison({ ...comparison, caveats: [{ text: "x", sources: [{ documentId: first, filename: "01.xlsx" }] }] }), false);
   assert.equal(isMatterHoldingsComparison({ ...comparison, documents: [{ ...comparison.documents[0], tables: [{ ...table, controlTotal: { ...table.controlTotal, status: "ok" } }] }] }), false);
   assert.equal(isMatterQuestionIntent("holdings_comparison"), true);
+  assert.equal(isMatterQuestionIntent("holdings_reconstruction"), true);
   assert.equal(isMatterQuestionIntent("status"), false);
 });
 
