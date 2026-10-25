@@ -67,6 +67,9 @@ const GET_RECONCILIATION_CANDIDATES_CHANNEL = "reconciliation:get-candidates" as
 const CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:confirm-candidate" as const;
 const REJECT_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:reject-candidate" as const;
 const APPLY_RECONCILIATION_POLICY_CHANNEL = "reconciliation:apply-policy" as const;
+const GET_IDENTITY_QUESTIONS_CHANNEL = "reconciliation:get-identity-questions" as const;
+const RESOLVE_IDENTITY_QUESTION_CHANNEL = "reconciliation:resolve-identity-question" as const;
+const REREAD_DOCUMENTS_CHANNEL = "reconciliation:reread-documents" as const;
 const GET_BILLING_RULE_CANDIDATES_CHANNEL = "billing:get-rule-candidates" as const;
 const APPROVE_BILLING_RULE_CHANNEL = "billing:approve-rule" as const;
 const SAVE_BILLING_CALCULATION_CHANNEL = "billing:save-calculation" as const;
@@ -346,6 +349,16 @@ const desktopApi = Object.freeze({
   async applyReconciliationPolicy(candidateIds: string[]): Promise<ReconciliationWriteResponse> {
     if (!Array.isArray(candidateIds) || candidateIds.length < 1 || candidateIds.length > 100 || !candidateIds.every((id) => /^[a-f0-9-]{36}$/i.test(id))) throw new Error("Invalid candidate review list.");
     return Object.freeze(await ipcRenderer.invoke(APPLY_RECONCILIATION_POLICY_CHANNEL, { candidateIds: [...new Set(candidateIds)], policy: "reviewed_batch", acknowledged: true }) as ReconciliationWriteResponse);
+  },
+  async getIdentityQuestions(status?: "open" | "linked" | "distinct"): Promise<ReconciliationReadResponse> {
+    return Object.freeze(await ipcRenderer.invoke(GET_IDENTITY_QUESTIONS_CHANNEL, status ? { status } : {}) as ReconciliationReadResponse);
+  },
+  async resolveIdentityQuestion(questionId: string, decision: "same" | "distinct"): Promise<ReconciliationWriteResponse> {
+    if (!/^[a-f0-9-]{36}$/i.test(questionId) || (decision !== "same" && decision !== "distinct")) throw new Error("Invalid identity question answer.");
+    return Object.freeze(await ipcRenderer.invoke(RESOLVE_IDENTITY_QUESTION_CHANNEL, { questionId, decision, acknowledged: true }) as ReconciliationWriteResponse);
+  },
+  async rereadDocuments(): Promise<ReconciliationWriteResponse> {
+    return Object.freeze(await ipcRenderer.invoke(REREAD_DOCUMENTS_CHANNEL, { acknowledged: true }) as ReconciliationWriteResponse);
   },
   async getBillingRuleCandidates(status?: "candidate" | "approved"): Promise<BillingCalculationReadResponse> {
     return Object.freeze(await ipcRenderer.invoke(GET_BILLING_RULE_CANDIDATES_CHANNEL, status ? { status } : {}) as BillingCalculationReadResponse);

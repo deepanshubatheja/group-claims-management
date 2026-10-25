@@ -41,6 +41,8 @@ INTENT_GENERAL = "general"
 _ISIN = re.compile(r"\b[A-Z]{2}[A-Z0-9]{9}[0-9]\b")
 _NUMERIC_IDENTIFIER = re.compile(r"\b[A-Za-z]{0,4}[-/]?[0-9][0-9\-/.]{3,}[0-9A-Za-z]*\b")
 _QUOTED = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{3,80})[\"“”'‘’]")
+# Letter-prefixed account or claim codes such as "DEL-880" or "CR-2025-A".
+_CODE_IDENTIFIER = re.compile(r"\b[A-Z]{2,6}-[A-Z0-9]*\d[A-Z0-9-]*\b")
 _LIST_CUE = re.compile(r"\b(?:list|enumerate|inventory|all|every|each|name the|show me the)\b")
 _PLURAL_QUESTION_CUE = re.compile(r"\b(?:which|what|who)\b")
 _RELATIONSHIP_CUE = re.compile(
@@ -112,7 +114,7 @@ def _role_mentions(query: str) -> tuple[frozenset[str], bool]:
 def lookup_identifiers(question: str) -> tuple[str, ...]:
     """Literal identifiers (ISIN, account-like numbers, quoted names) in a question."""
     found: list[str] = []
-    for match in (*_ISIN.findall(question), *_QUOTED.findall(question), *_NUMERIC_IDENTIFIER.findall(question)):
+    for match in (*_ISIN.findall(question), *_QUOTED.findall(question), *_CODE_IDENTIFIER.findall(question), *_NUMERIC_IDENTIFIER.findall(question)):
         value = match.strip()
         if len(value) >= 4 and value.casefold() not in {item.casefold() for item in found}:
             found.append(value)
@@ -193,6 +195,21 @@ _LEADING_WORDS = frozenset({
 
 
 _PREFIX_ABBREVIATIONS = frozenset({"no", "nr", "st", "mr", "mrs", "ms", "dr", "mt", "ft"})
+
+
+_ROLE_WORDS = frozenset({"fund", "subfund", "sub-fund", "participant", "class", "series", "compartment", "portfolio"})
+
+
+def is_contextual_phrase(phrase: str) -> bool:
+    """A phrase that is not a literal document name.
+
+    "NOT APPROVED" is an instruction in capitals; "Fund B" or "Participant
+    A" is a role-and-marker label resolved against the matter's records.
+    """
+    words = phrase.split()
+    if len(words) >= 2 and all(word.isalpha() and word.isupper() and len(word) > 1 for word in words):
+        return True
+    return len(words) == 2 and words[0].casefold() in _ROLE_WORDS and re.fullmatch(r"[A-Z]|\d{1,2}|[IVX]{1,4}", words[1]) is not None
 
 
 def question_entity_names(question: str) -> list[tuple[str, ...]]:

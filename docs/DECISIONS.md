@@ -631,3 +631,250 @@ packaged builds. It does not copy an existing profile, and cloud-AI actions and
 credential management are disabled in this mode to prevent use or mutation of
 normal Keychain credentials or ChatGPT sessions during synthetic acceptance
 testing.
+
+## 2026-10-25 — Canonical identities with recorded aliases
+
+Each legal entity, investment vehicle/subfund, and account keeps one internal
+id; names and account references are aliases of that id, never the id itself.
+Every spelling a source document uses is stored in `identity_aliases` with its
+source document, document issue date, and origin (`observed` or
+`user_confirmed`). Existing names were backfilled as observed aliases.
+
+Matching is tiered. A name links automatically only when its normalized form
+(case, spacing, punctuation, and equivalent legal-form spellings such as
+Limited/Ltd or S.A./SA ignored; "II" equals "2") is already known for exactly
+one record. Account references link automatically only on an exact match after
+ignoring case and separators; they are never fuzzy-matched. A weaker match
+(same name apart from legal form, a close spelling, or a known account number
+with a differently named subfund or investor) raises a "same as?" question in
+the Issues queue and blocks confirmation of the affected candidates. Names
+whose series numbers or single-letter markers differ ("Fund A" vs "Fund B")
+are never suggested as matches.
+
+The user's answer is audited and remembered: "same" stores the spelling as a
+user-confirmed alias so later documents link without asking; "distinct"
+prevents the same suggestion recurring. Answers change only future
+resolution; nothing is merged retroactively. A known account attributed to a
+different existing record is an `account_identity_conflict` issue, not a
+question. No merge, rename, or alias-removal workflow exists yet.
+
+## 2026-10-25 — Deterministic PDF extraction across varied wording
+
+PDF holdings, securities transfers, and claim-right assignments are read by
+`services/pdf_fields.py` instead of one fixed sentence per record type. Two
+layouts are understood: labelled fields (synonyms such as "Value date",
+"Debit account", "Account No", "Claim ref", "As at"), forming at most one
+record per page; and prose sentences located by meaning words (transfer /
+deliver / debit-credit, assign + claim, holds / holding / position), one
+record per sentence. No AI is used on this path.
+
+The extractor is conservative: sentences containing a negation are ignored;
+numeric dates whose day and month could be swapped (03/04/2025) and amounts
+such as "200.000" are refused; a labelled field with two different values on
+one page is unusable; and a record missing any required field is not staged.
+Every value is still checked against the stored source text, with dates and
+amounts matched by parsing so any accepted format can be verified. Source
+references now name only the blocks supporting each record plus the issue
+date's block.
+
+Investor and subfund may be absent from a holding or transfer. They are then
+taken from an already-known account at confirmation; an unknown account
+without both is held as `account_details_incomplete` in the issue queue
+rather than created from guesses. Multi-row PDF tables and scanned (image)
+PDFs are not yet read; documents imported before this change are not
+re-read automatically.
+
+## 2026-10-25 — Explicit re-read of imported documents
+
+Holdings & History offers "Re-read documents", which re-runs record
+extraction over each imported PDF/spreadsheet's existing parsed text with the
+current reading rules (the vault copy is not re-parsed and AI is not used).
+It requires explicit acknowledgement, stages new candidates for review only,
+and is audited with its counts. It never confirms, deletes, or changes earlier
+candidates; a rejected candidate stays rejected. A record identical to one
+already staged from the same document and origin is not staged again, even
+when the reading rules now cite different source blocks. One run covers at
+most the first 500 imported documents by import time.
+
+## 2026-10-25 — Holdings tables in PDFs
+
+`services/pdf_fields.py` rebuilds holdings tables from the stored PDF block
+positions. A header row must name at least an account and a nominal/quantity
+column plus one more known column (subfund, investor, ISIN, as-of date); each
+following row becomes one holding candidate. Two layouts are handled: a short
+block per row whose lines are cells (matched to the header by order), and one
+block per cell (grouped by baseline and matched to header columns by
+horizontal position, which tolerates empty cells). A missing ISIN or as-of
+column falls back to the page's labelled value.
+
+A row that cannot be lined up with its header (for example a cell wrapped
+onto two lines in the per-row layout) or lacks a valid account, ISIN, date,
+or single positive amount is skipped. When the table has a "Total" line, the
+rows are staged only if none were skipped and their sum equals the total;
+otherwise the whole table is refused, so a partly read table never looks
+complete. Table blocks are excluded from label and prose reading. Tables that
+continue onto a page without a repeated header, and scanned PDFs, are not
+read.
+
+## 2026-10-25 — Entity linkage and historical reconstruction from structured records
+
+Investigation of acceptance Case 01 showed the failures came from extraction
+(spreadsheet headings and documents without an issue date produced no
+holdings; alias statements were never read), entity resolution (no records
+to link; a fund name could merge funds of different investors), retrieval
+(Matter Review re-derived facts from keyword-ranked raw text) and routing
+(reconstruction and transfer requests were detected by exact phrases).
+
+Decisions:
+- Spreadsheet and PDF-table holdings share one column vocabulary; the
+  investor may be a column. A document that states no issue date is staged
+  with an empty issue date ("not stated"); it is never replaced by the as-of,
+  effective or import date.
+- A PDF's explicit alias statement ("'X' and 'Y' identify the same subfund as
+  'Z' for account A") is kept in `identity_alias_evidence` with its source
+  block. It links a name to a fund only when the stated account equals the
+  record's account, the canonical name already belongs to that account's
+  fund, and no statement attaches the alias to another account. Name
+  similarity alone never links; without such a statement the user is asked.
+- A fund name is matched only among the same investor's funds (or
+  unattached ones), so equal names held by different investors stay
+  separate. "<investor> - <fund>" is read as that investor's fund name.
+  Account-renumbering wording and negated sentences are never transfers.
+  Account migration is not yet stored as a dated relationship.
+- Matter Review answers "which names are the same fund" locally from
+  extracted account identifiers and alias statements, with a citation per
+  name and statement. Reconstruction requests are detected by meaning and
+  receive every extracted holding, transfer and alias statement as single
+  cell/block citations plus a locally calculated, labelled timeline
+  (documented / inferred / conflicting); that timeline is also the cited
+  fallback when the provider returns no supported answer. Records awaiting
+  review are included and labelled; rejected records are not.
+
+## 2026-10-25 — Re-reading on rule changes, superseded readings, and question scope
+
+Case 01 investigation on the user's workspace showed documents imported
+before the spreadsheet and alias rules existed were never read again, so
+holdings and aliases were absent; a manual re-read then kept the older
+transfer reading beside the newer one, double-counting it; and a question
+about one matter's funds and dates drew in other matters in the same
+workspace, exhausting the citation budget.
+
+- `READING_RULES_VERSION` labels the deterministic reading rules. Each read
+  is recorded in `reconciliation_document_reads`; at backend start, one
+  background pass reads again every document not yet read with the current
+  version. It only stages candidates for review and is audited.
+- A read supersedes the document's unconfirmed deterministic candidates it no
+  longer produces (`reconciliation_candidate_supersessions`). Superseded
+  candidates are kept, leave the review queue, and cannot be confirmed.
+  Confirmed, rejected and AI-origin candidates are never superseded.
+- Structured evidence counts a repeated holding, transfer or alias once.
+- Reconstruction and identity questions are scoped to the question's date
+  range (a date without a year takes its neighbour's year; each account's
+  latest earlier holding is its opening balance) and to fund or account
+  names written in the question (capitalised words and identifiers only).
+  Documents with no in-scope record and no mention of an in-scope account,
+  fund or investor are left out of the request and listed in a note.
+- Structured facts take the bounded citation slots first. An answer never
+  shows a placeholder: a step whose source did not fit is left out and the
+  answer says how many steps were left out.
+- The workspace still has a single matter; cases that should be separate
+  matters are isolated per question by date and name scope, not by a
+  matter boundary.
+
+## 2026-10-25 — Documented account migrations
+
+Root cause of the Cedar failure: the account-migration notice was parsed and
+its text stored, but no reader recognised migration wording (it was only
+excluded from transfer reading), so nothing was persisted and Matter Review,
+which grouped funds by account, showed CED-700 and CED-701 as two funds.
+Separately, a new account with an existing fund's name and investor would
+have been attached to that fund by name alone.
+
+- PDF statements such as "Custody account X was replaced by Y", "X was
+  migrated to Y", "migration from X to Y" or "Y replaces account X" are kept
+  in `account_migration_evidence` with their source block, effective date
+  (sentence or "Effective date" label), and any stated investor and fund.
+  Negated sentences and matches without account wording are ignored.
+- A new account joins its predecessor's fund (same canonical fund id) only
+  when such a statement exists, the predecessor account is known, and any
+  stated investor and fund belong to it; the change is recorded in
+  `account_relationships` (both account records keep their identifiers).
+  Without a statement, a new account using an existing fund's name and
+  investor raises an "account belongs to that fund?" question; "same" links
+  it without merging account identifiers, "distinct" creates a separate fund.
+- A migration moves no securities. Transfer balance checks use the
+  predecessor's holdings dated up to the migration's effective date.
+- Matter Review groups accounts into funds through documented migrations and
+  confirmed fund records, explains a name shared by separate funds (citing
+  each investor cell and any "does not relate to" statement), and carries a
+  balance across a migration as an inferred step. A single question date
+  means "as of" that date, using all earlier history.
+- Not yet done: the Holdings & History per-account timeline does not carry
+  balances across a migration.
+
+## 2026-10-25 — Follow-up questions within the request budget
+
+A follow-up's earlier question and answer are context, never evidence. They
+are now sized to the request budget after reserving
+`FOLLOW_UP_EVIDENCE_RESERVE_CHARACTERS` for cited evidence: citation markers
+and fixed explanatory sentences of local answers are removed, the earlier
+answer is shortened or left out (with a note in the plan), and only then is
+evidence selected. Identity follow-ups ("why must X remain separate?") use the
+local identity answer, which keeps funds sharing a name with the named one.
+Ordinary questions that name a recorded account or fund lead with that
+account's cited structured facts, facts dated on a day the question names
+first. Letter-prefixed codes such as "DEL-880" count as question identifiers.
+
+## 2026-10-25 — Holdings-conflict questions
+
+Conflicting holdings were already persisted at import
+(`reconciliation_holding_conflicts` with an open issue), but Matter Review
+classified "identify all conflicting holdings records…" as a two-spreadsheet
+comparison and "which position should we trust?" as a generic change
+question, so neither read those records.
+
+- Conflict questions (conflict/discrepancy/dispute wording about holdings,
+  positions or values) and trust questions ("which position should we
+  trust?", also as a follow-up to a conflict question) are answered locally
+  from the competing extracted records when the question is not a
+  cross-document reconstruction. Genuine dated spreadsheet comparisons keep
+  their own workflow.
+- Competing values are grouped by fund, security and as-of date; accounts
+  linked by a documented migration count as one position, other accounts
+  never conflict with each other. Every value keeps its own citation; the
+  difference is exact. Status comes from the persisted conflict record.
+- An assessment rebuilds the expected balance from the latest earlier
+  documented holding, documented migrations and transfers (each cited). A
+  value matching it is described as better supported, never as resolved; the
+  other value is not overridden and the conflict stays unresolved. Missing or
+  same-day evidence is stated instead of an assessment.
+
+## 2026-10-25 — Claim assignments, approved billing, scenarios and invoice recipients
+
+Case 3 investigation: the claim assignment, holdings and transfer were
+persisted, but Matter Review answered the assignment question by keyword
+retrieval; both billing-instruction parsers accepted only the earlier
+fixture's layout, so the approved instruction was never staged or used; the
+name check rejected "Fund B" and "NOT APPROVED" as missing document names;
+and invoice-recipient questions fell to generic retrieval.
+
+- `services/billing_instruction.py` reads an approved pro-rata instruction in
+  any layout (approval, currency fee pool, pro-rata rule, billing period,
+  participants with positive bases, exclusions with their stated reasons,
+  invoice statements), keeping each fact's block. The established parser is
+  tried first. `BillingService.generate` stages such an instruction as a
+  billing-rule candidate (never approved automatically); re-reads include it.
+- A role-and-marker participant label ("Participant A", "Fund B") maps to a
+  fund only when exactly one fund of the approving investor carries that
+  series marker; otherwise it stays unlinked. Participant references match
+  subfund names as whole words only.
+- Matter Review answers locally, with block/cell citations: claim
+  assignments (assignor, assignee, claim, share, effective date, issue date,
+  stated scope, whether securities moved, with a legal qualification);
+  approved allocations (exact cents, exclusions, totals, approval status in
+  ClaimFlow); hypothetical scenarios (labelled NOT APPROVED, read-only,
+  shown beside the approved amounts); and invoice recipients (what the
+  documents and records do and do not establish). Holdings-comparison and
+  holdings-movement questions keep their established routes.
+- Instructions in capitals and contextual labels are not treated as missing
+  document names.

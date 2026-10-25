@@ -202,8 +202,13 @@ class StorageTestCase(unittest.TestCase):
             column_names = {
                 row["name"] for row in connection.execute("PRAGMA table_info(investment_vehicles)")
             }
+            alias = connection.execute(
+                "SELECT normalized_alias, origin FROM identity_aliases WHERE target_type = 'legal_entity' AND target_id = ?",
+                ("legacy-entity",),
+            ).fetchone()
         self.assertEqual(entity["display_name"], "Legacy Entity")
         self.assertIn("vehicle_type", column_names)
+        self.assertEqual((alias["normalized_alias"], alias["origin"]), ("legacy entity", "observed"))
 
     def test_corrupt_database_is_not_replaced(self) -> None:
         corrupt_root = Path(self.temporary_directory.name) / "corrupt-app-data"

@@ -750,6 +750,193 @@ def _migration_016_link_invoice_lines_to_calculation_allocations(connection: sql
     )
 
 
+def _migration_017_add_identity_aliases(connection: sqlite3.Connection) -> None:
+    """Give each party, subfund, and account one id with recorded aliases.
+
+    Existing names and account references are backfilled as observed aliases
+    so records confirmed before this version keep resolving.  Questions record
+    the user's "same as?" answers, including "distinct", so they are not asked
+    again.  Normalization rules live in ``services.identity``; a later change
+    to those rules needs its own migration to re-normalize stored aliases.
+    """
+    from ..services.identity import normalize_alias
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_aliases (
+            id TEXT PRIMARY KEY,
+            target_type TEXT NOT NULL CHECK (target_type IN ('legal_entity','investment_vehicle','account')),
+            target_id TEXT NOT NULL,
+            alias_text TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            origin TEXT NOT NULL CHECK (origin IN ('observed','user_confirmed')),
+            source_document_id TEXT REFERENCES source_documents(id) ON DELETE RESTRICT,
+            first_seen_on TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (target_type, target_id, alias_text)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_alias_lookup ON identity_aliases(target_type, normalized_alias)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_link_questions (
+            id TEXT PRIMARY KEY,
+            target_type TEXT NOT NULL CHECK (target_type IN ('legal_entity','investment_vehicle','account')),
+            observed_text TEXT NOT NULL,
+            normalized_observed TEXT NOT NULL,
+            suggested_target_id TEXT NOT NULL,
+            match_basis TEXT NOT NULL,
+            candidate_id TEXT NOT NULL REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL CHECK (status IN ('open','linked','distinct')),
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE (target_type, normalized_observed, suggested_target_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_question_status ON identity_link_questions(status, created_at)"
+    )
+    now = _utc_timestamp()
+    existing = (
+        ("legal_entity", "SELECT id, display_name AS alias, NULL AS source_document_id FROM legal_entities"),
+        ("investment_vehicle", "SELECT id, name AS alias, NULL AS source_document_id FROM investment_vehicles"),
+        ("account", "SELECT id, external_reference AS alias, NULL AS source_document_id FROM accounts WHERE external_reference IS NOT NULL"),
+    )
+    for target_type, query in existing:
+        for row in connection.execute(query).fetchall():
+            alias = str(row["alias"]).strip()
+            normalized = normalize_alias(target_type, alias)
+            if alias and normalized:
+                connection.execute(
+                    "INSERT OR IGNORE INTO identity_aliases (id, target_type, target_id, alias_text, normalized_alias, origin, source_document_id, first_seen_on, created_at) "
+                    "VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, 'observed', NULL, NULL, ?)",
+                    (target_type, row["id"], alias, normalized, now),
+                )
+
+
+def _migration_018_add_identity_alias_evidence(connection: sqlite3.Connection) -> None:
+    """Keep documents' explicit alias statements as source-linked evidence.
+
+    A statement such as "'X' identifies the same subfund as 'Y' for account
+    A" is evidence, not a merge.  Resolution applies it only when the stated
+    account matches the record being linked; statements are never deleted.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_alias_evidence (
+            id TEXT PRIMARY KEY,
+            target_type TEXT NOT NULL CHECK (target_type IN ('legal_entity','investment_vehicle')),
+            alias_text TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            canonical_text TEXT NOT NULL,
+            normalized_canonical TEXT NOT NULL,
+            account_reference TEXT,
+            normalized_account TEXT,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            source_reference TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            document_issue_date TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (source_document_id, target_type, normalized_alias, normalized_canonical, normalized_account)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_alias_evidence_lookup ON identity_alias_evidence(target_type, normalized_alias)"
+    )
+
+
+def _migration_019_add_reading_versions(connection: sqlite3.Connection) -> None:
+    """Record which reading rules produced each document's candidates.
+
+    When the rules improve, a document is read again and an unconfirmed
+    candidate that the current rules no longer produce is marked superseded
+    here.  Nothing is deleted; confirmed and rejected candidates are never
+    superseded, and a supersession keeps its reason and time.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_document_reads (
+            id TEXT PRIMARY KEY,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            rules_version TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+            read_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_reads_version ON reconciliation_document_reads(source_document_id, extraction_id, rules_version)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_candidate_supersessions (
+            candidate_id TEXT PRIMARY KEY REFERENCES reconciliation_candidates(id) ON DELETE RESTRICT,
+            read_id TEXT NOT NULL REFERENCES reconciliation_document_reads(id) ON DELETE RESTRICT,
+            rules_version TEXT NOT NULL,
+            superseded_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _migration_020_add_account_migrations(connection: sqlite3.Connection) -> None:
+    """Documented custody-account changes as source-linked, dated relationships.
+
+    ``account_migration_evidence`` keeps each document statement ("account X
+    was replaced by Y") with its source block.  ``account_relationships``
+    records an applied migration between two account records, both of which
+    keep their identifiers; the fund identity is shared, not re-created.  A
+    migration moves no securities and is never inferred from names alone.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_migration_evidence (
+            id TEXT PRIMARY KEY,
+            old_account_reference TEXT NOT NULL,
+            normalized_old_account TEXT NOT NULL,
+            new_account_reference TEXT NOT NULL,
+            normalized_new_account TEXT NOT NULL,
+            effective_date TEXT,
+            investor_text TEXT,
+            fund_text TEXT,
+            source_document_id TEXT NOT NULL REFERENCES source_documents(id) ON DELETE RESTRICT,
+            extraction_id TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE RESTRICT,
+            source_reference TEXT NOT NULL,
+            evidence_snippet TEXT NOT NULL,
+            document_issue_date TEXT,
+            created_at TEXT NOT NULL,
+            CHECK (normalized_old_account <> normalized_new_account)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_migration_new ON account_migration_evidence(normalized_new_account)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_relationships (
+            id TEXT PRIMARY KEY,
+            relationship_type TEXT NOT NULL CHECK (relationship_type IN ('account_migration')),
+            from_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            to_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            effective_date TEXT,
+            evidence_id TEXT NOT NULL REFERENCES account_migration_evidence(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            UNIQUE (relationship_type, from_account_id, to_account_id),
+            CHECK (from_account_id <> to_account_id)
+        )
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, _migration_001_initial_schema),
     Migration(2, _migration_002_add_investment_vehicle_type),
@@ -767,6 +954,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(14, _migration_014_add_evidence_backed_billing),
     Migration(15, _migration_015_add_provisional_holding_conflicts),
     Migration(16, _migration_016_link_invoice_lines_to_calculation_allocations),
+    Migration(17, _migration_017_add_identity_aliases),
+    Migration(18, _migration_018_add_identity_alias_evidence),
+    Migration(19, _migration_019_add_reading_versions),
+    Migration(20, _migration_020_add_account_migrations),
 )
 
 

@@ -68,7 +68,7 @@ export function isMatterDocumentScope(value: unknown): value is MatterDocumentSc
     && Array.isArray(value.notes) && value.notes.every((note) => typeof note === "string");
 }
 
-const INTENTS = new Set(["inventory", "relationship", "specific_lookup", "holdings_comparison", "historical_reconstruction", "change", "legal_status", "comparison", "calculation", "general"]);
+const INTENTS = new Set(["inventory", "relationship", "specific_lookup", "holdings_comparison", "historical_reconstruction", "identity_resolution", "holdings_conflict", "change", "legal_status", "comparison", "calculation", "general"]);
 const RELATION_KINDS = new Set(["explicit_statement", "explicit_heading", "document_section", "same_row"]);
 const HOLDING_STATUSES = new Set(["compared", "only_earlier", "only_later", "duplicate_rows", "unusable_quantity", "unit_mismatch", "currency_mismatch"]);
 const CONTROL_TOTAL_STATUSES = new Set(["formula_covers_records", "matches", "differs", "not_verified"]);

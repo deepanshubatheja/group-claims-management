@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import sys
 from typing import BinaryIO
 
@@ -16,6 +17,21 @@ from .services.matter_review import MatterReviewError, MatterReviewService
 from .services.reconciliation import ReconciliationError, ReconciliationService
 from .services.billing import BillingError, BillingService
 from .storage.service import StorageService
+
+
+def _start_stale_reread(reconciliation: ReconciliationService) -> None:
+    """Read imported documents again when the reading rules have changed.
+
+    Runs once in the background so startup and requests are not delayed.  It
+    only stages candidates for review; failures are logged without content.
+    """
+    def run() -> None:
+        try:
+            reconciliation.reread_stale()
+        except Exception:
+            logging.getLogger(__name__).exception("Background re-read of imported documents failed.")
+
+    threading.Thread(target=run, name="claimflow-stale-reread", daemon=True).start()
 
 
 def configure_logging() -> None:
@@ -52,6 +68,7 @@ def main(
         matter_review = MatterReviewService(storage, analysis)
         reconciliation = ReconciliationService(storage)
         billing = BillingService(storage)
+        _start_stale_reread(reconciliation)
         commands = {
             "health.check": no_params(get_health_status), "storage.status": no_params(storage.status),
             "documents.import": lambda params: documents.import_authorized_paths(params.get("paths")),
@@ -98,6 +115,9 @@ def main(
             "reconciliation.claim_assignment_history": reconciliation.claim_assignment_history,
             "reconciliation.open_discrepancies": reconciliation.open_discrepancies,
             "reconciliation.result": reconciliation.reconciliation_result,
+            "reconciliation.identity_questions": reconciliation.identity_questions,
+            "reconciliation.resolve_identity_question": reconciliation.resolve_identity_question,
+            "reconciliation.reread_documents": reconciliation.reread_documents,
             "billing.generate": billing.generate,
             "billing.candidate": billing.candidate,
             "billing.candidates": billing.candidates,

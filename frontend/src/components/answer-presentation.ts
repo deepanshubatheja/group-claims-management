@@ -91,6 +91,8 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 const TITLES: Record<MatterQuestionIntent, string> = {
   holdings_comparison: "Holdings comparison",
   historical_reconstruction: "Historical holdings reconstruction",
+  identity_resolution: "Fund names and accounts",
+  holdings_conflict: "Conflicting holdings records",
   inventory: "Entity listing",
   relationship: "Entity relationships",
   specific_lookup: "Account / ISIN lookup",

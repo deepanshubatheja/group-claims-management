@@ -53,6 +53,9 @@ class BillingService:
                 return {"documentId": document_id, "generated": 0, "candidates": []}
             source = sources[0]
             parsed = self._parse_instruction("\n".join(str(item["text"]) for item in sources))
+            reference = "; ".join(str(item["source_reference"]) for item in sources)
+            if parsed is None:
+                parsed, reference = self._parse_general_instruction(sources)
             if parsed is None:
                 return {"documentId": document_id, "generated": 0, "candidates": []}
             payload = parsed
@@ -60,7 +63,7 @@ class BillingService:
             digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
             row = connection.execute(
                 "SELECT id FROM billing_rule_candidates WHERE source_document_id = ? AND source_reference = ? AND payload_sha256 = ?",
-                (document_id, "; ".join(str(item["source_reference"]) for item in sources), digest),
+                (document_id, reference, digest),
             ).fetchone()
             now = self._now()
             candidate_id = str(row["id"]) if row else str(uuid.uuid4())
@@ -69,7 +72,7 @@ class BillingService:
                     "INSERT INTO billing_rule_candidates "
                     "(id,lifecycle_status,source_document_id,extraction_id,parser_version,source_reference,evidence_snippet,document_issue_date,origin,payload_json,payload_sha256,created_at,approved_at) "
                     "VALUES (?, 'candidate', ?, ?, ?, ?, ?, ?, 'deterministic', ?, ?, ?, NULL)",
-                    (candidate_id, document_id, source["extraction_id"], source["parser_version"], "; ".join(str(item["source_reference"]) for item in sources),
+                    (candidate_id, document_id, source["extraction_id"], source["parser_version"], reference,
                      self._snippet("\n".join(str(item["text"]) for item in sources)), payload["documentIssueDate"], payload_json, digest, now),
                 )
                 self._audit(connection, "billing_rule_candidate_staged", "billing_rule_candidate", candidate_id, "system", now, {
@@ -282,7 +285,7 @@ class BillingService:
             key, label, status = raw.get("key"), raw.get("label"), raw.get("status")
             if not isinstance(key, str) or not isinstance(label, str) or status not in {"eligible", "excluded"}:
                 raise BillingError("INVALID_BILLING_RULE", "The approved billing participant is invalid.")
-            holding_ids, issues = self._participant_records(connection, str(raw.get("name", label)), str(raw.get("subfundReference", "")), selected_date)
+            holding_ids, issues = self._participant_records(connection, str(raw.get("name", label)), str(raw.get("subfundReference", "")), selected_date, rule.get("approvedBy"))
             related_issues.extend(issues)
             allocation: dict[str, object] = {
                 "participantKey": key, "participantLabel": label, "subfundReference": raw.get("subfundReference"),
@@ -527,10 +530,11 @@ class BillingService:
     def _recipient_label(names: set[str]) -> str | None:
         return next(iter(names)) if len(names) == 1 else None
 
-    def _participant_records(self, connection: sqlite3.Connection, name: str, reference: str, as_of_date: object) -> tuple[list[str], list[Mapping[str, object]]]:
+    def _participant_records(self, connection: sqlite3.Connection, name: str, reference: str, as_of_date: object, approved_by: object = None) -> tuple[list[str], list[Mapping[str, object]]]:
         # Match only a documented vehicle name, not a loose inference from a
         # claimant or assignment.  The billing rule's own explicit basis still
         # controls the allocation when a linked holding is disputed.
+        name = self._contextual_vehicle_name(connection, name, approved_by) or name
         rows = connection.execute(
             "SELECT h.id, h.position_date, h.quantity, h.source_document_id, v.name FROM holding_positions h "
             "JOIN accounts a ON a.id = h.account_id JOIN investment_vehicles v ON v.id = a.investment_vehicle_id "
@@ -546,7 +550,7 @@ class BillingService:
         ).fetchall()
         for item in candidates:
             payload = self._json(str(item["payload_json"]))
-            if payload.get("subfund") == name or (reference and reference in str(payload.get("subfund", ""))):
+            if payload.get("subfund") == name or self._reference_names(reference, payload.get("subfund")):
                 issues.append({"id": str(item["id"]), "reason": str(item["reason"]), "sourceDocumentId": str(item["source_document_id"]), "sourceReference": str(item["source_reference"])})
         conflicts = connection.execute(
             "SELECT DISTINCT i.id, i.reason, link.source_document_id, link.source_reference, candidate.payload_json "
@@ -558,9 +562,34 @@ class BillingService:
         ).fetchall()
         for item in conflicts:
             payload = self._json(str(item["payload_json"]))
-            if payload.get("subfund") == name or (reference and reference in str(payload.get("subfund", ""))):
+            if payload.get("subfund") == name or self._reference_names(reference, payload.get("subfund")):
                 issues.append({"id": str(item["id"]), "reason": str(item["reason"]), "sourceDocumentId": str(item["source_document_id"]), "sourceReference": str(item["source_reference"])})
         return record_ids, issues
+
+    @staticmethod
+    def _reference_names(reference: str, subfund: object) -> bool:
+        """Whether a participant reference such as "SF-A" names this subfund (whole words only)."""
+        return bool(reference) and len(reference) > 1 and isinstance(subfund, str) and re.search(rf"(?<![\w-]){re.escape(reference)}(?![\w-])", subfund) is not None
+
+    @staticmethod
+    def _contextual_vehicle_name(connection: sqlite3.Connection, label: str, approved_by: object) -> str | None:
+        """The one fund a role-and-marker label names among the approving investor's funds."""
+        from .billing_instruction import is_generic_label, participant_marker
+        from .identity import normalize_name
+
+        if not is_generic_label(label) or not isinstance(approved_by, str) or not approved_by.strip():
+            return None
+        if connection.execute("SELECT 1 FROM investment_vehicles WHERE name = ?", (label,)).fetchone() is not None:
+            return None
+        hint, marker = normalize_name(approved_by), participant_marker(label)
+        names = {
+            str(row["name"]) for row in connection.execute(
+                "SELECT DISTINCT v.name, e.display_name FROM investment_vehicles v JOIN accounts a ON a.investment_vehicle_id = v.id "
+                "JOIN investors i ON i.id = a.investor_id JOIN legal_entities e ON e.id = i.legal_entity_id"
+            )
+            if normalize_name(str(row["display_name"])) in hint and participant_marker(str(row["name"])) == marker
+        }
+        return next(iter(names)) if len(names) == 1 else None
 
     # Parsing and serialization ------------------------------------------
 
@@ -614,6 +643,47 @@ class BillingService:
         return {"documentIssueDate": issue_date, "periodStart": period_start, "periodEnd": period_end, "allocationDate": None,
                 "allocationDateRequired": False, "allocationDateRule": "explicit approved eligible nominal amounts for the stated billing period",
                 "feePool": BillingService._string(fee_pool, 2), "currency": pool.group(1), "methodology": "eligible nominal amount / total eligible nominal amount", "rounding": "currency rounding reconciles allocations to fee pool", "participants": participants}
+
+    @staticmethod
+    def _parse_general_instruction(sources: Sequence[sqlite3.Row]) -> tuple[dict[str, object] | None, str]:
+        """Stage an approved instruction in any layout (see ``billing_instruction``).
+
+        Participants keep the instruction's own labels; ``subfundReference``
+        carries a label's series marker, used later to link it to a fund of
+        the approving investor.  The source reference lists the cited blocks.
+        """
+        from .billing_instruction import parse_billing_instruction, participant_marker
+
+        by_page: dict[int, list[tuple[int, str]]] = {}
+        for item in sources:
+            by_page.setdefault(int(item["page_number"]), []).append((int(item["block_index"]), str(item["text"])))
+        parsed = [(page, instruction) for page, blocks in by_page.items() if (instruction := parse_billing_instruction(blocks)) is not None]
+        if len(parsed) != 1:
+            return None, ""
+        page, instruction = parsed[0]
+        participants: list[dict[str, object]] = []
+        for index, participant in enumerate(instruction.participants, start=1):
+            participants.append({
+                "key": f"participant-{index}", "name": participant.label, "label": participant.label,
+                "subfundReference": participant.reference or participant_marker(participant.label) or "",
+                "eligibleBasis": BillingService._string(participant.basis), "status": "eligible", "reason": "explicit approved billing basis",
+            })
+        for index, exclusion in enumerate(instruction.exclusions, start=1):
+            participants.append({
+                "key": f"excluded-{index}", "name": exclusion.label, "label": exclusion.label,
+                "subfundReference": exclusion.reference or participant_marker(exclusion.label) or "", "status": "excluded", "reason": exclusion.reason,
+            })
+        blocks = sorted({*instruction.blocks.values(), *(item.block for item in instruction.participants), *(item.block for item in instruction.exclusions)})
+        payload: dict[str, object] = {
+            "documentIssueDate": instruction.issue_date or "", "periodStart": instruction.period_start, "periodEnd": instruction.period_end,
+            "allocationDate": None, "allocationDateRequired": False,
+            "allocationDateRule": "explicit approved eligible nominal amounts for the stated billing period",
+            "feePool": BillingService._string(instruction.fee_pool, 2), "currency": instruction.currency,
+            "methodology": "eligible nominal amount / total eligible nominal amount",
+            "rounding": "currency rounding reconciles allocations to fee pool", "participants": participants,
+            "approvedBy": instruction.approved_by,
+        }
+        return payload, "; ".join(f"page {page} block {block}" for block in blocks)
 
     @staticmethod
     def _date_text(value: str) -> str:

@@ -46,6 +46,9 @@ export const GET_RECONCILIATION_CANDIDATES_CHANNEL = "reconciliation:get-candida
 export const CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:confirm-candidate" as const;
 export const REJECT_RECONCILIATION_CANDIDATE_CHANNEL = "reconciliation:reject-candidate" as const;
 export const APPLY_RECONCILIATION_POLICY_CHANNEL = "reconciliation:apply-policy" as const;
+export const GET_IDENTITY_QUESTIONS_CHANNEL = "reconciliation:get-identity-questions" as const;
+export const RESOLVE_IDENTITY_QUESTION_CHANNEL = "reconciliation:resolve-identity-question" as const;
+export const REREAD_DOCUMENTS_CHANNEL = "reconciliation:reread-documents" as const;
 export const GET_BILLING_RULE_CANDIDATES_CHANNEL = "billing:get-rule-candidates" as const;
 export const APPROVE_BILLING_RULE_CHANNEL = "billing:approve-rule" as const;
 export const SAVE_BILLING_CALCULATION_CHANNEL = "billing:save-calculation" as const;
@@ -231,7 +234,7 @@ export interface MatterDocumentScope {
   resolvedDocuments: Array<{ documentId: string; filename: string; matchedBy: string }>;
   notes: string[];
 }
-export type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "historical_reconstruction" | "change" | "legal_status" | "comparison" | "calculation" | "general";
+export type MatterQuestionIntent = "inventory" | "relationship" | "specific_lookup" | "holdings_comparison" | "historical_reconstruction" | "identity_resolution" | "holdings_conflict" | "change" | "legal_status" | "comparison" | "calculation" | "general";
 export interface MatterRelationship { documentId: string; filename: string; subject: string; subjectRole: string; subjectReference: string; related: string; relatedRole: string; relatedReference: string; kind: "explicit_statement" | "explicit_heading" | "document_section" | "same_row"; basis: string; }
 export interface MatterHoldingSide { documentId: string; filename: string; sheet: string; row: number; rowReference: string | null; quantity: string | null; quantityReference: string | null; isinReference: string | null; accountReference: string | null; entityReferences: string[]; unit: string | null; unitReference: string | null; currency: string | null; currencyReference: string | null; rowDate: string | null; rowDateReference: string | null; cells: Array<{ heading: string; value: string; reference: string }>; }
 export interface MatterHoldingRow { entities: Array<{ kind: string; name: string }>; account: string | null; isin: string | null; currency: string | null; earlier: MatterHoldingSide | null; later: MatterHoldingSide | null; difference: string | null; status: "compared" | "only_earlier" | "only_later" | "duplicate_rows" | "unusable_quantity" | "unit_mismatch" | "currency_mismatch"; note: string | null; }

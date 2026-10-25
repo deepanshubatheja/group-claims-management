@@ -130,6 +130,8 @@ export function questionIntentLabel(intent: MatterQuestionIntent): string {
     specific_lookup: "Exact account/ISIN lookup",
     holdings_comparison: "Dated holdings comparison (calculated locally)",
     historical_reconstruction: "Historical holdings reconstruction",
+    identity_resolution: "Fund identity from accounts and documented aliases (built locally)",
+    holdings_conflict: "Conflicting holdings records and supporting evidence (built locally)",
     change: "Document change or transfer analysis",
     legal_status: "Legal claim status",
     comparison: "Cross-document comparison",

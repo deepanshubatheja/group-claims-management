@@ -535,6 +535,20 @@ class DocumentImportService:
                 "SELECT id FROM document_extractions WHERE source_document_id = ?)",
                 (document.id,),
             )
+            # Reading bookkeeping and alias statements are derived from this
+            # document's text, like its extractions.
+            connection.execute(
+                "DELETE FROM reconciliation_candidate_supersessions WHERE read_id IN ("
+                "SELECT id FROM reconciliation_document_reads WHERE source_document_id = ?)",
+                (document.id,),
+            )
+            connection.execute("DELETE FROM reconciliation_document_reads WHERE source_document_id = ?", (document.id,))
+            connection.execute("DELETE FROM identity_alias_evidence WHERE source_document_id = ?", (document.id,))
+            connection.execute(
+                "DELETE FROM account_migration_evidence WHERE source_document_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM account_relationships r WHERE r.evidence_id = account_migration_evidence.id)",
+                (document.id,),
+            )
             connection.execute("DELETE FROM document_extractions WHERE source_document_id = ?", (document.id,))
             connection.execute("DELETE FROM source_documents WHERE id = ?", (document.id,))
         self._vault.remove_managed_copy(document)

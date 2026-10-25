@@ -300,11 +300,15 @@ class ReconciliationPipelineTests(unittest.TestCase):
         self._write_pdf(conflicting, """SYNTHETIC TRANSFER\n\nIssue date: 20 February 2025\nEffective date: 20 February 2025\nInvestor group: Redwood Investors LP\nAtlas Custody Bank confirms a securities transfer of 10,000 nominal units of ISIN XS0123456789 from Horizon Credit Fund B (SF-B), account CUST-ALPHA-01, to Horizon Credit Fund B (SF-B), account CUST-ALPHA-02.""")
         self.assertTrue(self.imports.import_authorized_paths([str(conflicting)])["documents"][0]["ok"])
         row = next(row for row in self._candidate_rows() if row["original_filename"] == conflicting.name)
+        batch = self.service.apply_policy({"candidateIds": [row["id"]], "policy": "reviewed_batch", "acknowledged": True})
+        self.assertEqual(batch["confirmed"], [])
+        self.assertEqual(batch["reviewRequired"], [{"candidateId": row["id"], "reason": "account_identity_conflict"}])
         with self.assertRaisesRegex(ReconciliationError, "conflicts with its established investor or subfund"):
-            self.service.apply_policy({"candidateIds": [row["id"]], "policy": "reviewed_batch", "acknowledged": True})
+            self.service.confirm({"candidateId": row["id"], "acknowledged": True})
         assert self.storage.database is not None
         with self.storage.database.connection() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM securities_transfers").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM issues WHERE status = 'open' AND reason = 'account identity conflict'").fetchone()[0], 1)
 
     def test_cross_document_duplicate_transfer_and_assignment_add_no_second_business_event(self) -> None:
         self._import()

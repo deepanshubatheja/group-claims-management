@@ -12,14 +12,19 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Mapping, Sequence
 
 from ..storage.service import StorageService
+from .identity import IdentityResolver, TargetType, normalize_account_reference, normalize_alias
+from .pdf_fields import column_name, extract_page_aliases, extract_page_migrations, extract_page_records, find_amounts, find_dates, labelled_value, parse_date
 
 
 _CANDIDATE_TYPES = frozenset({"holding_snapshot", "securities_transfer", "claim_assignment"})
+# Bump when deterministic reading rules change, so imported documents are
+# read again (see ``reread_stale``).  Keep it a plain dated label.
+READING_RULES_VERSION = "2026-10-25.5"
 _ORIGINS = frozenset({"deterministic", "ai_validated"})
 _VALIDATION_STATUSES = frozenset({"supported", "validated_ai", "review_required"})
 _PDF_BLOCK_REFERENCE = re.compile(r"^page\s+(\d+)\s+block\s+(\d+)$", re.IGNORECASE)
@@ -28,8 +33,6 @@ _SHEET_RANGE_REFERENCE = re.compile(
     r"^(?P<sheet>.+)!(?P<start_column>[A-Z]+)(?P<start_row>[1-9][0-9]*)"
     r"(?::(?P<end_column>[A-Z]+)(?P<end_row>[1-9][0-9]*))?$"
 )
-_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-_TEXT_DATE = re.compile(r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b", re.IGNORECASE)
 
 
 class ReconciliationError(RuntimeError):
@@ -45,6 +48,7 @@ class ReconciliationService:
         if storage.database is None:
             raise ReconciliationError("STORAGE_UNAVAILABLE", "Local storage is not ready.")
         self._database = storage.database
+        self._storage = storage
 
     def generate(self, params: object) -> Mapping[str, object]:
         """Generate bounded candidates from one already-parsed local document."""
@@ -60,16 +64,27 @@ class ReconciliationService:
             generated = self._deterministic_candidates(connection, context)
             if include_ai:
                 generated.extend(self._ai_candidates(connection, context))
+        alias_statements = self._stage_alias_statements(context)
         staged: list[Mapping[str, object]] = []
         skipped: list[str] = []
+        unchanged = 0
+        produced: set[str] = set()
         for candidate in generated:
+            existing = self._already_staged_elsewhere(candidate)
+            if existing is not None:
+                unchanged += 1
+                produced.add(existing)
+                continue
             try:
-                staged.append(self.stage(candidate))
+                result = self.stage(candidate)
+                staged.append(result)
+                produced.add(str(result["id"]))
             except ReconciliationError as error:
                 # A partially understood source remains local and reviewable;
                 # importing a document must not fail because it has no safe
                 # business-record interpretation.
                 skipped.append(error.code)
+        superseded = self._record_read(context, produced)
         return {
             "documentId": document_id,
             "extractionId": context["extraction_id"],
@@ -77,7 +92,115 @@ class ReconciliationService:
             "generated": len(generated),
             "staged": staged,
             "skipped": sorted(skipped),
+            "unchanged": unchanged,
+            "aliasStatements": alias_statements,
+            "superseded": superseded,
         }
+
+    def _record_read(self, context: sqlite3.Row, produced: set[str]) -> int:
+        """Record this reading; supersede unconfirmed deterministic candidates it no longer produces.
+
+        A better reading (for example a fuller fund name) must replace, not
+        add to, the earlier interpretation of the same document.  Confirmed,
+        rejected and AI-origin candidates are never superseded.
+        """
+        now, read_id = datetime.now(UTC).isoformat(), str(uuid.uuid4())
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reconciliation_document_reads (id, source_document_id, extraction_id, rules_version, candidate_count, read_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (read_id, context["source_document_id"], context["extraction_id"], READING_RULES_VERSION, len(produced), now),
+            )
+            stale = [
+                str(row["id"]) for row in connection.execute(
+                    "SELECT c.id FROM reconciliation_candidates c WHERE c.source_document_id = ? AND c.lifecycle_status = 'candidate' AND c.origin = 'deterministic' "
+                    "AND NOT EXISTS (SELECT 1 FROM reconciliation_candidate_supersessions s WHERE s.candidate_id = c.id)",
+                    (context["source_document_id"],),
+                )
+                if str(row["id"]) not in produced
+            ]
+            for candidate_id in stale:
+                connection.execute(
+                    "INSERT INTO reconciliation_candidate_supersessions (candidate_id, read_id, rules_version, superseded_at) VALUES (?, ?, ?, ?)",
+                    (candidate_id, read_id, READING_RULES_VERSION, now),
+                )
+                self._audit(connection, "reconciliation_candidate_superseded", "reconciliation_candidate", candidate_id, "system", now, {
+                    "read_id": read_id, "rules_version": READING_RULES_VERSION,
+                })
+        return len(stale)
+
+    def reread_stale(self, limit: int = 500) -> Mapping[str, object]:
+        """Read documents again whose current extraction predates the current reading rules.
+
+        Runs at backend start.  It stages candidates for review only; nothing
+        is confirmed, and confirmed or rejected candidates are untouched.
+        """
+        with self._database.connection() as connection:
+            document_ids = [str(row["id"]) for row in connection.execute(
+                "SELECT d.id FROM source_documents d WHERE d.file_format IN ('pdf','xlsx','xls','csv') "
+                "AND EXISTS (SELECT 1 FROM document_extractions e WHERE e.source_document_id = d.id AND e.status = 'parsed') "
+                "AND NOT EXISTS (SELECT 1 FROM reconciliation_document_reads r JOIN document_extractions e ON e.id = r.extraction_id "
+                "  WHERE r.source_document_id = d.id AND r.rules_version = ? AND e.id = (SELECT latest.id FROM document_extractions latest "
+                "  WHERE latest.source_document_id = d.id AND latest.status = 'parsed' ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1)) "
+                "ORDER BY d.imported_at, d.id LIMIT ?",
+                (READING_RULES_VERSION, limit),
+            )]
+        read, failed = 0, 0
+        for document_id in document_ids:
+            try:
+                self.generate({"documentId": document_id, "includeAi": False})
+                self._generate_billing(document_id)
+                read += 1
+            except ReconciliationError:
+                failed += 1
+        if document_ids:
+            now = datetime.now(UTC).isoformat()
+            with self._database.transaction() as connection:
+                self._audit(connection, "reconciliation_documents_reread", "reconciliation_batch", str(uuid.uuid4()), "system", now, {
+                    "documentsRead": read, "documentsFailed": failed, "rulesVersion": READING_RULES_VERSION, "trigger": "reading_rules_changed",
+                })
+        return {"documentsRead": read, "documentsFailed": failed}
+
+    def reread_documents(self, params: object) -> Mapping[str, object]:
+        """Re-run record extraction over the stored text of imported documents.
+
+        Uses each document's existing parsed extraction (the vault copy is not
+        re-parsed) with the current reading rules.  It only stages new
+        candidates for review: nothing is confirmed, and earlier candidates,
+        including rejected ones, are kept unchanged.
+        """
+        if not isinstance(params, dict) or set(params) != {"acknowledged"} or params.get("acknowledged") is not True:
+            raise ReconciliationError("CONFIRMATION_REQUIRED", "Explicit acknowledgement is required to re-read documents.")
+        limit = 500
+        with self._database.connection() as connection:
+            document_ids = [str(row["id"]) for row in connection.execute(
+                "SELECT d.id FROM source_documents d WHERE d.file_format IN ('pdf','xlsx','xls','csv') "
+                "AND EXISTS (SELECT 1 FROM document_extractions e WHERE e.source_document_id = d.id AND e.status = 'parsed') "
+                "ORDER BY d.imported_at, d.id LIMIT ?",
+                (limit + 1,),
+            )]
+        read, failed, with_new, new_candidates = 0, 0, 0, 0
+        for document_id in document_ids[:limit]:
+            with self._database.connection() as connection:
+                before = self._candidate_count(connection)
+            try:
+                self.generate({"documentId": document_id, "includeAi": False})
+                self._generate_billing(document_id)
+            except ReconciliationError:
+                failed += 1
+                continue
+            with self._database.connection() as connection:
+                added = self._candidate_count(connection) - before
+            read += 1
+            new_candidates += added
+            with_new += added > 0
+        now = datetime.now(UTC).isoformat()
+        with self._database.transaction() as connection:
+            summary = {
+                "documentsRead": read, "documentsFailed": failed, "documentsWithNewCandidates": with_new,
+                "newCandidates": new_candidates, "truncated": len(document_ids) > limit,
+            }
+            self._audit(connection, "reconciliation_documents_reread", "reconciliation_batch", str(uuid.uuid4()), "user", now, summary)
+        return summary
 
     def stage(self, params: object) -> Mapping[str, object]:
         if not isinstance(params, dict):
@@ -91,7 +214,7 @@ class ReconciliationService:
             kind not in _CANDIDATE_TYPES
             or not isinstance(payload, dict)
             or not all(isinstance(params[key], str) and params[key].strip() for key in ("sourceDocumentId", "sourceReference", "evidenceSnippet"))
-            or not self._date(params["documentIssueDate"])
+            or not (params["documentIssueDate"] == "" or self._date(params["documentIssueDate"]))
             or params["origin"] not in _ORIGINS
         ):
             raise ReconciliationError("INVALID_CANDIDATE", "Candidate evidence is incomplete.")
@@ -113,7 +236,7 @@ class ReconciliationService:
             document_text = self._document_text(connection, str(extraction["id"]))
             resolved_account = (
                 kind == "holding_snapshot" and isinstance(payload.get("account"), str)
-                and len(connection.execute("SELECT id FROM accounts WHERE external_reference = ?", (payload["account"],)).fetchall()) == 1
+                and IdentityResolver(connection).resolve("account", payload["account"]).status == "matched"
             )
             if not self._payload_supported(str(kind), payload, str(params["documentIssueDate"]), document_text, resolved_account):
                 raise ReconciliationError("UNSUPPORTED_EVIDENCE", "Candidate business values are not all supported by the local source document.")
@@ -138,6 +261,7 @@ class ReconciliationService:
                 # either one is confirmed.  The helper is idempotent, so it
                 # also repairs a previously interrupted generation attempt.
                 self._sync_provisional_holding_conflicts(connection, candidate_id, now)
+            self._sync_identity_questions(connection, candidate_id, now)
         return self.candidate({"candidateId": candidate_id})
 
     def candidate(self, params: object) -> Mapping[str, object]:
@@ -162,7 +286,8 @@ class ReconciliationService:
         with self._database.connection() as connection:
             rows = connection.execute(
                 "SELECT c.*, d.imported_at FROM reconciliation_candidates c JOIN source_documents d ON d.id = c.source_document_id "
-                + ("WHERE c.lifecycle_status = ? " if status else "")
+                "WHERE NOT EXISTS (SELECT 1 FROM reconciliation_candidate_supersessions s WHERE s.candidate_id = c.id AND c.lifecycle_status = 'candidate') "
+                + ("AND c.lifecycle_status = ? " if status else "")
                 + "ORDER BY CASE c.lifecycle_status WHEN 'candidate' THEN 0 WHEN 'confirmed' THEN 1 ELSE 2 END, c.created_at, c.id LIMIT 500",
                 (status,) if status else (),
             ).fetchall()
@@ -179,12 +304,21 @@ class ReconciliationService:
         if not isinstance(params, dict) or set(params) != {"candidateId", "acknowledged"} or params.get("acknowledged") is not True or not isinstance(params.get("candidateId"), str):
             raise ReconciliationError("CONFIRMATION_REQUIRED", "Explicit confirmation is required.")
         now = datetime.now(UTC).isoformat()
+        # Questions are committed in their own transaction so the refusal
+        # below leaves the "same as?" question visible in the issue queue.
+        with self._database.transaction() as connection:
+            row = self._candidate_row(connection, str(params["candidateId"]))
+            pending_identity = row["lifecycle_status"] == "candidate" and self._sync_identity_questions(connection, str(row["id"]), now) > 0
+        if pending_identity:
+            raise ReconciliationError("IDENTITY_REVIEW_REQUIRED", "A name or account in this record may refer to an existing record. Answer the open identity question first.")
         with self._database.transaction() as connection:
             row = self._candidate_row(connection, str(params["candidateId"]))
             if row["lifecycle_status"] == "confirmed":
                 return {"id": row["id"], "type": row["candidate_type"], "status": "confirmed"}
             if row["lifecycle_status"] == "rejected":
                 raise ReconciliationError("CANDIDATE_REJECTED", "A rejected candidate cannot be confirmed.")
+            if self._superseded(connection, str(row["id"])):
+                raise ReconciliationError("CANDIDATE_SUPERSEDED", "This reading was replaced when the document was read again; review the current record instead.")
             if self._candidate_has_open_holding_conflict(connection, str(row["id"])):
                 raise ReconciliationError("CONFLICT_REQUIRES_REVIEW", "A conflicting dated holding must remain provisional until reviewed.")
             if self._holding_conflict(connection, row, json.loads(str(row["payload_json"]))):
@@ -248,6 +382,72 @@ class ReconciliationService:
                 connection.execute("UPDATE reconciliation_candidates SET lifecycle_status = 'rejected' WHERE id = ?", (row["id"],))
                 self._audit(connection, "reconciliation_candidate_rejected", str(row["candidate_type"]), str(row["id"]), "user", now, {"reason": reason})
         return self.candidate({"candidateId": str(params["candidateId"])})
+
+    def identity_questions(self, params: object) -> Mapping[str, object]:
+        """Return "same as?" questions raised when a name nearly matches a record."""
+        if not isinstance(params, dict) or set(params) - {"status"}:
+            raise ReconciliationError("INVALID_IDENTITY_QUESTION", "Identity question filters are invalid.")
+        status = params.get("status", "open")
+        if status not in {"open", "linked", "distinct"}:
+            raise ReconciliationError("INVALID_IDENTITY_QUESTION", "Identity question status is invalid.")
+        with self._database.connection() as connection:
+            rows = connection.execute(
+                "SELECT q.*, c.candidate_type, c.source_reference, c.document_issue_date FROM identity_link_questions q "
+                "JOIN reconciliation_candidates c ON c.id = q.candidate_id WHERE q.status = ? ORDER BY q.created_at, q.id LIMIT 200",
+                (status,),
+            ).fetchall()
+            questions = [self._identity_question_result(connection, row) for row in rows]
+        return {"questions": questions, "truncated": len(rows) == 200}
+
+    def resolve_identity_question(self, params: object) -> Mapping[str, object]:
+        """Record the user's answer; "same" stores the spelling as an alias.
+
+        Nothing is merged retroactively: the answer only changes how this
+        spelling resolves from now on, and it is audited.
+        """
+        if (
+            not isinstance(params, dict) or set(params) != {"questionId", "decision", "acknowledged"}
+            or params.get("acknowledged") is not True or not isinstance(params.get("questionId"), str)
+            or params.get("decision") not in {"same", "distinct"}
+        ):
+            raise ReconciliationError("CONFIRMATION_REQUIRED", "An explicit same-or-distinct answer is required.")
+        decision = str(params["decision"])
+        status = "linked" if decision == "same" else "distinct"
+        now = datetime.now(UTC).isoformat()
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT q.*, c.document_issue_date FROM identity_link_questions q JOIN reconciliation_candidates c ON c.id = q.candidate_id WHERE q.id = ?",
+                (params["questionId"],),
+            ).fetchone()
+            if row is None:
+                raise ReconciliationError("IDENTITY_QUESTION_NOT_FOUND", "Identity question was not found.")
+            if row["status"] != "open":
+                if row["status"] != status:
+                    raise ReconciliationError("IDENTITY_QUESTION_RESOLVED", "This identity question was already answered differently.")
+            else:
+                if decision == "same":
+                    if self._identity_target_label(connection, str(row["target_type"]), str(row["suggested_target_id"])) is None:
+                        raise ReconciliationError("IDENTITY_TARGET_NOT_FOUND", "The suggested record no longer exists.")
+                if decision == "same" and row["target_type"] != "account":
+                    IdentityResolver(connection).record_alias(
+                        row["target_type"], str(row["suggested_target_id"]), str(row["observed_text"]), origin="user_confirmed",
+                        source_document_id=str(row["source_document_id"]), first_seen_on=row["document_issue_date"] or None, now=now,
+                    )
+                connection.execute("UPDATE identity_link_questions SET status = ?, resolved_at = ? WHERE id = ?", (status, now, row["id"]))
+                connection.execute(
+                    "UPDATE issues SET status = 'resolved', resolved_at = ? WHERE status = 'open' AND affected_type = 'identity_link_question' AND affected_id = ?",
+                    (now, row["id"]),
+                )
+                self._audit(connection, "identity_link_question_answered", str(row["target_type"]), str(row["suggested_target_id"]), "user", now, {
+                    "question_id": row["id"], "decision": decision,
+                })
+                self._refresh_review_status(connection, now)
+            result_row = connection.execute(
+                "SELECT q.*, c.candidate_type, c.source_reference, c.document_issue_date FROM identity_link_questions q "
+                "JOIN reconciliation_candidates c ON c.id = q.candidate_id WHERE q.id = ?",
+                (row["id"],),
+            ).fetchone()
+            return self._identity_question_result(connection, result_row)
 
     def backfill_provisional_holding_conflicts(self, params: object) -> Mapping[str, object]:
         """Explicitly repair issue records for candidates created before v15.
@@ -423,6 +623,45 @@ class ReconciliationService:
             "claimRightAssignments": self.claim_assignment_history({**assignment_filters, "toDate": day}),
             "openDiscrepancies": self.open_discrepancies(shared),
         }
+
+    def _generate_billing(self, document_id: str) -> None:
+        """Stage the document's approved billing instruction, if any (never approves it)."""
+        from .billing import BillingError, BillingService
+
+        try:
+            BillingService(self._storage).generate({"documentId": document_id})
+        except BillingError:
+            pass
+
+    @staticmethod
+    def _superseded(connection: sqlite3.Connection, candidate_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM reconciliation_candidate_supersessions WHERE candidate_id = ?", (candidate_id,),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _candidate_count(connection: sqlite3.Connection) -> int:
+        return int(connection.execute("SELECT COUNT(*) FROM reconciliation_candidates").fetchone()[0])
+
+    def _already_staged_elsewhere(self, candidate: Mapping[str, object]) -> str | None:
+        """The id of the same record already staged from this document under another reference.
+
+        Reading rules may cite different blocks over time; the same fact from
+        the same document and origin must not become a second candidate.  An
+        exact repeat is still passed to ``stage`` so its idempotent repair of
+        conflicts and identity questions runs.
+        """
+        payload = candidate.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        with self._database.connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM reconciliation_candidates WHERE source_document_id = ? AND candidate_type = ? AND origin = ? AND payload_sha256 = ? AND source_reference <> ? "
+                "ORDER BY CASE lifecycle_status WHEN 'confirmed' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END, created_at LIMIT 1",
+                (candidate.get("sourceDocumentId"), candidate.get("type"), candidate.get("origin"), digest, candidate.get("sourceReference")),
+            ).fetchone()
+            return str(row["id"]) if row is not None else None
 
     # Read-only historical-query helpers ---------------------------------
 
@@ -836,69 +1075,138 @@ class ReconciliationService:
                 by_sheet.setdefault(str(row["sheet_name"]), {}).setdefault(int(row["row_number"]), {})[int(row["column_number"])] = str(row["value_text"] or "")
         candidates: list[Mapping[str, object]] = []
         for sheet, grid in by_sheet.items():
-            metadata = self._sheet_metadata(sheet, grid)
-            issue_date, investor = metadata.get("issue_date"), metadata.get("investor")
-            if not isinstance(issue_date, str) or not isinstance(investor, str):
-                continue
-            for header_row, columns in self._holding_headers(grid):
-                for row_number in sorted(number for number in grid if number > header_row):
+            headers = list(self._holding_headers(grid))
+            metadata = self._sheet_metadata(sheet, grid, skip_rows={row for row, _columns in headers})
+            sheet_issue = metadata.get("issue_date") if isinstance(metadata.get("issue_date"), str) else ""
+            sheet_investor = metadata.get("investor") if isinstance(metadata.get("investor"), str) else None
+            for index, (header_row, columns) in enumerate(headers):
+                next_header = headers[index + 1][0] if index + 1 < len(headers) else None
+                for row_number in sorted(number for number in grid if number > header_row and (next_header is None or number < next_header)):
                     values = {name: grid[row_number].get(column, "").strip() for name, column in columns.items()}
                     if not any(values.values()):
                         continue
-                    if not all(values.get(name) for name in ("account", "subfund", "isin", "quantity", "position_date")):
+                    if not all(values.get(name) for name in ("account", "isin", "quantity", "position_date")):
                         continue
                     position_date, quantity = self._parse_date(values["position_date"]), self._quantity(values["quantity"])
                     isin = values["isin"].upper().replace(" ", "")
                     if position_date is None or quantity is None or len(isin) != 12:
                         continue
+                    investor = values.get("investor") or sheet_investor
                     refs = [*metadata["references"], self._sheet_row_reference(sheet, row_number, min(columns.values()), max(columns.values()))]
-                    candidates.append(self._candidate_input(context, "holding_snapshot", "; ".join(dict.fromkeys(refs)), f"Structured holdings row {sheet} {row_number}", issue_date, "deterministic", {
-                        "investor": investor, "subfund": values["subfund"], "account": values["account"], "isin": isin, "quantity": quantity, "positionDate": position_date,
+                    candidates.append(self._candidate_input(context, "holding_snapshot", "; ".join(dict.fromkeys(refs)), f"Structured holdings row {sheet} {row_number}", str(sheet_issue), "deterministic", {
+                        "investor": investor or None, "subfund": values.get("subfund") or None, "account": values["account"], "isin": isin, "quantity": quantity, "positionDate": position_date,
                     }, 1.0, "supported"))
         return candidates
 
-    def _pdf_candidates(self, connection: sqlite3.Connection, context: sqlite3.Row) -> list[Mapping[str, object]]:
+    @staticmethod
+    def _pdf_pages(connection: sqlite3.Connection, extraction_id: str) -> tuple[dict[int, list[tuple[int, str]]], dict[int, dict[int, tuple[float, float, float, float]]]]:
         rows = connection.execute(
-            "SELECT p.page_number, b.block_index, b.text FROM pdf_text_blocks b JOIN pdf_page_extractions p ON p.id = b.pdf_page_extraction_id WHERE p.extraction_id = ? ORDER BY p.page_number, b.block_index",
-            (context["extraction_id"],),
+            "SELECT p.page_number, b.block_index, b.text, b.x0, b.y0, b.x1, b.y1 FROM pdf_text_blocks b JOIN pdf_page_extractions p ON p.id = b.pdf_page_extraction_id WHERE p.extraction_id = ? ORDER BY p.page_number, b.block_index",
+            (extraction_id,),
         ).fetchall()
-        by_page: dict[int, list[sqlite3.Row]] = {}
+        pages: dict[int, list[tuple[int, str]]] = {}
+        geometry: dict[int, dict[int, tuple[float, float, float, float]]] = {}
         for row in rows:
-            by_page.setdefault(int(row["page_number"]), []).append(row)
+            pages.setdefault(int(row["page_number"]), []).append((int(row["block_index"]), str(row["text"] or "")))
+            if None not in (row["x0"], row["y0"], row["x1"], row["y1"]):
+                geometry.setdefault(int(row["page_number"]), {})[int(row["block_index"])] = (float(row["x0"]), float(row["y0"]), float(row["x1"]), float(row["y1"]))
+        return pages, geometry
+
+    @staticmethod
+    def _pdf_document_context(pages: Mapping[int, Sequence[tuple[int, str]]]) -> tuple[tuple[str, int, int] | None, str | None]:
+        """The document's first labelled issue date (with location) and its single labelled investor."""
+        document_issue: tuple[str, int, int] | None = None
+        investors: set[str] = set()
+        for page_number, blocks in pages.items():
+            issue_value, issue_block = labelled_value(blocks, "issue_date")
+            if document_issue is None and isinstance(issue_value, str) and issue_block is not None:
+                document_issue = (issue_value, page_number, issue_block)
+            investor_value, _block = labelled_value(blocks, "investor")
+            if isinstance(investor_value, str):
+                investors.add(investor_value)
+        return document_issue, (next(iter(investors)) if len(investors) == 1 else None)
+
+    def _pdf_candidates(self, connection: sqlite3.Connection, context: sqlite3.Row) -> list[Mapping[str, object]]:
+        """Read holdings, transfers, and assignments from varied PDF wording.
+
+        A page without its own labelled issue date uses the document's first
+        one; with none at all the issue date is recorded as not stated.
+        References name only the blocks that support each record.
+        """
+        pages, geometry = self._pdf_pages(connection, str(context["extraction_id"]))
+        document_issue, document_investor = self._pdf_document_context(pages)
         candidates: list[Mapping[str, object]] = []
-        for page_number, blocks in by_page.items():
-            text, compact = " ".join(str(block["text"]) for block in blocks), ""
-            compact = " ".join(text.split())
-            issue_date = self._labelled_date(text, "issue date")
-            if issue_date is None:
-                continue
-            references = self._pdf_references(page_number, blocks)
-            transfer = re.search(r"(?:securities\s+)?transfer\s+of\s+([\d,]+(?:\.\d+)?)\s+nominal(?:\s+units)?\s+of\s+ISIN\s+([A-Z0-9]{12}).*?from\s+(.+?),\s*account\s+([A-Z0-9-]+),\s*to\s+(.+?),\s*account\s+([A-Z0-9-]+)", compact, re.IGNORECASE)
-            investor = re.search(r"Investor\s+group\s*:\s*(.+?)(?=\s+(?:[A-Z][A-Za-z]+\s+Custody|confirms|$))", compact, re.IGNORECASE)
-            effective_date = self._labelled_date(compact, "effective date")
-            if transfer and investor and effective_date:
-                quantity = self._quantity(transfer.group(1))
-                if quantity is not None:
-                    candidates.append(self._candidate_input(context, "securities_transfer", references, "Explicit securities transfer notice", issue_date, "deterministic", {
-                        "investor": investor.group(1).strip(), "fromSubfund": transfer.group(3).strip(), "fromAccount": transfer.group(4).strip(), "toSubfund": transfer.group(5).strip(), "toAccount": transfer.group(6).strip(), "isin": transfer.group(2).upper(), "quantity": quantity, "effectiveDate": effective_date,
-                    }, 1.0, "supported"))
-            assignment = re.search(r"Claim\s+reference\s*:\s*([A-Z0-9-]+).*?(.+?)\s+assigns\s+([\d.]+)\s+percent.*?ISIN\s+([A-Z0-9]{12})\s+to\s+(.+?),\s+effective", compact, re.IGNORECASE)
-            if assignment and effective_date:
-                percentage = self._percentage(assignment.group(3))
-                if percentage is not None:
-                    candidates.append(self._candidate_input(context, "claim_assignment", references, "Explicit claim-right assignment notice", issue_date, "deterministic", {
-                        "claimReference": assignment.group(1).strip(), "fromEntity": assignment.group(2).strip(), "toEntity": assignment.group(5).strip(), "isin": assignment.group(4).upper(), "effectiveDate": effective_date, "percentage": percentage,
-                    }, 1.0, "supported"))
-            holding = re.search(r"For\s+account\s+([A-Z0-9-]+),\s*(.+?),\s*the\s+recorded\s+holding\s+of\s+ISIN\s+([A-Z0-9]{12})\s+is\s+([\d,]+(?:\.\d+)?)\s+nominal\s+units\s+as\s+of\s+(.+?)(?:\.|$)", compact, re.IGNORECASE)
-            if holding:
-                position_date, quantity = self._parse_date(holding.group(5)), self._quantity(holding.group(4))
-                if position_date and quantity:
-                    # This notice does not establish an investor. It remains
-                    # unknown unless a unique confirmed account resolves it.
-                    candidates.append(self._candidate_input(context, "holding_snapshot", references, "Custodian position statement", issue_date, "deterministic", {
-                        "investor": None, "subfund": holding.group(2).strip(), "account": holding.group(1).strip(), "isin": holding.group(3).upper(), "quantity": quantity, "positionDate": position_date,
-                    }, 1.0, "supported"))
+        for page_number, blocks in pages.items():
+            records, page_issue, page_issue_block = extract_page_records(blocks, document_investor, geometry.get(page_number))
+            issue = (page_issue, page_number, page_issue_block) if page_issue is not None and page_issue_block is not None else document_issue
+            for record in records:
+                references = [f"page {page_number} block {index}" for index in record.block_indexes]
+                if issue is not None and f"page {issue[1]} block {issue[2]}" not in references:
+                    references.append(f"page {issue[1]} block {issue[2]}")
+                candidates.append(self._candidate_input(context, record.kind, "; ".join(references), record.snippet, issue[0] if issue else "", "deterministic", record.payload, 1.0, "supported"))
         return candidates
+
+    def _stage_alias_statements(self, context: sqlite3.Row) -> int:
+        """Keep a PDF's explicit alias statements as source-linked evidence.
+
+        Every alias, canonical name and account must appear in the stored
+        source text.  Statements are evidence for later matching only.
+        """
+        if context["file_format"] != "pdf":
+            return 0
+        now, staged = datetime.now(UTC).isoformat(), 0
+        with self._database.transaction() as connection:
+            extraction_id = str(context["extraction_id"])
+            pages, geometry = self._pdf_pages(connection, extraction_id)
+            document_issue, _investor = self._pdf_document_context(pages)
+            text = self._normalise_text(self._document_text(connection, extraction_id))
+            for page_number, blocks in pages.items():
+                for statement in extract_page_aliases(blocks, geometry.get(page_number)):
+                    values = [*statement.aliases, statement.canonical, *([statement.account] if statement.account else [])]
+                    if not all(self._normalise_text(value) in text for value in values):
+                        continue
+                    reference = "; ".join(f"page {page_number} block {index}" for index in statement.block_indexes)
+                    normalized_account = normalize_account_reference(statement.account) if statement.account else None
+                    for alias in statement.aliases:
+                        exists = connection.execute(
+                            "SELECT 1 FROM identity_alias_evidence WHERE source_document_id = ? AND target_type = ? AND normalized_alias = ? AND normalized_canonical = ? AND COALESCE(normalized_account, '') = ?",
+                            (context["source_document_id"], statement.target_type, normalize_alias(statement.target_type, alias), normalize_alias(statement.target_type, statement.canonical), normalized_account or ""),
+                        ).fetchone()
+                        if exists is not None:
+                            continue
+                        evidence_id = str(uuid.uuid4())
+                        connection.execute(
+                            "INSERT INTO identity_alias_evidence (id, target_type, alias_text, normalized_alias, canonical_text, normalized_canonical, account_reference, normalized_account, source_document_id, extraction_id, source_reference, evidence_snippet, document_issue_date, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (evidence_id, statement.target_type, alias, normalize_alias(statement.target_type, alias), statement.canonical, normalize_alias(statement.target_type, statement.canonical),
+                             statement.account, normalized_account, context["source_document_id"], extraction_id, reference, statement.snippet, document_issue[0] if document_issue else None, now),
+                        )
+                        self._audit(connection, "identity_alias_statement_staged", statement.target_type, evidence_id, "system", now, {"source_document_id": context["source_document_id"]})
+                        staged += 1
+                for migration in extract_page_migrations(blocks, geometry.get(page_number), _investor):
+                    values = [migration.old_account, migration.new_account, *(value for value in (migration.investor, migration.fund) if value)]
+                    if not all(self._normalise_text(value) in text for value in values):
+                        continue
+                    old_key, new_key = normalize_account_reference(migration.old_account), normalize_account_reference(migration.new_account)
+                    if connection.execute(
+                        "SELECT 1 FROM account_migration_evidence WHERE source_document_id = ? AND normalized_old_account = ? AND normalized_new_account = ? AND COALESCE(effective_date, '') = ?",
+                        (context["source_document_id"], old_key, new_key, migration.effective_date or ""),
+                    ).fetchone() is not None:
+                        continue
+                    evidence_id = str(uuid.uuid4())
+                    connection.execute(
+                        "INSERT INTO account_migration_evidence (id, old_account_reference, normalized_old_account, new_account_reference, normalized_new_account, effective_date, investor_text, fund_text, source_document_id, extraction_id, source_reference, evidence_snippet, document_issue_date, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (evidence_id, migration.old_account, old_key, migration.new_account, new_key, migration.effective_date, migration.investor, migration.fund,
+                         context["source_document_id"], extraction_id, "; ".join(f"page {page_number} block {index}" for index in migration.block_indexes),
+                         migration.snippet, document_issue[0] if document_issue else None, now),
+                    )
+                    self._audit(connection, "account_migration_statement_staged", "account", evidence_id, "system", now, {"source_document_id": context["source_document_id"]})
+                    staged += 1
+            if staged:
+                # Candidates waiting only on a "same as?" answer may now be documented.
+                self._refresh_review_status(connection, now)
+        return staged
 
     def _ai_candidates(self, connection: sqlite3.Connection, context: sqlite3.Row) -> list[Mapping[str, object]]:
         """Assemble AI candidates only from complete, independently validated fields."""
@@ -966,7 +1274,7 @@ class ReconciliationService:
         return result
 
     def _holding(self, connection: sqlite3.Connection, row: sqlite3.Row, payload: Mapping[str, object], now: str) -> Mapping[str, object]:
-        account = self._account(connection, payload.get("investor"), str(payload["subfund"]), str(payload["account"]), now)
+        account = self._account(connection, row, payload.get("investor"), payload.get("subfund"), str(payload["account"]), now)
         security, quantity = self._security(connection, str(payload["isin"]), now), self._decimal(Decimal(str(payload["quantity"])))
         existing = connection.execute("SELECT id, quantity FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date = ? ORDER BY created_at", (account, security, payload["positionDate"])).fetchall()
         duplicate = next((item for item in existing if str(item["quantity"]) == quantity), None)
@@ -981,17 +1289,19 @@ class ReconciliationService:
         return {"id": position_id, "type": "holding_snapshot", "status": "confirmed"}
 
     def _transfer(self, connection: sqlite3.Connection, row: sqlite3.Row, payload: Mapping[str, object], now: str) -> Mapping[str, object]:
-        source = self._account(connection, payload.get("investor"), str(payload["fromSubfund"]), str(payload["fromAccount"]), now)
-        destination = self._account(connection, payload.get("investor"), str(payload["toSubfund"]), str(payload["toAccount"]), now)
+        source = self._account(connection, row, payload.get("investor"), payload.get("fromSubfund"), str(payload["fromAccount"]), now)
+        destination = self._account(connection, row, payload.get("investor"), payload.get("toSubfund"), str(payload["toAccount"]), now)
         security, quantity = self._security(connection, str(payload["isin"]), now), Decimal(str(payload["quantity"]))
-        prior = connection.execute("SELECT quantity, position_date FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date <= ? ORDER BY position_date DESC, created_at DESC LIMIT 1", (source, security, payload["effectiveDate"])).fetchone()
+        lineage = self._account_lineage(connection, source)
+        prior = self._lineage_snapshot(connection, lineage, security, str(payload["effectiveDate"]))
         if prior is None:
             raise ReconciliationError("IMPOSSIBLE_TRANSFER", "Transfer has no confirmed source balance.")
         available = Decimal(str(prior["quantity"]))
+        lineage_ids = {account for account, _replaced in lineage}
         for transfer in connection.execute("SELECT from_account_id, to_account_id, quantity FROM securities_transfers WHERE security_id = ? AND effective_date > ? AND effective_date <= ? ORDER BY effective_date, id", (security, prior["position_date"], payload["effectiveDate"])):
-            if transfer["from_account_id"] == source:
+            if transfer["from_account_id"] in lineage_ids:
                 available -= Decimal(str(transfer["quantity"]))
-            if transfer["to_account_id"] == source:
+            if transfer["to_account_id"] in lineage_ids:
                 available += Decimal(str(transfer["quantity"]))
         if available < quantity:
             raise ReconciliationError("IMPOSSIBLE_TRANSFER", "Transfer exceeds the confirmed source balance after earlier transfers.")
@@ -1004,7 +1314,7 @@ class ReconciliationService:
 
     def _assignment(self, connection: sqlite3.Connection, row: sqlite3.Row, payload: Mapping[str, object], now: str) -> Mapping[str, object]:
         security = self._security(connection, str(payload["isin"]), now)
-        from_entity, to_entity = self._entity(connection, str(payload["fromEntity"]), now), self._entity(connection, str(payload["toEntity"]), now)
+        from_entity, to_entity = self._entity(connection, row, str(payload["fromEntity"]), now), self._entity(connection, row, str(payload["toEntity"]), now)
         claim = connection.execute("SELECT id FROM claim_rights WHERE claim_reference = ?", (payload["claimReference"],)).fetchone()
         claim_id = str(claim["id"]) if claim else str(uuid.uuid4())
         if claim is None:
@@ -1022,8 +1332,16 @@ class ReconciliationService:
     def _policy_review_reason(self, connection: sqlite3.Connection, row: sqlite3.Row) -> str | None:
         if row["lifecycle_status"] == "confirmed":
             return None
+        if self._superseded(connection, str(row["id"])):
+            return "candidate_superseded"
         if self._candidate_has_open_holding_conflict(connection, str(row["id"])):
             return "conflicting_dated_holding"
+        if self._sync_identity_questions(connection, str(row["id"]), datetime.now(UTC).isoformat()):
+            return "identity_link_requires_review"
+        if self._identity_review(connection, str(row["candidate_type"]), json.loads(str(row["payload_json"])))[1]:
+            return "account_identity_conflict"
+        if self._account_details_incomplete(connection, str(row["candidate_type"]), json.loads(str(row["payload_json"]))):
+            return "account_details_incomplete"
         if row["origin"] != "deterministic":
             return "ai_origin_requires_individual_review"
         if row["candidate_type"] == "claim_assignment":
@@ -1038,11 +1356,11 @@ class ReconciliationService:
     def _holding_conflict(self, connection: sqlite3.Connection, row: sqlite3.Row, payload: Mapping[str, object]) -> bool:
         if row["candidate_type"] != "holding_snapshot":
             return False
-        accounts = connection.execute("SELECT id FROM accounts WHERE external_reference = ?", (payload.get("account"),)).fetchall()
+        account = self._resolved_account_id(connection, payload.get("account"))
         security = connection.execute("SELECT id FROM securities WHERE isin = ?", (payload.get("isin"),)).fetchone()
-        if len(accounts) != 1 or security is None:
+        if account is None or security is None:
             return False
-        quantities = connection.execute("SELECT quantity FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date = ?", (accounts[0]["id"], security["id"], payload.get("positionDate"))).fetchall()
+        quantities = connection.execute("SELECT quantity FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date = ?", (account, security["id"], payload.get("positionDate"))).fetchall()
         return any(str(item["quantity"]) != self._decimal(Decimal(str(payload["quantity"]))) for item in quantities)
 
     def _sync_provisional_holding_conflicts(
@@ -1061,7 +1379,8 @@ class ReconciliationService:
         identity = self._holding_conflict_identity(payload)
         if identity is None:
             return None
-        account, isin, position_date = identity
+        account_key, isin, position_date = identity
+        account = str(payload["account"]).strip()
         observations: list[tuple[sqlite3.Row, Mapping[str, object], Decimal]] = []
         rows = connection.execute(
             "SELECT * FROM reconciliation_candidates WHERE candidate_type = 'holding_snapshot' ORDER BY created_at, id"
@@ -1078,11 +1397,21 @@ class ReconciliationService:
         if len({quantity for _, _, quantity in observations}) < 2:
             return None
 
-        key_material = json.dumps({"account": account, "isin": isin, "positionDate": position_date}, sort_keys=True, separators=(",", ":"))
-        conflict_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+        # Reuse a conflict an observation already belongs to, so spelling
+        # variants of one account reference never split a contradiction.
+        observation_ids = [str(row["id"]) for row, _payload, _quantity in observations]
         conflict = connection.execute(
-            "SELECT * FROM reconciliation_holding_conflicts WHERE conflict_key = ?", (conflict_key,)
+            "SELECT conflict.* FROM reconciliation_holding_conflicts conflict "
+            "JOIN reconciliation_holding_conflict_candidates link ON link.conflict_id = conflict.id "
+            f"WHERE link.candidate_id IN ({','.join('?' for _ in observation_ids)}) ORDER BY conflict.created_at, conflict.id LIMIT 1",
+            observation_ids,
         ).fetchone()
+        key_material = json.dumps({"account": account_key, "isin": isin, "positionDate": position_date}, sort_keys=True, separators=(",", ":"))
+        conflict_key = str(conflict["conflict_key"]) if conflict is not None else hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+        if conflict is None:
+            conflict = connection.execute(
+                "SELECT * FROM reconciliation_holding_conflicts WHERE conflict_key = ?", (conflict_key,)
+            ).fetchone()
         created = conflict is None
         conflict_id = str(conflict["id"]) if conflict is not None else str(uuid.uuid4())
         investor = self._shared_observation_value(observations, "investor")
@@ -1132,7 +1461,7 @@ class ReconciliationService:
         account, isin, position_date = payload.get("account"), payload.get("isin"), payload.get("positionDate")
         if not all(isinstance(value, str) and value.strip() for value in (account, isin, position_date)):
             return None
-        return (str(account).strip(), str(isin).upper().replace(" ", ""), str(position_date))
+        return (normalize_account_reference(str(account)), str(isin).upper().replace(" ", ""), str(position_date))
 
     @staticmethod
     def _shared_observation_value(
@@ -1203,11 +1532,35 @@ class ReconciliationService:
         return result
 
     def _transfer_has_source_balance(self, connection: sqlite3.Connection, payload: Mapping[str, object]) -> bool:
-        accounts = connection.execute("SELECT id FROM accounts WHERE external_reference = ?", (payload.get("fromAccount"),)).fetchall()
+        account = self._resolved_account_id(connection, payload.get("fromAccount"))
         security = connection.execute("SELECT id FROM securities WHERE isin = ?", (payload.get("isin"),)).fetchone()
-        if len(accounts) != 1 or security is None:
+        if security is None:
             return False
-        return connection.execute("SELECT 1 FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date <= ? LIMIT 1", (accounts[0]["id"], security["id"], payload.get("effectiveDate"))).fetchone() is not None
+        if account is not None:
+            lineage = self._account_lineage(connection, account)
+        else:
+            migration = self._documented_migration(connection, IdentityResolver(connection), payload.get("fromAccount"))
+            if migration is None:
+                return False
+            lineage = [(str(migration["old_account_id"]), migration["effective_date"])] + self._account_lineage(connection, str(migration["old_account_id"]))[1:]
+        return self._lineage_snapshot(connection, lineage, str(security["id"]), str(payload.get("effectiveDate"))) is not None
+
+    @staticmethod
+    def _lineage_snapshot(connection: sqlite3.Connection, lineage: Sequence[tuple[str, str | None]], security_id: str, as_of: str) -> sqlite3.Row | None:
+        """The latest confirmed holding across an account and its predecessors.
+
+        A predecessor's holding counts only up to the date it was replaced.
+        """
+        best: sqlite3.Row | None = None
+        for account_id, replaced_on in lineage:
+            limit = min(as_of, replaced_on) if replaced_on else as_of
+            row = connection.execute(
+                "SELECT quantity, position_date FROM holding_positions WHERE account_id = ? AND security_id = ? AND position_date <= ? ORDER BY position_date DESC, created_at DESC LIMIT 1",
+                (account_id, security_id, limit),
+            ).fetchone()
+            if row is not None and (best is None or str(row["position_date"]) > str(best["position_date"])):
+                best = row
+        return best
 
     def _mark_review_required(self, connection: sqlite3.Connection, row: sqlite3.Row, reason: str, now: str) -> None:
         connection.execute("UPDATE reconciliation_candidates SET validation_status = 'review_required' WHERE id = ?", (row["id"],))
@@ -1216,7 +1569,7 @@ class ReconciliationService:
         # set itself is contradictory or operationally impossible.
         if reason == "conflicting_dated_holding" and self._candidate_has_open_holding_conflict(connection, str(row["id"])):
             return
-        if reason in {"conflicting_dated_holding", "transfer_source_balance_unavailable"}:
+        if reason in {"conflicting_dated_holding", "transfer_source_balance_unavailable", "account_identity_conflict", "account_details_incomplete"}:
             self._issue(connection, row, "reconciliation_candidate", str(row["id"]), reason.replace("_", " "), now)
 
     def _stored_review_reason(self, connection: sqlite3.Connection, row: sqlite3.Row) -> str | None:
@@ -1237,6 +1590,8 @@ class ReconciliationService:
             return "Legal claim-right assignments require individual confirmation."
         if self._candidate_has_open_holding_conflict(connection, str(row["id"])):
             return "Conflicting dated holding evidence requires review."
+        if self._identity_review(connection, str(row["candidate_type"]), json.loads(str(row["payload_json"])))[0]:
+            return "A name or account may refer to an existing record. Answer the identity question in Issues."
         issue = connection.execute(
             "SELECT reason FROM issues WHERE status = 'open' AND affected_type = 'reconciliation_candidate' AND affected_id = ? ORDER BY created_at, id LIMIT 1",
             (row["id"],),
@@ -1250,52 +1605,433 @@ class ReconciliationService:
 
     # Identity, provenance, and storage helpers --------------------------
 
-    def _account(self, connection: sqlite3.Connection, investor: object, subfund: str, reference: str, now: str) -> str:
-        matching = connection.execute(
-            "SELECT a.id, fund.name AS subfund, entity.display_name AS investor "
-            "FROM accounts a JOIN investors i ON i.id = a.investor_id "
-            "JOIN legal_entities entity ON entity.id = i.legal_entity_id "
-            "LEFT JOIN investment_vehicles fund ON fund.id = a.investment_vehicle_id "
-            "WHERE a.external_reference = ?",
-            (reference,),
-        ).fetchall()
-        if len(matching) > 1:
+    def _account(self, connection: sqlite3.Connection, row: sqlite3.Row, investor: object, subfund: object, reference: str, now: str) -> str:
+        """Resolve or create the one account a reference identifies.
+
+        A known account keeps its established investor and subfund; a
+        different spelling of either is accepted only once it resolves to the
+        same record (directly or through a user-confirmed alias).
+        """
+        identities = IdentityResolver(connection)
+        resolution = identities.resolve("account", reference)
+        if resolution.status == "ambiguous":
             raise ReconciliationError("AMBIGUOUS_IDENTITY", "Account identity is ambiguous.")
-        if matching:
-            existing = matching[0]
-            if existing["subfund"] != subfund or (
-                isinstance(investor, str) and investor.strip() and existing["investor"] != investor
-            ):
-                raise ReconciliationError("AMBIGUOUS_IDENTITY", "The account identifier conflicts with its established investor or subfund.")
-            return str(matching[0]["id"])
+        if resolution.status == "matched":
+            existing = connection.execute(
+                "SELECT a.id, a.investment_vehicle_id, i.legal_entity_id FROM accounts a JOIN investors i ON i.id = a.investor_id WHERE a.id = ?",
+                (resolution.target_id,),
+            ).fetchone()
+            for target_type, text, expected in (("investment_vehicle", subfund, existing["investment_vehicle_id"]), ("legal_entity", investor, existing["legal_entity_id"])):
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                if self._established_name(connection, identities, target_type, text, expected, reference, existing["legal_entity_id"]) != "same":
+                    raise ReconciliationError("AMBIGUOUS_IDENTITY", "The account identifier conflicts with its established investor or subfund.")
+                self._record_alias(identities, row, target_type, str(expected), text, now)
+            self._record_alias(identities, row, "account", str(existing["id"]), reference, now)
+            return str(existing["id"])
+        migration = self._documented_migration(connection, identities, reference)
+        if migration is not None:
+            if isinstance(investor, str) and investor.strip() and not identities.is_alias_of("legal_entity", migration["legal_entity_id"], investor):
+                raise ReconciliationError("AMBIGUOUS_IDENTITY", "The documented account migration names a different investor.")
+            if isinstance(subfund, str) and subfund.strip() and self._established_name(
+                connection, identities, "investment_vehicle", subfund, migration["vehicle_id"], migration["old_reference"], migration["legal_entity_id"],
+            ) != "same":
+                raise ReconciliationError("AMBIGUOUS_IDENTITY", "The documented account migration names a different fund.")
+            account_id = str(uuid.uuid4())
+            connection.execute("INSERT INTO accounts VALUES (?, ?, NULL, ?, ?, ?)", (account_id, migration["investor_id"], migration["vehicle_id"], reference, now))
+            connection.execute(
+                "INSERT INTO account_relationships (id, relationship_type, from_account_id, to_account_id, effective_date, evidence_id, created_at) VALUES (?, 'account_migration', ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), migration["old_account_id"], account_id, migration["effective_date"], migration["evidence_id"], now),
+            )
+            self._audit(connection, "account_migration_applied", "account", account_id, "system", now, {
+                "from_account_id": migration["old_account_id"], "evidence_id": migration["evidence_id"], "candidate_id": row["id"],
+            })
+            self._record_alias(identities, row, "account", account_id, reference, now)
+            if isinstance(subfund, str) and subfund.strip():
+                self._record_alias(identities, row, "investment_vehicle", migration["vehicle_id"], subfund, now)
+            return account_id
         if not isinstance(investor, str) or not investor.strip():
             raise ReconciliationError("AMBIGUOUS_IDENTITY", "The investor is not established for this account.")
-        entity_id = self._entity(connection, investor, now)
+        if not isinstance(subfund, str) or not subfund.strip():
+            raise ReconciliationError("AMBIGUOUS_IDENTITY", "The subfund is not established for this account.")
+        entity_id = self._entity(connection, row, investor, now)
         investor_row = connection.execute("SELECT id FROM investors WHERE legal_entity_id = ?", (entity_id,)).fetchone()
         investor_id = str(investor_row["id"]) if investor_row else str(uuid.uuid4())
         if investor_row is None:
             connection.execute("INSERT INTO investors VALUES (?, ?, NULL, ?)", (investor_id, entity_id, now))
-        vehicle = connection.execute("SELECT id FROM investment_vehicles WHERE name = ? AND vehicle_type = 'subfund'", (subfund,)).fetchone()
-        vehicle_id = str(vehicle["id"]) if vehicle else str(uuid.uuid4())
-        if vehicle is None:
-            connection.execute("INSERT INTO investment_vehicles (id, name, legal_entity_id, has_separate_legal_personality, created_at, vehicle_type) VALUES (?, ?, NULL, 0, ?, 'subfund')", (vehicle_id, subfund, now))
-        account = connection.execute("SELECT id FROM accounts WHERE investor_id = ? AND external_reference = ?", (investor_id, reference)).fetchone()
-        if account:
-            return str(account["id"])
+        existing = self._existing_fund_for_new_account(connection, identities, subfund, entity_id, reference)
+        if existing is not None and existing[1] == "ask":
+            raise ReconciliationError("IDENTITY_REVIEW_REQUIRED", "This new account uses an existing fund's name. Answer the open identity question first.")
+        vehicle_id = existing[0] if existing is not None and existing[1] == "same" else self._vehicle(connection, row, subfund, now, entity_id, allow_existing=existing is None)
+        if existing is not None and existing[1] == "distinct":
+            self._audit(connection, "identity_separate_fund_created", "investment_vehicle", vehicle_id, "system", now, {"account_reference": reference, "candidate_id": row["id"]})
         account_id = str(uuid.uuid4())
         connection.execute("INSERT INTO accounts VALUES (?, ?, NULL, ?, ?, ?)", (account_id, investor_id, vehicle_id, reference, now))
+        self._record_alias(identities, row, "account", account_id, reference, now)
         return account_id
 
-    @staticmethod
-    def _entity(connection: sqlite3.Connection, name: str, now: str) -> str:
-        rows = connection.execute("SELECT id FROM legal_entities WHERE display_name = ?", (name,)).fetchall()
-        if len(rows) > 1:
-            raise ReconciliationError("AMBIGUOUS_IDENTITY", "Entity identity is ambiguous.")
-        if rows:
-            return str(rows[0]["id"])
-        entity_id = str(uuid.uuid4())
-        connection.execute("INSERT INTO legal_entities VALUES (?, ?, NULL, 'organization', NULL, ?)", (entity_id, name, now))
+    def _entity(self, connection: sqlite3.Connection, row: sqlite3.Row, name: str, now: str) -> str:
+        identities = IdentityResolver(connection)
+        entity_id = self._resolved_or_new(identities, "legal_entity", name)
+        if entity_id is None:
+            entity_id = str(uuid.uuid4())
+            connection.execute("INSERT INTO legal_entities VALUES (?, ?, NULL, 'organization', NULL, ?)", (entity_id, name, now))
+        self._record_alias(identities, row, "legal_entity", entity_id, name, now)
         return entity_id
+
+    def _vehicle(self, connection: sqlite3.Connection, row: sqlite3.Row, name: str, now: str, investor_entity_id: str | None, *, allow_existing: bool = True) -> str:
+        """Resolve a fund only among the investor's own (or unattached) funds.
+
+        Two investors' funds that share a name are never merged by name.
+        ``allow_existing=False`` creates a separate fund (the user declared it distinct).
+        """
+        identities = IdentityResolver(connection)
+        vehicle_id = self._resolved_or_new(identities, "investment_vehicle", name, self._vehicle_scope(connection, investor_entity_id)) if allow_existing else None
+        if vehicle_id is None:
+            vehicle_id = str(uuid.uuid4())
+            connection.execute("INSERT INTO investment_vehicles (id, name, legal_entity_id, has_separate_legal_personality, created_at, vehicle_type) VALUES (?, ?, NULL, 0, ?, 'subfund')", (vehicle_id, name, now))
+        self._record_alias(identities, row, "investment_vehicle", vehicle_id, name, now)
+        return vehicle_id
+
+    @staticmethod
+    def _resolved_or_new(identities: IdentityResolver, target_type: TargetType, name: str, within: set[str] | None = None) -> str | None:
+        """Return the matched record id, or None when a new record is safe."""
+        resolution = identities.resolve(target_type, name, within=within)
+        if resolution.status == "ambiguous":
+            raise ReconciliationError("AMBIGUOUS_IDENTITY", "Entity identity is ambiguous.")
+        if resolution.status == "ask":
+            # Confirmation paths sync questions first; this guards a race.
+            raise ReconciliationError("IDENTITY_REVIEW_REQUIRED", "A name may refer to an existing record. Answer the open identity question first.")
+        return resolution.target_id if resolution.status == "matched" else None
+
+    def _documented_migration(self, connection: sqlite3.Connection, identities: IdentityResolver, reference: object) -> dict[str, str | None] | None:
+        """The known predecessor account a document says ``reference`` replaced.
+
+        Applies only when the predecessor account exists, any investor and
+        fund the statement names belong to it, and no statement names a
+        different predecessor fund for the same new account.
+        """
+        if not isinstance(reference, str) or not reference.strip():
+            return None
+        rows = connection.execute(
+            "SELECT * FROM account_migration_evidence WHERE normalized_new_account = ? ORDER BY created_at, rowid",
+            (normalize_account_reference(reference),),
+        ).fetchall()
+        found: list[dict[str, str | None]] = []
+        for row in rows:
+            old_id = self._resolved_account_id(connection, row["old_account_reference"])
+            if old_id is None:
+                continue
+            old = connection.execute(
+                "SELECT a.id, a.external_reference, a.investor_id, a.investment_vehicle_id, i.legal_entity_id FROM accounts a JOIN investors i ON i.id = a.investor_id WHERE a.id = ?",
+                (old_id,),
+            ).fetchone()
+            if old["investment_vehicle_id"] is None:
+                continue
+            if row["investor_text"] and not identities.is_alias_of("legal_entity", str(old["legal_entity_id"]), str(row["investor_text"])):
+                continue
+            if row["fund_text"] and self._established_name(
+                connection, identities, "investment_vehicle", str(row["fund_text"]), old["investment_vehicle_id"], str(old["external_reference"]), old["legal_entity_id"],
+            ) != "same":
+                continue
+            found.append({
+                "evidence_id": str(row["id"]), "old_account_id": str(old["id"]), "old_reference": str(old["external_reference"]),
+                "investor_id": str(old["investor_id"]), "vehicle_id": str(old["investment_vehicle_id"]), "legal_entity_id": str(old["legal_entity_id"]),
+                "effective_date": row["effective_date"],
+            })
+        if not found or len({item["vehicle_id"] for item in found}) != 1:
+            return None
+        return found[0]
+
+    def _existing_fund_for_new_account(
+        self, connection: sqlite3.Connection, identities: IdentityResolver, subfund: str, investor_entity_id: str | None, reference: str,
+    ) -> tuple[str, str] | None:
+        """Whether a new account's fund name already belongs to a fund held through another account.
+
+        Returns (fund id, "same") when the user confirmed it, (account id to
+        ask about, "ask") when undecided, ("", "distinct") when the user
+        declared the account a separate fund, or None when no such fund
+        exists.  A shared name and investor never link a new account on their
+        own.
+        """
+        resolution = identities.resolve("investment_vehicle", subfund, within=self._vehicle_scope(connection, investor_entity_id))
+        if resolution.status != "matched" or resolution.target_id is None:
+            return None
+        accounts = [str(row["id"]) for row in connection.execute(
+            "SELECT id FROM accounts WHERE investment_vehicle_id = ? ORDER BY created_at, id", (resolution.target_id,),
+        )]
+        if not accounts:
+            return None
+        decisions = {
+            str(row["status"]) for row in connection.execute(
+                f"SELECT status FROM identity_link_questions WHERE target_type = 'account' AND normalized_observed = ? AND suggested_target_id IN ({','.join('?' for _ in accounts)}) AND status <> 'open'",
+                (normalize_account_reference(reference), *accounts),
+            )
+        }
+        if "linked" in decisions:
+            return resolution.target_id, "same"
+        if "distinct" in decisions:
+            return "", "distinct"
+        return accounts[0], "ask"
+
+    def _account_lineage(self, connection: sqlite3.Connection, account_id: str) -> list[tuple[str, str | None]]:
+        """The account and its documented predecessors, each with the date it was replaced."""
+        lineage: list[tuple[str, str | None]] = [(account_id, None)]
+        seen = {account_id}
+        current = account_id
+        while True:
+            row = connection.execute(
+                "SELECT from_account_id, effective_date FROM account_relationships WHERE relationship_type = 'account_migration' AND to_account_id = ? ORDER BY created_at LIMIT 1",
+                (current,),
+            ).fetchone()
+            if row is None or str(row["from_account_id"]) in seen:
+                return lineage
+            current = str(row["from_account_id"])
+            seen.add(current)
+            lineage.append((current, row["effective_date"]))
+
+    @staticmethod
+    def _vehicle_scope(connection: sqlite3.Connection, investor_entity_id: str | None) -> set[str]:
+        """Funds a name may match for this investor: its own funds and unattached ones."""
+        return {
+            str(row["id"]) for row in connection.execute(
+                "SELECT v.id FROM investment_vehicles v WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.investment_vehicle_id = v.id) "
+                "OR EXISTS (SELECT 1 FROM accounts a JOIN investors i ON i.id = a.investor_id WHERE a.investment_vehicle_id = v.id AND i.legal_entity_id = ?)",
+                (investor_entity_id,),
+            )
+        }
+
+    def _established_name(
+        self, connection: sqlite3.Connection, identities: IdentityResolver, target_type: TargetType, text: str,
+        expected_id: object, account_reference: str, holder_entity_id: object,
+    ) -> str:
+        """Whether ``text`` names the record already established for an account.
+
+        "same": a recorded alias of that record, a name a document explicitly
+        states is that record for this same account, or "<holder> - <name>".
+        "other": exclusively a different record's name.  "unknown": neither,
+        so the user is asked.  Name similarity alone never returns "same".
+        """
+        if expected_id is None:
+            return "other"
+        expected = str(expected_id)
+        variants = [text]
+        if target_type == "investment_vehicle" and holder_entity_id is not None:
+            prefix = re.match(r"^\s*(?P<holder>.+?)(?:\s+[-–—:]\s+|['’]s\s+)(?P<rest>.+)$", text)
+            if prefix and identities.is_alias_of("legal_entity", str(holder_entity_id), prefix.group("holder")):
+                variants.append(prefix.group("rest"))
+        for variant in variants:
+            if identities.is_alias_of(target_type, expected, variant) or self._documented_alias(connection, identities, target_type, variant, expected, account_reference):
+                return "same"
+        resolution = identities.resolve(target_type, text)
+        return "other" if resolution.status == "matched" and resolution.target_id != expected else "unknown"
+
+    @staticmethod
+    def _documented_alias(
+        connection: sqlite3.Connection, identities: IdentityResolver, target_type: TargetType, text: str, expected_id: str, account_reference: str,
+    ) -> bool:
+        """A document states ``text`` is the expected record for this account.
+
+        The statement's account must equal the record's account, its canonical
+        name must already belong to the expected record, and no statement may
+        attach the same alias to a different account.
+        """
+        rows = connection.execute(
+            "SELECT canonical_text, normalized_account FROM identity_alias_evidence WHERE target_type = ? AND normalized_alias = ?",
+            (target_type, normalize_alias(target_type, text)),
+        ).fetchall()
+        wanted = normalize_account_reference(account_reference)
+        stated_accounts = {row["normalized_account"] for row in rows if row["normalized_account"]}
+        if not rows or stated_accounts != {wanted}:
+            return False
+        return any(
+            identities.is_alias_of(target_type, expected_id, str(row["canonical_text"]))
+            for row in rows if row["normalized_account"] == wanted
+        )
+
+    @staticmethod
+    def _record_alias(identities: IdentityResolver, row: sqlite3.Row, target_type: TargetType, target_id: str, value: str, now: str) -> None:
+        identities.record_alias(
+            target_type, target_id, value, origin="observed",
+            source_document_id=str(row["source_document_id"]), first_seen_on=row["document_issue_date"] or None, now=now,
+        )
+
+    @staticmethod
+    def _resolved_account_id(connection: sqlite3.Connection, reference: object) -> str | None:
+        if not isinstance(reference, str) or not reference.strip():
+            return None
+        resolution = IdentityResolver(connection).resolve("account", reference)
+        return resolution.target_id if resolution.status == "matched" else None
+
+    def _identity_review(
+        self, connection: sqlite3.Connection, kind: str, payload: Mapping[str, object]
+    ) -> tuple[list[tuple[TargetType, str, str, str]], bool]:
+        """Find names that need a "same as?" answer before confirmation.
+
+        Returns ``(questions, conflict)``.  Each question is (target type,
+        observed text, suggested record id, match basis).  ``conflict`` means a
+        known account is attributed to a party or subfund that is a different
+        record, or that the user has declared distinct; that is a genuine
+        inconsistency, not a naming question.
+        """
+        identities = IdentityResolver(connection)
+        questions: list[tuple[TargetType, str, str, str]] = []
+        conflict = False
+
+        def party(target_type: TargetType, text: object, within: set[str] | None = None) -> None:
+            if isinstance(text, str) and text.strip():
+                resolution = identities.resolve(target_type, text, within=within)
+                if resolution.status == "ask":
+                    questions.append((target_type, text.strip(), str(resolution.target_id), str(resolution.basis)))
+
+        def account(investor: object, subfund: object, reference: object) -> None:
+            nonlocal conflict
+            account_id = self._resolved_account_id(connection, reference)
+            if account_id is None:
+                migration = self._documented_migration(connection, identities, reference)
+                if migration is not None:
+                    # A documented successor account: same fund, same investor.
+                    if isinstance(investor, str) and investor.strip() and not identities.is_alias_of("legal_entity", migration["legal_entity_id"], investor):
+                        conflict = True
+                    if isinstance(subfund, str) and subfund.strip():
+                        verdict = self._established_name(connection, identities, "investment_vehicle", subfund, migration["vehicle_id"], migration["old_reference"], migration["legal_entity_id"])
+                        if verdict == "other":
+                            conflict = True
+                        elif verdict == "unknown":
+                            questions.append(("investment_vehicle", subfund.strip(), migration["vehicle_id"], "same_account_reference"))
+                    return
+                party("legal_entity", investor)
+                investor_id = None
+                if isinstance(investor, str) and investor.strip():
+                    resolved = identities.resolve("legal_entity", investor)
+                    investor_id = resolved.target_id if resolved.status == "matched" else None
+                party("investment_vehicle", subfund, self._vehicle_scope(connection, investor_id))
+                if isinstance(subfund, str) and subfund.strip() and isinstance(reference, str):
+                    pending = self._existing_fund_for_new_account(connection, identities, subfund, investor_id, reference)
+                    if pending is not None and pending[1] == "ask":
+                        questions.append(("account", reference.strip(), pending[0], "existing_fund_new_account"))
+                return
+            established = connection.execute(
+                "SELECT a.investment_vehicle_id, i.legal_entity_id FROM accounts a JOIN investors i ON i.id = a.investor_id WHERE a.id = ?",
+                (account_id,),
+            ).fetchone()
+            checks: tuple[tuple[TargetType, object, object], ...] = (
+                ("investment_vehicle", subfund, established["investment_vehicle_id"]),
+                ("legal_entity", investor, established["legal_entity_id"]),
+            )
+            for target_type, text, expected in checks:
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                verdict = self._established_name(connection, identities, target_type, text, expected, str(reference), established["legal_entity_id"])
+                if verdict == "same":
+                    continue
+                if verdict == "other" or self._declared_distinct(connection, target_type, text, str(expected)):
+                    conflict = True
+                else:
+                    questions.append((target_type, text.strip(), str(expected), "same_account_reference"))
+
+        if kind == "holding_snapshot":
+            account(payload.get("investor"), payload.get("subfund"), payload.get("account"))
+        elif kind == "securities_transfer":
+            account(payload.get("investor"), payload.get("fromSubfund"), payload.get("fromAccount"))
+            account(payload.get("investor"), payload.get("toSubfund"), payload.get("toAccount"))
+        elif kind == "claim_assignment":
+            party("legal_entity", payload.get("fromEntity"))
+            party("legal_entity", payload.get("toEntity"))
+        return list(dict.fromkeys(questions)), conflict
+
+    def _refresh_review_status(self, connection: sqlite3.Connection, now: str) -> None:
+        """Return deterministic candidates to routine review once nothing blocks them."""
+        rows = connection.execute(
+            "SELECT * FROM reconciliation_candidates WHERE lifecycle_status = 'candidate' AND validation_status = 'review_required' AND origin = 'deterministic' ORDER BY created_at, id"
+        ).fetchall()
+        for row in rows:
+            if self._policy_review_reason(connection, row) is None:
+                connection.execute("UPDATE reconciliation_candidates SET validation_status = 'supported' WHERE id = ?", (row["id"],))
+
+    @staticmethod
+    def _identity_target_label(connection: sqlite3.Connection, target_type: str, target_id: str) -> str | None:
+        query = {
+            "legal_entity": "SELECT display_name AS label FROM legal_entities WHERE id = ?",
+            "investment_vehicle": "SELECT name AS label FROM investment_vehicles WHERE id = ?",
+            "account": "SELECT external_reference AS label FROM accounts WHERE id = ?",
+        }[target_type]
+        row = connection.execute(query, (target_id,)).fetchone()
+        return None if row is None else str(row["label"])
+
+    def _identity_question_result(self, connection: sqlite3.Connection, row: sqlite3.Row) -> Mapping[str, object]:
+        aliases = connection.execute(
+            "SELECT alias_text, origin, source_document_id, first_seen_on FROM identity_aliases WHERE target_type = ? AND target_id = ? ORDER BY created_at, alias_text",
+            (row["target_type"], row["suggested_target_id"]),
+        ).fetchall()
+        return {
+            "id": row["id"], "status": row["status"], "targetType": row["target_type"],
+            "observedText": row["observed_text"], "matchBasis": row["match_basis"],
+            "suggested": {
+                "id": row["suggested_target_id"],
+                "label": self._identity_target_label(connection, str(row["target_type"]), str(row["suggested_target_id"])),
+                "aliases": [
+                    {"text": alias["alias_text"], "origin": alias["origin"], "sourceDocumentId": alias["source_document_id"], "firstSeenOn": alias["first_seen_on"]}
+                    for alias in aliases
+                ],
+            },
+            "candidateId": row["candidate_id"], "candidateType": row["candidate_type"],
+            "sourceDocumentId": row["source_document_id"], "sourceReference": row["source_reference"],
+            "documentIssueDate": row["document_issue_date"] or None, "createdAt": row["created_at"], "resolvedAt": row["resolved_at"],
+        }
+
+    def _account_details_incomplete(self, connection: sqlite3.Connection, kind: str, payload: Mapping[str, object]) -> bool:
+        """An unknown account can only be created when the source names its investor and subfund."""
+        sides = {
+            "holding_snapshot": (("account", "subfund"),),
+            "securities_transfer": (("fromAccount", "fromSubfund"), ("toAccount", "toSubfund")),
+        }.get(kind, ())
+        for account_key, subfund_key in sides:
+            if self._resolved_account_id(connection, payload.get(account_key)) is None and not (
+                isinstance(payload.get("investor"), str) and isinstance(payload.get(subfund_key), str)
+            ) and self._documented_migration(connection, IdentityResolver(connection), payload.get(account_key)) is None:
+                return True
+        return False
+
+    @staticmethod
+    def _declared_distinct(connection: sqlite3.Connection, target_type: str, text: str, target_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM identity_link_questions WHERE target_type = ? AND normalized_observed = ? AND suggested_target_id = ? AND status = 'distinct'",
+            (target_type, normalize_alias(target_type, text), target_id),
+        ).fetchone() is not None
+
+    def _sync_identity_questions(self, connection: sqlite3.Connection, candidate_id: str, now: str) -> int:
+        """Persist open "same as?" questions for a provisional candidate.
+
+        Idempotent: one question per observed spelling and suggested record,
+        shared by every candidate that raises it.  Returns how many questions
+        this candidate is waiting on.
+        """
+        row = self._candidate_row(connection, candidate_id)
+        if row["lifecycle_status"] != "candidate":
+            return 0
+        questions, _conflict = self._identity_review(connection, str(row["candidate_type"]), json.loads(str(row["payload_json"])))
+        for target_type, text, suggested_id, basis in questions:
+            normalized = normalize_alias(target_type, text)
+            existing = connection.execute(
+                "SELECT id FROM identity_link_questions WHERE target_type = ? AND normalized_observed = ? AND suggested_target_id = ?",
+                (target_type, normalized, suggested_id),
+            ).fetchone()
+            if existing is not None:
+                continue
+            question_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO identity_link_questions (id, target_type, observed_text, normalized_observed, suggested_target_id, match_basis, candidate_id, source_document_id, status, created_at, resolved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL)",
+                (question_id, target_type, text, normalized, suggested_id, basis, row["id"], row["source_document_id"], now),
+            )
+            self._issue(connection, row, "identity_link_question", question_id, "possible same identity", now)
+            self._audit(connection, "identity_link_question_raised", target_type, suggested_id, "system", now, {
+                "question_id": question_id, "candidate_id": row["id"], "match_basis": basis,
+            })
+        if questions:
+            connection.execute("UPDATE reconciliation_candidates SET validation_status = 'review_required' WHERE id = ?", (row["id"],))
+        return len(questions)
 
     @staticmethod
     def _security(connection: sqlite3.Connection, isin: str, now: str) -> str:
@@ -1346,7 +2082,7 @@ class ReconciliationService:
 
     @staticmethod
     def _candidate_result(row: sqlite3.Row) -> Mapping[str, object]:
-        return {"id": row["id"], "type": row["candidate_type"], "status": row["lifecycle_status"], "origin": row["origin"], "sourceDocumentId": row["source_document_id"], "documentIssueDate": row["document_issue_date"], "payload": json.loads(row["payload_json"]), "sourceReference": row["source_reference"], "evidenceSnippet": row["evidence_snippet"], "extractionId": row["extraction_id"], "parserVersion": row["parser_version"], "confidence": row["confidence"], "validationStatus": row["validation_status"], "documentImportedAt": row["imported_at"], "createdAt": row["created_at"], "confirmedAt": row["confirmed_at"]}
+        return {"id": row["id"], "type": row["candidate_type"], "status": row["lifecycle_status"], "origin": row["origin"], "sourceDocumentId": row["source_document_id"], "documentIssueDate": row["document_issue_date"] or None, "payload": json.loads(row["payload_json"]), "sourceReference": row["source_reference"], "evidenceSnippet": row["evidence_snippet"], "extractionId": row["extraction_id"], "parserVersion": row["parser_version"], "confidence": row["confidence"], "validationStatus": row["validation_status"], "documentImportedAt": row["imported_at"], "createdAt": row["created_at"], "confirmedAt": row["confirmed_at"]}
 
     @classmethod
     def _potential_candidate_conflicts(
@@ -1374,10 +2110,11 @@ class ReconciliationService:
                 nominal = Decimal(str(quantity))
             except InvalidOperation:
                 continue
-            groups.setdefault((account, isin, position_date), []).append((candidate, payload, nominal))
+            groups.setdefault((normalize_account_reference(account), isin, position_date), []).append((candidate, payload, nominal))
 
         conflicts: dict[str, Mapping[str, object]] = {}
-        for (account, isin, position_date), observations in groups.items():
+        for (_account_key, isin, position_date), observations in groups.items():
+            account = str(observations[0][1]["account"])
             if len({quantity for _, _, quantity in observations}) < 2:
                 continue
             ordered = sorted(observations, key=lambda item: (item[2], str(item[0]["id"])))
@@ -1457,11 +2194,15 @@ class ReconciliationService:
 
     # Parsing helpers ------------------------------------------------------
 
-    def _sheet_metadata(self, sheet: str, grid: Mapping[int, Mapping[int, str]]) -> Mapping[str, object]:
+    def _sheet_metadata(self, sheet: str, grid: Mapping[int, Mapping[int, str]], skip_rows: Iterable[int] = ()) -> Mapping[str, object]:
+        """Labelled cells above a table ("Investor | X"); table header rows are not labels."""
         investor: str | None = None
         issue_date: str | None = None
         references: list[str] = []
+        skipped = set(skip_rows)
         for row_number, row in grid.items():
+            if row_number in skipped:
+                continue
             for column, cell in row.items():
                 key, adjacent = self._field_key(cell), row.get(column + 1, "")
                 if key in {"investor", "investor_name", "investor_group"} and adjacent.strip():
@@ -1475,16 +2216,14 @@ class ReconciliationService:
         return {"investor": investor, "issue_date": issue_date, "references": tuple(references)}
 
     def _holding_headers(self, grid: Mapping[int, Mapping[int, str]]) -> Iterable[tuple[int, Mapping[str, int]]]:
-        for row_number, row in grid.items():
+        """Header rows naming account, ISIN, quantity and as-of columns (same vocabulary as PDF tables)."""
+        for row_number in sorted(grid):
             columns: dict[str, int] = {}
-            for column, value in row.items():
-                normalized = self._field_key(value)
-                if normalized == "account": columns.setdefault("account", column)
-                elif normalized in {"subfund", "fund", "sub_fund"}: columns.setdefault("subfund", column)
-                elif normalized in {"security_isin", "isin"}: columns.setdefault("isin", column)
-                elif normalized in {"nominal_amount", "quantity", "holding", "holding_amount"}: columns.setdefault("quantity", column)
-                elif normalized in {"as_of_date", "asof_date", "position_date", "statement_date"}: columns.setdefault("position_date", column)
-            if {"account", "subfund", "isin", "quantity", "position_date"} <= set(columns):
+            for column, value in sorted(grid[row_number].items()):
+                name = column_name(value)
+                if name is not None:
+                    columns.setdefault("position_date" if name == "as_of" else name, column)
+            if {"account", "isin", "quantity", "position_date"} <= set(columns):
                 yield row_number, columns
 
     @staticmethod
@@ -1515,30 +2254,16 @@ class ReconciliationService:
                 if isinstance(issue, str):
                     return issue
             return None
-        return self._labelled_date(self._document_text(connection, str(context["extraction_id"])), "issue date")
+        issue_date, _block = labelled_value([(0, self._document_text(connection, str(context["extraction_id"])))], "issue_date")
+        return issue_date if isinstance(issue_date, str) else None
 
     @staticmethod
     def _pdf_references(page_number: int, blocks: Sequence[sqlite3.Row]) -> str:
         return "; ".join(f"page {page_number} block {block['block_index']}" for block in blocks[:8])
 
     @classmethod
-    def _labelled_date(cls, text: str, label: str) -> str | None:
-        match = re.search(rf"{re.escape(label)}\s*:\s*([^\n.]+)", text, re.IGNORECASE)
-        return cls._parse_date(match.group(1)) if match else None
-
-    @classmethod
     def _parse_date(cls, value: object) -> str | None:
-        if not isinstance(value, str):
-            return None
-        match = _ISO_DATE.search(value)
-        if match:
-            try: return date.fromisoformat(match.group(1)).isoformat()
-            except ValueError: return None
-        text = _TEXT_DATE.search(value)
-        if text:
-            try: return datetime.strptime(text.group(1).title(), "%d %B %Y").date().isoformat()
-            except ValueError: return None
-        return None
+        return parse_date(value)
 
     @staticmethod
     def _quantity(value: object) -> str | None:
@@ -1573,30 +2298,46 @@ class ReconciliationService:
 
     @classmethod
     def _payload_supported(cls, kind: str, payload: Mapping[str, object], issue_date: str, evidence: str, resolved_account: bool) -> bool:
-        text, values = cls._normalise_text(evidence), [issue_date]
+        """Every business value must appear in the source text.
+
+        Dates and amounts may be written in any accepted format ("15/02/2025",
+        "1.000.000,00"), so they are also matched by parsing the source.
+        """
+        text = cls._normalise_text(evidence)
+        dates = {value for value, _start in find_dates(evidence) if value}
+        amounts = find_amounts(evidence)
+        values: list[tuple[str, object]] = [("documentIssueDate", issue_date)] if issue_date else []
         for key, value in payload.items():
             if value is None or (kind == "holding_snapshot" and key == "investor" and resolved_account):
                 continue
-            values.append(value)
-        return all(cls._normalise_text(str(value)) in text or cls._date_in_text(str(value), text) for value in values)
+            values.append((key, value))
+
+        def supported(key: str, value: object) -> bool:
+            if cls._normalise_text(str(value)) in text:
+                return True
+            if key in {"documentIssueDate", "positionDate", "effectiveDate"}:
+                return str(value) in dates
+            if key in {"quantity", "percentage"}:
+                try:
+                    return Decimal(str(value)) in amounts
+                except InvalidOperation:
+                    return False
+            return False
+
+        return all(supported(key, value) for key, value in values)
 
     @staticmethod
     def _normalise_text(value: str) -> str:
         return " ".join(value.casefold().replace(",", "").split())
-
-    @classmethod
-    def _date_in_text(cls, value: str, text: str) -> bool:
-        if not cls._date(value): return False
-        parsed = date.fromisoformat(value)
-        return f"{parsed.day} {parsed.strftime('%B')} {parsed.year}".casefold() in text
 
     def _validate(self, kind: str, payload: Mapping[str, object]) -> None:
         fields = {"holding_snapshot": ("investor", "subfund", "account", "isin", "quantity", "positionDate"), "securities_transfer": ("investor", "fromSubfund", "fromAccount", "toSubfund", "toAccount", "isin", "quantity", "effectiveDate"), "claim_assignment": ("claimReference", "fromEntity", "toEntity", "isin", "effectiveDate")}[kind]
         allowed = set(fields) | ({"percentage"} if kind == "claim_assignment" else set())
         if set(payload) - allowed or not set(fields) <= set(payload):
             raise ReconciliationError("INVALID_PAYLOAD", "Candidate business fields are incomplete.")
+        optional = {"holding_snapshot": {"investor", "subfund"}, "securities_transfer": {"investor", "fromSubfund", "toSubfund"}, "claim_assignment": set()}[kind]
         for field in fields:
-            if kind == "holding_snapshot" and field == "investor" and payload[field] is None: continue
+            if field in optional and payload[field] is None: continue
             if not isinstance(payload[field], str) or not payload[field].strip():
                 raise ReconciliationError("INVALID_PAYLOAD", "Candidate business fields are incomplete.")
         date_field = "positionDate" if kind == "holding_snapshot" else "effectiveDate"

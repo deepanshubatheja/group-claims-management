@@ -90,6 +90,8 @@ test("guards the local entity inventory and question intent", () => {
   const [entity] = inventory.entities;
   assert.equal(isMatterEntityInventory({ ...inventory, entities: [{ ...entity, evidence: [{ ...entity!.evidence[0], status: "confirmed" }] }] }), false);
   assert.equal(isMatterQuestionIntent("inventory"), true);
+  assert.equal(isMatterQuestionIntent("identity_resolution"), true);
+  assert.equal(isMatterQuestionIntent("holdings_conflict"), true);
   assert.equal(isMatterQuestionIntent("agent"), false);
 });
 

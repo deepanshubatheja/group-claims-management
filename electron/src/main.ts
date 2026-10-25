@@ -28,6 +28,7 @@ import {
   GET_RECONCILIATION_TRANSFERS_CHANNEL, GET_RECONCILIATION_ASSIGNMENTS_CHANNEL,
   GET_RECONCILIATION_DISCREPANCIES_CHANNEL, GET_RECONCILIATION_RESULT_CHANNEL,
   GET_RECONCILIATION_CANDIDATES_CHANNEL, CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL, REJECT_RECONCILIATION_CANDIDATE_CHANNEL, APPLY_RECONCILIATION_POLICY_CHANNEL,
+  GET_IDENTITY_QUESTIONS_CHANNEL, RESOLVE_IDENTITY_QUESTION_CHANNEL, REREAD_DOCUMENTS_CHANNEL,
   GET_BILLING_RULE_CANDIDATES_CHANNEL, APPROVE_BILLING_RULE_CHANNEL, SAVE_BILLING_CALCULATION_CHANNEL,
   GET_BILLING_RULE_CHANNEL, GET_BILLING_CALCULATION_PREVIEW_CHANNEL, GET_BILLING_CALCULATION_RUNS_CHANNEL, GET_BILLING_CALCULATION_RUN_CHANNEL, COMPARE_BILLING_CALCULATION_RUNS_CHANNEL,
   SELECT_AND_IMPORT_DOCUMENTS_CHANNEL, SELECT_FOLDER_FOR_IMPORT_CHANNEL, CONFIRM_FOLDER_IMPORT_CHANNEL, CANCEL_FOLDER_IMPORT_CHANNEL, FOLDER_IMPORT_PROGRESS_CHANNEL, IMPORT_DROPPED_DOCUMENTS_CHANNEL, REMOVE_DOCUMENT_CHANNEL, LIST_DOCUMENTS_CHANNEL, GET_DOCUMENT_CONTENT_CHANNEL, RETRY_DOCUMENT_PARSE_CHANNEL,
@@ -961,13 +962,15 @@ app.whenReady().then(() => {
     typeof value === "string" && /^[a-f0-9-]{36}$/i.test(value) ? value : undefined;
   const reconciliationWrite = async (
     event: Electron.IpcMainInvokeEvent, payload: unknown, arguments_: unknown[],
-    command: "reconciliation.confirm" | "reconciliation.reject" | "reconciliation.apply_policy",
+    command: "reconciliation.confirm" | "reconciliation.reject" | "reconciliation.apply_policy" | "reconciliation.resolve_identity_question" | "reconciliation.reread_documents",
   ): Promise<ReconciliationWriteResponse> => {
     if (!validAnalysisSender(event, arguments_) || !isRecord(payload)) throw new Error("Invalid reconciliation review request.");
     let request: Record<string, unknown> | undefined;
     if (command === "reconciliation.confirm" && Object.keys(payload).length === 2 && candidateId(payload.candidateId) && payload.acknowledged === true) request = { candidateId: payload.candidateId, acknowledged: true };
     if (command === "reconciliation.reject" && Object.keys(payload).length === 3 && candidateId(payload.candidateId) && payload.acknowledged === true && typeof payload.reason === "string" && payload.reason.trim().length > 0 && payload.reason.trim().length <= 500) request = { candidateId: payload.candidateId, reason: payload.reason.trim(), acknowledged: true };
     if (command === "reconciliation.apply_policy" && Object.keys(payload).length === 3 && payload.policy === "reviewed_batch" && payload.acknowledged === true && Array.isArray(payload.candidateIds) && payload.candidateIds.length > 0 && payload.candidateIds.length <= 100 && payload.candidateIds.every(candidateId)) request = { candidateIds: [...new Set(payload.candidateIds)], policy: "reviewed_batch", acknowledged: true };
+    if (command === "reconciliation.resolve_identity_question" && Object.keys(payload).length === 3 && candidateId(payload.questionId) && (payload.decision === "same" || payload.decision === "distinct") && payload.acknowledged === true) request = { questionId: payload.questionId, decision: payload.decision, acknowledged: true };
+    if (command === "reconciliation.reread_documents" && Object.keys(payload).length === 1 && payload.acknowledged === true) request = { acknowledged: true };
     if (!request) throw new Error("Invalid reconciliation review request.");
     try {
       const backend = await ensureBackend();
@@ -990,6 +993,18 @@ app.whenReady().then(() => {
   ipcMain.handle(CONFIRM_RECONCILIATION_CANDIDATE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.confirm"));
   ipcMain.handle(REJECT_RECONCILIATION_CANDIDATE_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.reject"));
   ipcMain.handle(APPLY_RECONCILIATION_POLICY_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.apply_policy"));
+  ipcMain.handle(GET_IDENTITY_QUESTIONS_CHANNEL, async (event, payload: unknown, ...arguments_: unknown[]): Promise<ReconciliationReadResponse> => {
+    if (!validAnalysisSender(event, arguments_) || !isRecord(payload) || Object.keys(payload).length > 1 || (payload.status !== undefined && !["open", "linked", "distinct"].includes(String(payload.status)))) throw new Error("Invalid identity question request.");
+    try {
+      const backend = await ensureBackend();
+      if (backend === undefined) return documentFailure(new BackendProcessError("BACKEND_UNAVAILABLE", "The backend is unavailable."));
+      const result = await backend.requestDocumentOperation("reconciliation.identity_questions", payload.status === undefined ? {} : { status: payload.status });
+      if (!isRecord(result)) throw new BackendProcessError("BACKEND_PROTOCOL_ERROR", "The backend returned invalid identity question data.");
+      return { ok: true, result };
+    } catch (error) { return documentFailure(error); }
+  });
+  ipcMain.handle(RESOLVE_IDENTITY_QUESTION_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.resolve_identity_question"));
+  ipcMain.handle(REREAD_DOCUMENTS_CHANNEL, (event, payload: unknown, ...arguments_: unknown[]) => reconciliationWrite(event, payload, arguments_, "reconciliation.reread_documents"));
   const billingIdRequest = (payload: unknown, key: "billingAgreementId" | "runId"): Record<string, string> | undefined => {
     if (!isRecord(payload) || Object.keys(payload).some((name) => name !== key && !(key === "billingAgreementId" && name === "asOfDate"))) return undefined;
     const identifier = payload[key];
